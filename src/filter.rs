@@ -21,6 +21,35 @@
 
 use crate::inspect::TypeInfo;
 
+/// Outcome of the path-only filter, carrying *why* an entry was kept or dropped.
+///
+/// A reason-carrying result (rather than a bare `bool`) so the scan statistics
+/// can attribute every skip to the rule that caused it — for `--not-path` it
+/// even records *which* glob matched, by its index in the exclude list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathDecision {
+    /// The path passes the include/exclude globs; read and search it.
+    Search,
+    /// `--path` was given and this path matched none of the include globs.
+    SkipNotIncluded,
+    /// The path matched the `--not-path` glob at this index in the exclude list.
+    SkipNotPath(usize),
+}
+
+/// Outcome of the type/media filter, applied once the content header is known.
+///
+/// Like [`PathDecision`], it names the rule responsible so the statistics can
+/// count media skips and `--type` exclusions separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeDecision {
+    /// The detected type passes the filter; search the content.
+    Search,
+    /// The media skip (`--exclude-media`/`--fast`) dropped a `media` file.
+    SkipMedia,
+    /// The `--type` allowlist did not include this file's format/category.
+    SkipType,
+}
+
 /// Which entries to search: path include/exclude globs, a `--type` allowlist,
 /// and the media skip.
 pub struct EntryFilter {
@@ -55,22 +84,31 @@ impl EntryFilter {
         }
     }
 
-    /// Whether `path` passes the path-only filters (include/exclude globs).
+    /// The `--not-path` globs, in the order their indices refer to.
     ///
-    /// This runs before any content is read; the type/media decision is made
-    /// separately by [`accepts_type`](Self::accepts_type) once the header has
-    /// been inspected.
-    pub fn selects(&self, path: &str) -> bool {
-        if !self.include.is_empty() && !self.include.iter().any(|g| matches(g, path)) {
-            return false;
-        }
-        if self.exclude.iter().any(|g| matches(g, path)) {
-            return false;
-        }
-        true
+    /// Exposed so the scan statistics can label each [`PathDecision::SkipNotPath`]
+    /// index with the glob string that caused the skip.
+    pub fn not_path_globs(&self) -> &[String] {
+        &self.exclude
     }
 
-    /// Whether an entry of the detected type should be searched.
+    /// Classify `path` against the path-only filters (include/exclude globs).
+    ///
+    /// This runs before any content is read; the type/media decision is made
+    /// separately by [`accept_type`](Self::accept_type) once the header has been
+    /// inspected. Exclude wins over include — a path matching both is skipped,
+    /// attributed to the matching `--not-path` glob.
+    pub fn select(&self, path: &str) -> PathDecision {
+        if !self.include.is_empty() && !self.include.iter().any(|g| matches(g, path)) {
+            return PathDecision::SkipNotIncluded;
+        }
+        if let Some(idx) = self.exclude.iter().position(|g| matches(g, path)) {
+            return PathDecision::SkipNotPath(idx);
+        }
+        PathDecision::Search
+    }
+
+    /// Classify an entry by its detected type.
     ///
     /// `info` is the format/category from `inspect::detect_type` (header-first,
     /// then extension), or `None` when no inspector claims the file.
@@ -80,18 +118,23 @@ impl EntryFilter {
     ///   allowlist takes over, so the media skip does not also apply.
     /// - Without `--type`: keep everything, except — when `skip_media` is set —
     ///   files whose category is `media`.
-    pub fn accepts_type(&self, info: Option<TypeInfo>) -> bool {
+    pub fn accept_type(&self, info: Option<TypeInfo>) -> TypeDecision {
         if !self.types.is_empty() {
-            return info.is_some_and(|i| {
+            let kept = info.is_some_and(|i| {
                 self.types
                     .iter()
                     .any(|t| t.as_str() == i.name || t.as_str() == i.category)
             });
+            return if kept {
+                TypeDecision::Search
+            } else {
+                TypeDecision::SkipType
+            };
         }
         if self.skip_media && info.is_some_and(|i| i.category == "media") {
-            return false;
+            return TypeDecision::SkipMedia;
         }
-        true
+        TypeDecision::Search
     }
 }
 
@@ -105,7 +148,11 @@ fn matches(pattern: &str, path: &str) -> bool {
 /// HOW: a linear two-pointer scan with backtracking. `star`/`mark` remember the
 /// most recent `*` and how far `text` had advanced, so when a later literal
 /// fails we let that `*` swallow one more character and retry.
-fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+///
+/// Exposed `pub(crate)` so the decryption profile matcher (`decrypt::profile`)
+/// reuses the *same* wildcard semantics as `--path`/`--not-path`, keeping one
+/// glob implementation rather than two that could drift.
+pub(crate) fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let mut star: Option<usize> = None;
     let mut mark = 0usize;
@@ -166,56 +213,56 @@ mod tests {
     #[test]
     fn all_selects_everything() {
         let f = EntryFilter::all();
-        assert!(f.selects("any/path.txt"));
-        assert!(f.selects("photo.jpg")); // selects() is path-only
-        assert!(f.accepts_type(media())); // and `all` keeps media too
+        assert_eq!(f.select("any/path.txt"), PathDecision::Search);
+        assert_eq!(f.select("photo.jpg"), PathDecision::Search); // select() is path-only
+        assert_eq!(f.accept_type(media()), TypeDecision::Search); // and `all` keeps media too
     }
 
     #[test]
     fn include_restricts_to_matching() {
         let f = EntryFilter::new(&["*.db".into()], &[], &[], false);
-        assert!(f.selects("a/x.db"));
-        assert!(!f.selects("a/x.txt"));
+        assert_eq!(f.select("a/x.db"), PathDecision::Search);
+        assert_eq!(f.select("a/x.txt"), PathDecision::SkipNotIncluded);
     }
 
     #[test]
     fn exclude_rejects_matching() {
         let f = EntryFilter::new(&[], &["*/Caches/*".into()], &[], false);
-        assert!(f.selects("a/Documents/x.db"));
-        assert!(!f.selects("a/Caches/x.db"));
+        assert_eq!(f.select("a/Documents/x.db"), PathDecision::Search);
+        assert_eq!(f.select("a/Caches/x.db"), PathDecision::SkipNotPath(0));
     }
 
     #[test]
     fn exclude_wins_over_include() {
         let f = EntryFilter::new(&["*.db".into()], &["*/Caches/*".into()], &[], false);
-        assert!(!f.selects("a/Caches/x.db"));
+        assert_eq!(f.select("a/Caches/x.db"), PathDecision::SkipNotPath(0));
     }
 
     #[test]
     fn skip_media_drops_media_category() {
         let f = EntryFilter::new(&[], &[], &[], true);
-        assert!(!f.accepts_type(media())); // image/video/audio dropped
-        assert!(f.accepts_type(sqlite())); // non-media kept
-        assert!(f.accepts_type(None)); // unrecognised type still searched
+        assert_eq!(f.accept_type(media()), TypeDecision::SkipMedia); // a/v dropped
+        assert_eq!(f.accept_type(sqlite()), TypeDecision::Search); // non-media kept
+        assert_eq!(f.accept_type(None), TypeDecision::Search); // unrecognised still searched
     }
 
     #[test]
     fn include_media_keeps_media() {
         let f = EntryFilter::new(&[], &[], &[], false); // skip_media off
-        assert!(f.accepts_type(media()));
+        assert_eq!(f.accept_type(media()), TypeDecision::Search);
     }
 
     #[test]
     fn type_allowlist_matches_name_or_category() {
         let by_name = EntryFilter::new(&[], &[], &["sqlite".into()], true);
-        assert!(by_name.accepts_type(sqlite()));
-        assert!(!by_name.accepts_type(media()));
-        assert!(!by_name.accepts_type(None));
+        assert_eq!(by_name.accept_type(sqlite()), TypeDecision::Search);
+        assert_eq!(by_name.accept_type(media()), TypeDecision::SkipType);
+        assert_eq!(by_name.accept_type(None), TypeDecision::SkipType);
 
         // A category value selects the whole family; it also overrides the media
         // skip, so `--type media` keeps media even though skip_media is set.
         let by_category = EntryFilter::new(&[], &[], &["media".into()], true);
-        assert!(by_category.accepts_type(media()));
-        assert!(!by_category.accepts_type(sqlite()));
+        assert_eq!(by_category.accept_type(media()), TypeDecision::Search);
+        assert_eq!(by_category.accept_type(sqlite()), TypeDecision::SkipType);
     }
 }

@@ -6,10 +6,10 @@ Every match carries the location, completely:
 
 | Field | Meaning |
 |---|---|
-| `path` | File name and path inside the archive. |
-| `file_start` | Byte offset where the matching file's data begins in the archive. |
+| `path` | File name and path inside the source. |
+| `file_start` | Byte offset where the matching file's data begins in the archive (`0` for a loose file — it is its own data from byte 0). |
 | `file_offset` | The match position **within the file's logical content**. |
-| `archive_offset` | The match's **absolute** byte position in the archive. |
+| `archive_offset` | The match's **absolute** byte position in the archive, when one exists. |
 
 For **STORED** entries `archive_offset == file_start + file_offset`, and it is
 byte-accurate — you can seek to it directly:
@@ -18,13 +18,19 @@ byte-accurate — you can seek to it directly:
 dd if=acquisition.zip bs=1 skip=<archive_offset> count=16 2>/dev/null
 ```
 
-For **DEFLATE** entries the match exists only in the decompressed stream, which
-has no single byte in the archive. There:
+`archive_offset` is **absent** (omitted in json, empty in csv) when there is no single
+archive byte for the match:
 
-- `file_offset` is the position in the **decompressed** data;
-- `archive_offset` is set to `file_start` (the compressed blob's start);
-- the record is flagged **compressed** (`~` prefix in txt, `compressed: true`
-  in json/csv).
+- **DEFLATE** entries — the match exists only in the decompressed stream, so
+  `file_offset` is the position in the **decompressed** data and the record is flagged
+  **compressed** (`~` prefix in txt, `compressed: true` in json/csv);
+- **loose files** in a `--dir-mode` folder source — there is no enclosing archive
+  (`file_start` is `0`);
+- files inside an **opened nested archive** (`--archive-depth`) — the bytes live in an
+  in-memory blob, not the archive on disk;
+- **decrypted** content — the offsets are within the plaintext, not the archive.
+
+`file_offset` (the in-file position) is always meaningful and is what txt shows.
 
 **Output rules:** at most one line per match, and binary file content is never
 raw-dumped. The matched line is shown only when it looks **textual**; binary
@@ -49,6 +55,8 @@ path:0x<file_offset>[:line][  [format  labelled summary]]
   show just `path:0x<offset>`.
 - `--colour` wraps the matched bytes in ANSI bold-red (terminal only).
 - With `--inspect`, a labelled `  [format  key: value  …]` tag is appended.
+- With `--base64`, a base64 hit appends `  [base64 → "decoded value"]` so the
+  encoded run is flagged and the decoded value shown (see [base64 search](#base64-search--base64)).
 
 Examples:
 
@@ -57,6 +65,7 @@ notes.txt:0x1a2:the meeting is at 5pm
 notes.txt:0x1a2:the meeting is at 5pm  [txt  line: 12  col: 4]
 sms.db:0x500000                          (binary: location only)
 sms.db:0x500000  [sqlite  table: message  column: text  row: 4213  cell: hello there]
+config.txt:0x13:...U3VwZXJTZWNyZXRUb2tlbg...  [base64 → "SuperSecretToken"]
 ```
 
 > Note: the absolute `archive_offset` and `compressed` flag are not in txt (they
@@ -64,16 +73,17 @@ sms.db:0x500000  [sqlite  table: message  column: text  row: 4213  cell: hello t
 
 ## json
 
-A single pretty-printed object with two members: `run` (the query and every
-filter in effect, so the file is self-describing) and `results` (one object per
-match). Offsets are `0x…` hex strings. `archive` is the source archive's full
-path; `line` appears only for textual matches; `format`/`context` only with
-`--inspect`.
+A single pretty-printed object with three members: `run` (the query and every
+filter in effect, so the file is self-describing), `stats` (the coverage tally —
+see [scan statistics](#scan-statistics--the-report-sidecar)), and `results` (one
+object per match). Offsets are `0x…` hex strings. `archive` is the source
+archive's full path; `line` appears only for textual matches; `format`/`context`
+only with `--inspect`; `encoding`/`decoded` only for base64 hits.
 
 ```json
 {
   "run": {
-    "tool": "mf-zipgrep",
+    "tool": "mf-scan",
     "version": "0.1.0",
     "pattern": "hello",
     "literal": false,
@@ -84,8 +94,11 @@ path; `line` appears only for textual matches; `format`/`context` only with
     "path_globs": [],
     "not_path_globs": [],
     "types": ["sqlite"],
-    "exclude_media": false
+    "exclude_media": false,
+    "base64": false,
+    "base64_urlsafe": false
   },
+  "stats": { "files_scanned": 1280, "files_skipped": 4096, "...": "..." },
   "results": [
     {
       "archive": "/cases/acquisition.zip",
@@ -103,21 +116,24 @@ path; `line` appears only for textual matches; `format`/`context` only with
 
 `context` is format-specific (see below). For binary formats the decoded value
 lives in `context` (e.g. `cell`); for text formats the surrounding `line` is the
-content.
+content. A base64 match adds `"encoding": "base64"` and `"decoded": "<value>"`;
+plain matches omit both (the `encoding` key is absent).
 
 ## csv
 
 A header row plus one row per match. Columns are fixed (so the set never varies):
 
 ```
-archive,path,file_start,file_offset,archive_offset,compressed,format,context,line
+archive,path,file_start,file_offset,archive_offset,compressed,encoding,decoded,format,context,line
 ```
 
 Offsets are `0x…` hex strings. `archive` is the source archive's display label,
 empty unless several archives were searched (the full path is in json's `run`);
-`format`/`context` are empty unless `--inspect` matched; `line` is empty for
-binary files. `context` is the human labelled one-liner (the same text as the
-txt tag). Run metadata (pattern, filters) is not in csv; use json for that.
+`encoding` is always present (`plain` or `base64`) and `decoded` holds the
+decoded value for base64 hits (empty otherwise); `format`/`context` are empty
+unless `--inspect` matched; `line` is empty for binary files. `context` is the
+human labelled one-liner (the same text as the txt tag). Run metadata (pattern,
+filters) and the coverage stats are not in csv; use json for those.
 
 ## counts (`--count`)
 
@@ -149,11 +165,83 @@ app.json:1
 value — a TEXT/INTEGER/REAL value as text, a NULL as `NULL`, a BLOB as
 `<blob N bytes>`. Raw bytes are never shown.
 
+## base64 search (`--base64`)
+
+Secrets, tokens, and identifiers are often stored **base64-encoded**, where a
+plaintext search would miss them. `--base64` also searches for the pattern's
+base64 form, tagging each hit with its encoding so an analyst can tell an encoded
+hit from a literal one — and see the decoded value.
+
+How it works: base64 packs **3 bytes into 4 characters**, so where the target
+falls relative to those 3-byte groups (its offset **mod 3**) changes its
+encoding. There are three such alignments; for each, the characters in the middle
+of the encoded run depend only on the target and so are a literal that must
+appear. `--base64` searches all three (≈3× the work), which finds the value at
+any alignment. See `src/search/base64.rs` for the bit-level derivation.
+
+Constraints and behaviour:
+
+- **Requires `-l`** (a literal can be encoded; a regex has no byte form) and is
+  **incompatible with `--match-path`** (a path is not base64).
+- Searches **both** plaintext and base64 in one run; plain hits are unaffected.
+- Standard alphabet (`+/`) by default; `--base64-urlsafe` uses the URL-safe one
+  (`-_`). Base64 matching is always case-sensitive (the `-i` flag does not apply
+  to it).
+- Very short terms produce short fragments and may match unreliably; a warning is
+  printed when that is likely.
+
+A base64 hit's offset points at the **base64 text** in the file (the matched
+`line` is the encoded run); the `decoded` field carries the value you searched
+for. See the txt/json/csv sections above for how it is rendered.
+
+## Scan statistics & the report sidecar
+
+Every search records **coverage statistics** — what was scanned, what each filter
+skipped, and why — so a run leaves a defensible record of what it did and did not
+look at (important when `--fast` or a preset excludes whole subtrees).
+
+- **stderr:** the active skip rules are printed *before* results; a summary
+  (scanned/skipped counts, per-rule and per-type breakdowns, bytes scanned vs
+  total, throughput) is printed at the end.
+- **JSON output:** the `stats` object is embedded in the `{ run, stats, results }`
+  report (see [json](#json)).
+- **Sidecar file:** a `{ run, stats }` report is written for *every* run,
+  regardless of output format. Its path is `--report <FILE>` if given, else
+  `<output>.report.json` beside `-o`, else `mf-scan-report.json` in the current
+  directory. `--no-report` suppresses it.
+
+The `stats` object:
+
+```json
+{
+  "total_entries": 5376,
+  "directories": 410,
+  "files_scanned": 1280,
+  "files_skipped": 3686,
+  "bytes_total": 8123456789,
+  "bytes_scanned": 1203456789,
+  "archive_bytes": 7000000000,
+  "skipped_not_included": { "count": 0, "bytes": 0 },
+  "skipped_media": { "count": 3201, "bytes": 6800000000 },
+  "skipped_type": { "count": 0, "bytes": 0 },
+  "skipped_not_path": [ { "glob": "*/Caches/*", "count": 485, "bytes": 120000000 } ],
+  "scanned_by_type": { "sqlite": 412, "plist": 88, "txt": 780 },
+  "files_with_matches": 37,
+  "total_matches": 214,
+  "elapsed": 3.42
+}
+```
+
+- `bytes_*` are **uncompressed** (logical) sizes; `archive_bytes` is the on-disk
+  archive size. `elapsed` is in seconds.
+- Each skip is attributed to the rule responsible: the `--path` include filter,
+  the media skip, the `--type` allowlist, or the specific `--not-path` glob.
+
 ## Manifest schema (`--manifest` / `export --from-manifest`)
 
 ```json
 {
-  "run": { "tool": "mf-zipgrep", "pattern": "private_key", "archives": ["/cases/acquisition.zip"], "...": "..." },
+  "run": { "tool": "mf-scan", "pattern": "private_key", "archives": ["/cases/acquisition.zip"], "...": "..." },
   "total_size": 412300191,
   "file_count": 37,
   "files": [
@@ -188,7 +276,7 @@ SQLite sidecars alike) beside the artefacts themselves.
 
 ```json
 {
-  "run": { "tool": "mf-zipgrep", "...": "..." },
+  "run": { "tool": "mf-scan", "...": "..." },
   "file_count": 2,
   "files": [
     {

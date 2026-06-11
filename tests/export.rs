@@ -2,7 +2,7 @@
 //!
 //! Defines: tests for folder naming (basename + stable path hash), manifest
 //! content + total size, export layout/content, and the --max-size refusal.
-//! Uses: `common` (fixture builder), `mf_zipgrep::{engine, export}`,
+//! Uses: `common` (fixture builder), `mf_scan::{engine, export}`,
 //! `serde_json`, `tempfile`.
 
 mod common;
@@ -10,16 +10,17 @@ mod common;
 use std::fs;
 
 use common::{FileSpec, build_zip};
-use mf_zipgrep::engine::search_archive;
-use mf_zipgrep::export::{self, ExportOutcome};
-use mf_zipgrep::filter::EntryFilter;
-use mf_zipgrep::models::RunInfo;
+use mf_scan::engine::search_archive;
+use mf_scan::filter::EntryFilter;
+use mf_scan::models::RunInfo;
+use mf_scan::report::export::{self, ExportOutcome};
+use mf_scan::source::zip::ZipSource;
 use regex::bytes::Regex;
 
 /// Minimal run metadata for manifest tests.
 fn run_info() -> RunInfo {
     RunInfo {
-        tool: "mf-zipgrep".into(),
+        tool: "mf-scan".into(),
         version: "test".into(),
         pattern: "TARGET".into(),
         literal: false,
@@ -31,11 +32,15 @@ fn run_info() -> RunInfo {
         not_path_globs: vec![],
         types: vec![],
         exclude_media: false,
+        base64: false,
+        base64_urlsafe: false,
+        keyfiles: vec![],
+        platform: None,
     }
 }
 
 /// Build a two-file archive (same basename, different dirs) and search it.
-fn findings_two_infoplists() -> (Vec<u8>, mf_zipgrep::engine::Findings) {
+fn findings_two_infoplists() -> (Vec<u8>, mf_scan::engine::Findings) {
     let files = [
         FileSpec::stored("AppA/Info.plist", b"key TARGET one"),
         FileSpec::stored("AppB/Info.plist", b"key TARGET two"),
@@ -108,7 +113,14 @@ fn export_writes_files_under_their_folders() {
     let plan = export::plan(&findings.files);
     let dir = tempfile::tempdir().unwrap();
 
-    let outcome = export::export_files(&plan, &zip, &findings.files, dir.path(), None).unwrap();
+    let outcome = export::export_files(
+        &plan,
+        &ZipSource::open(&zip).unwrap(),
+        &findings.files,
+        dir.path(),
+        None,
+    )
+    .unwrap();
     match outcome {
         ExportOutcome::Exported { files, .. } => assert_eq!(files, 2),
         ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
@@ -142,7 +154,14 @@ fn export_includes_sqlite_sidecars() {
 
     let plan = export::plan(&findings.files);
     let dir = tempfile::tempdir().unwrap();
-    let outcome = export::export_files(&plan, &zip, &findings.files, dir.path(), None).unwrap();
+    let outcome = export::export_files(
+        &plan,
+        &ZipSource::open(&zip).unwrap(),
+        &findings.files,
+        dir.path(),
+        None,
+    )
+    .unwrap();
     match outcome {
         ExportOutcome::Exported { files, .. } => assert_eq!(files, 3), // db + wal + shm
         ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
@@ -162,7 +181,14 @@ fn export_refuses_when_over_max_size() {
     let dir = tempfile::tempdir().unwrap();
 
     // Cap below the 28-byte total.
-    let outcome = export::export_files(&plan, &zip, &findings.files, dir.path(), Some(10)).unwrap();
+    let outcome = export::export_files(
+        &plan,
+        &ZipSource::open(&zip).unwrap(),
+        &findings.files,
+        dir.path(),
+        Some(10),
+    )
+    .unwrap();
     match outcome {
         ExportOutcome::Refused { total_size, cap } => {
             assert_eq!(total_size, 28);
@@ -185,7 +211,9 @@ fn export_from_manifest_round_trips() {
     let manifest = export::read_manifest(&buf[..]).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let outcome = export::export_from_manifest(&manifest, &zip, dir.path(), None).unwrap();
+    let outcome =
+        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), dir.path(), None)
+            .unwrap();
     match outcome {
         ExportOutcome::Exported { files, skipped, .. } => {
             assert_eq!(files, 2);
@@ -221,7 +249,9 @@ fn export_from_manifest_skips_missing_entries() {
     };
     let dir = tempfile::tempdir().unwrap();
 
-    let outcome = export::export_from_manifest(&manifest, &zip, dir.path(), None).unwrap();
+    let outcome =
+        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), dir.path(), None)
+            .unwrap();
     match outcome {
         ExportOutcome::Exported { files, skipped, .. } => {
             assert_eq!(files, 0);

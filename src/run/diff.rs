@@ -1,0 +1,206 @@
+//! The `diff` subcommand orchestration.
+//!
+//! Defines: [`run_diff`], which opens both sides, compares them, renders the report,
+//! and (optionally) exports the changed files from side B with a re-ingestable
+//! manifest — the same export pipeline `grep` uses.
+//! Used by: `run` (dispatched from `main`).
+//! Uses: the `mf_scan` library (`diff`, `source`, `report`) plus the shared
+//! `crate::support` machinery (source resolution, the output sink, the export report).
+//!
+//! Each side is a single source: an archive file, or a directory opened as a folder
+//! (`--dir-mode folder`). Type filtering (`--type`), intra-file diff (`--inspect`),
+//! decryption (`--keyfile`), and nested-archive expansion (`--archive-depth`) are
+//! rejected for now rather than silently ignored — they arrive in later milestones.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+use mf_scan::diff::{Change, CompareMode, DiffReport, diff_sources};
+use mf_scan::engine::MatchedFile;
+use mf_scan::filter::EntryFilter;
+use mf_scan::models::{Entry, RunInfo};
+use mf_scan::report::diff::write_diff;
+use mf_scan::report::export::{self, ExportOutcome};
+use mf_scan::source::Source;
+use mf_scan::source::folder::FolderSource;
+use mf_scan::source::zip::ZipSource;
+
+use crate::cli::DiffArgs;
+use crate::support::exporting::write_export_report_file;
+use crate::support::reporting::emit;
+use crate::support::sources::open_archive;
+
+/// Run the `diff` subcommand.
+pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
+    reject_unsupported(&args)?;
+
+    let mode = if args.exact {
+        CompareMode::Hash
+    } else {
+        CompareMode::Meta
+    };
+    // Path globs only for now (type filtering is rejected above).
+    let filter = EntryFilter::new(&args.filter.path, &args.filter.not_path, &[], false);
+    let want_export = args.sink.manifest.is_some() || args.sink.export.is_some();
+
+    // Open both sides — nested so both backing buffers stay alive across the diff —
+    // then render, and export side B's changes through the shared export pipeline.
+    with_diff_side(&args.a, args.dir_mode, args.archive_depth, |a_src| {
+        with_diff_side(&args.b, args.dir_mode, args.archive_depth, |b_src| {
+            let report = diff_sources(a_src, b_src, mode, &filter, args.inspect)?;
+
+            emit(args.output.as_deref(), |w| {
+                write_diff(&report, args.format, w)
+            })?;
+
+            // Summary to stderr so it never pollutes a piped/redirected report.
+            let (added, removed, modified, unchanged) = report.counts();
+            eprintln!(
+                "diff: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
+            );
+
+            if want_export {
+                export_changes(&args, &report, b_src)?;
+            }
+            Ok(())
+        })
+    })
+}
+
+/// Reject the flags whose `diff` behaviour is not implemented yet, so they fail
+/// loudly instead of being silently ignored.
+fn reject_unsupported(args: &DiffArgs) -> Result<()> {
+    if !args.filter.file_type.is_empty() || args.filter.exclude_media {
+        bail!("diff --type/--exclude-media filtering is not yet implemented");
+    }
+    if decryption_requested(args) {
+        bail!("decryption-aware diff (--keyfile/--platform) is not yet implemented");
+    }
+    Ok(())
+}
+
+/// Whether any decryption material was supplied (shared or per-side).
+fn decryption_requested(args: &DiffArgs) -> bool {
+    !args.decrypt.keyfile.is_empty()
+        || !args.keyfile_a.is_empty()
+        || !args.keyfile_b.is_empty()
+        || args.decrypt.platform.is_some()
+        || args.platform_a.is_some()
+        || args.platform_b.is_some()
+}
+
+/// Open one diff side as a single [`Source`] and run `f` with it.
+///
+/// A file is an archive (`ZipSource` over its mmap); a directory must be given with
+/// `--dir-mode` (a single `FolderSource`) — a diff side is one source, so there is no
+/// archive-harvesting (`-r`) mode here. Keeping the mmap and `ZipSource` in this scope
+/// lets the caller nest two sides safely.
+fn with_diff_side<R>(
+    path: &Path,
+    dir_mode: bool,
+    archive_depth: u32,
+    f: impl FnOnce(&dyn Source) -> Result<R>,
+) -> Result<R> {
+    if !path.is_dir() {
+        let mmap = open_archive(path)?;
+        let source = ZipSource::open(&mmap)?;
+        f(&source)
+    } else if dir_mode {
+        let source = FolderSource::open(path, archive_depth)?;
+        f(&source)
+    } else {
+        bail!(
+            "{} is a directory; pass --dir-mode to diff it as a folder",
+            path.display()
+        )
+    }
+}
+
+/// Export the added/modified files from side B and/or write a manifest, reusing the
+/// same export engine and manifest schema as `grep` (so `mf-scan export
+/// --from-manifest` re-ingests a diff result with no special-casing).
+fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> Result<()> {
+    // Side B's entries by path, to fetch the ones that changed.
+    let by_path: HashMap<&str, &Entry> = b_src
+        .entries()
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let files: Vec<MatchedFile> = report
+        .files
+        .iter()
+        .filter(|f| matches!(f.change, Change::Added | Change::Modified))
+        .filter_map(|f| {
+            by_path.get(f.path.as_str()).map(|e| MatchedFile {
+                entry: (*e).clone(),
+                offsets: Vec::new(),
+            })
+        })
+        .collect();
+
+    let plan = export::plan(&files);
+    let run = diff_run_info(args);
+
+    if let Some(path) = &args.sink.manifest {
+        let file =
+            File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let mut w = BufWriter::new(file);
+        export::write_manifest(&plan, &run, &mut w)?;
+        w.flush().context("failed flushing manifest")?;
+        eprintln!(
+            "manifest: {} changed file(s), {} bytes total -> {}",
+            plan.items.len(),
+            plan.total_size,
+            path.display()
+        );
+    }
+
+    if let Some(dir) = &args.sink.export {
+        match export::export_files(&plan, b_src, &files, dir, Some(args.sink.max_size))? {
+            ExportOutcome::Exported {
+                files: n,
+                bytes,
+                report: rep,
+                ..
+            } => {
+                write_export_report_file(dir, &run, &rep)?;
+                eprintln!(
+                    "exported {n} changed file(s) ({bytes} bytes) to {}",
+                    dir.display()
+                );
+            }
+            ExportOutcome::Refused { total_size, cap } => eprintln!(
+                "refusing to export: changed total {total_size} bytes exceeds --max-size {cap}; \
+                 nothing written (use --manifest to review)"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Run metadata for the diff manifest/export report — informational provenance
+/// describing what produced it (the two sides and any path filters).
+fn diff_run_info(args: &DiffArgs) -> RunInfo {
+    RunInfo {
+        tool: "mf-scan".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        pattern: format!("diff {} -> {}", args.a.display(), args.b.display()),
+        literal: false,
+        ignore_case: false,
+        match_path: false,
+        inspect: false,
+        archives: vec![args.a.display().to_string(), args.b.display().to_string()],
+        path_globs: args.filter.path.clone(),
+        not_path_globs: args.filter.not_path.clone(),
+        types: Vec::new(),
+        exclude_media: false,
+        base64: false,
+        base64_urlsafe: false,
+        keyfiles: Vec::new(),
+        platform: None,
+    }
+}

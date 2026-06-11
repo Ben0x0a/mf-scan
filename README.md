@@ -1,36 +1,46 @@
-# mf-zipgrep
+# MobileForensic-Scan
 
-Fast, forensic-aware regex search **inside** ZIP acquisitions — a `zipgrep` built
-for mobile-forensic images.
+Fast, forensic-aware **search, export, and diff** over mobile-acquisition archives
+**and** folders — a `zipgrep` that also reads loose files and compares two
+acquisitions, built for mobile-forensic images.
 
 Mobile acquisitions are frequently delivered as large ZIP archives of a phone's
-file system. Searching them with `zipgrep` is painfully slow: it spawns a process
-per entry and copies every byte through pipes. mf-zipgrep memory-maps the archive
-and runs a SIMD regex engine straight over the bytes — and because acquisition
-ZIPs usually store entries **uncompressed** (STORED), there is nothing to
-decompress on the hot path.
+file system (or as extracted folders). Searching a ZIP with `zipgrep` is painfully
+slow: it spawns a process per entry and copies every byte through pipes. mf-scan
+memory-maps the archive and runs a SIMD regex engine straight over the bytes — and
+because acquisition ZIPs usually store entries **uncompressed** (STORED), there is
+nothing to decompress on the hot path. The same engine reads a folder of loose
+files and (with `--archive-depth`) the archives nested inside it.
 
 ```
-$ mf-zipgrep search 'IMSI' acquisition.zip
+$ mf-scan grep 'IMSI' acquisition.zip
 private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 ```
 
 - **~40–100× faster than `zipgrep`** on STORED archives (memory-mapped, no
   per-file process spawn, SIMD search).
-- **Tells you *where*, always** — every match reports the file path plus three
-  byte offsets (see [Offsets](#offsets)).
+- **Archives *and* folders** — point at a `.zip` or a directory; with
+  `--archive-depth` mf-scan opens nested `.zip` files found inside a folder and
+  searches the files within them.
+- **Tells you *where*, always** — every match reports the file path plus byte
+  offsets (see [Offsets](#offsets)).
 - **STORED + DEFLATE**: uncompressed entries are searched in place; DEFLATE
-  entries are decompressed on demand.
+  entries are decompressed on demand; loose files are read from disk.
+- **Diff two sources** (`mf-scan diff`): which files were added / removed /
+  modified between two archives or folders, and — with `--inspect` — *what changed
+  inside* recognised formats (SQLite table row-counts, plist/JSON keys, text lines).
 - **Deep inspection** (`--inspect`): for recognised formats, resolves a match to
   a meaningful location — a SQLite `table/column [TYPE]/rowid` (plus the embedded
   format when the cell is a BLOB), a JSON/plist key path, an XML element path, a
   CSV row/column, …
-- **Filter by file type** (`--type`): keep only a format or a whole category
-  (e.g. `--type sqlite`, `--type media`), recognised by content **header first**,
-  then extension — the same detection the inspectors use.
-- **Find files by path** (`--match-path`): apply the pattern to each file's
-  internal **path** instead of its content — list every file whose path matches.
-- **Export matched files out** with a re-ingestable manifest and a size cap.
+- **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
+  recognised by content **header first**, then extension.
+- **Find base64-encoded values** (`--base64`), **find files by path**
+  (`--match-path`), **decrypt app databases** (`--keyfile`).
+- **Transparent coverage**: every run logs what it skipped and why, prints a
+  scanned/skipped summary, and writes a scan-report sidecar.
+- **Export matched (or changed) files out** with a re-ingestable manifest and a
+  size cap — `grep` and `diff` share one export pipeline.
 - **Multi-threaded**, with a live progress hint on a terminal.
 
 > Additional inspectors (ABX, SEGB) are planned for a future version; see
@@ -44,7 +54,7 @@ Requires a Rust toolchain (2024 edition, e.g. Rust 1.95+).
 
 ```
 cargo build --release
-# binary at: target/release/mf-zipgrep
+# binary at: target/release/mf-scan
 ```
 
 ---
@@ -52,85 +62,127 @@ cargo build --release
 ## Quick start
 
 ```
-# Find a string and show where it is (path:0x<offset-in-file>:line)
-mf-zipgrep search 'secret' case.zip
+# Find a string in an archive and show where it is (path:0x<offset-in-file>:line)
+mf-scan grep 'secret' case.zip
 
-# Case-insensitive, literal (not a regex)
-mf-zipgrep search -i -l 'O2 UK' case.zip
+# Search a folder of loose files; open nested zips one level deep
+mf-scan grep 'secret' ./extracted --dir-mode --archive-depth 1
+
+# Walk a directory tree and search every *.zip in it (one source per archive)
+mf-scan grep 'secret' ./cases -r
 
 # Restrict to certain files, and resolve matches inside them
-mf-zipgrep search 'token' case.zip --path '*.sqlite' --path '*.plist' --inspect
-
-# Only search databases (detected by header, not just extension)
-mf-zipgrep search 'token' case.zip --type database --inspect
-
-# List every file whose path contains "banking" (no content searched)
-mf-zipgrep search 'banking' case.zip --match-path
+mf-scan grep 'token' case.zip --path '*.sqlite' --path '*.plist' --inspect
 
 # Machine-readable output to a file
-mf-zipgrep search 'token' case.zip --format json -o hits.json
+mf-scan grep 'token' case.zip --format json -o hits.json
 
 # Record matched files (with total size), review, then export them out
-mf-zipgrep search 'token' case.zip --manifest hits.json
-mf-zipgrep export case.zip --from-manifest hits.json --to ./exported --max-size 500MB
+mf-scan grep 'token' case.zip --manifest hits.json
+mf-scan export case.zip --from-manifest hits.json --to ./exported --max-size 500MB
+
+# Diff two acquisitions: which files changed, and what changed inside them
+mf-scan diff before.zip after.zip --exact --inspect
 ```
 
 ---
 
 ## Commands
 
-mf-zipgrep has two subcommands:
+mf-scan has three subcommands:
 
 | Command | Purpose |
 |---|---|
-| `search PATTERN ARCHIVE...` | Search one or more archives (or directories, with `-r`); print/record matches; optionally export files. |
-| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest and copy the listed files out (no search). |
+| `grep PATTERN SOURCE...` | Search one or more sources (archives and/or directories); print/record matches; optionally export files. |
+| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep` or `diff`) and copy the listed files out (no search). |
+| `diff A B` | Compare two sources (archives or folders): report added / removed / modified files, optionally what changed inside them, and optionally export the changed files. |
 
-### `search`
+### Sources, `--dir-mode`, and `-r`
+
+A **file** operand is always opened as an archive. A **directory** operand needs one
+of these two flags to say how to read it (there is no silent default — a directory
+with neither is rejected; the two are mutually exclusive):
+
+- `--dir-mode` — treat the directory as a **folder of interest**: scan the files
+  inside it. A nested `.zip` is an opaque file at the default `--archive-depth 0`;
+  raise the depth to open nested archives and list the files within them (`1` = one
+  level, `N` = `N` levels of nesting).
+- `-r`, `--recursive` — walk the directory tree and treat **every `*.zip`** found as
+  its own archive source (each tagged by its path).
+
+### `grep`
 
 ```
-mf-zipgrep search PATTERN ARCHIVE... [options]
+mf-scan grep PATTERN SOURCE... [options]
 ```
 
-Grep-style: the **PATTERN comes first**, then the archives. `ARCHIVE` may be
-repeated, and with `-r` a directory argument is searched recursively for its
-`*.zip` files. With more than one archive, each result is tagged with its source
-(see [Output](#output)). `--export`/`--manifest` require a single archive.
+Grep-style: the **PATTERN comes first**, then the sources. `SOURCE` may be repeated.
+With more than one source, each result is tagged with its origin (see
+[Output](#output)). `--export`/`--manifest` require a single source.
 
 | Flag | Meaning |
 |---|---|
 | `-i`, `--ignore-case` | Case-insensitive matching. |
 | `-l`, `--literal-string` | Treat PATTERN as a literal string, not a regex (alias: `--fixed-strings`). |
 | `-E`, `--extended-regexp` | Accepted for grep muscle memory; no-op (the engine is already ERE-like). |
-| `-r`, `--recursive` | Search directory arguments recursively for `*.zip` files. |
-| `--path GLOB` | Only search files whose internal path matches the wildcard. Repeatable. |
+| `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
+| `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
+| `-r`, `--recursive` | Walk a directory operand for `*.zip` files, each its own source. |
+| `--path GLOB` | Only handle files whose internal path matches the wildcard. Repeatable. |
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |
-| `-t`, `--type TYPE` | Only search files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
-| `--match-path` | Match the PATTERN against each file's internal path instead of its content; list the files whose path matches (no content is read). |
-| `--exclude-media` | Skip image/video/audio files (searched by default — see below). |
-| `--fast` | Speed preset: exclude media + all cores + a customisable exclude list (`src/preset/fast.rs`). |
+| `-t`, `--type TYPE` | Only handle files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
+| `--match-path` | Match the PATTERN against each file's internal path instead of its content. |
+| `--base64` / `--base64-urlsafe` | Also search for the base64 encoding of the pattern (any alignment). Requires `-l`; not with `--match-path`. |
+| `--exclude-media` | Skip image/video/audio files (searched by default). |
+| `--fast` | Speed preset: exclude media + a customisable exclude list. |
 | `--inspect` | Resolve matches inside recognised formats (see [Inspection](#deep-inspection)). |
-| `-c`, `--count` | Print only the match count per file (one line per file). |
+| `-c`, `--count` | Print only the match count per file. |
 | `-f`, `--format txt\|json\|csv` | Output format (default `txt`). |
 | `-o`, `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
-| `--manifest FILE` | Write a re-ingestable manifest of matched files (+ total size). |
-| `--export DIR` | Also copy matched files out, in one step. Writes `DIR/export-report.json` (run metadata + each file's SHA-256). |
-| `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G` as an accident guard. |
-| `--verify` | SHA-256 the archive before and after the run; report whether it changed (integrity attestation). |
+| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + each file's SHA-256). |
+| `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
+| `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
+| `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: beside `-o`, else `mf-scan-report.json`. |
+| `--keyfile FILE` | Decrypt profile-matched databases using keys from this keychain/keystore dump (repeatable). See [Decryption](#decryption). |
+| `--platform ios\|android` | Limit decryption profiles to one platform. |
+| `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
 
 ### `export`
 
 ```
-mf-zipgrep export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE]
+mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE]
 ```
 
-Re-ingests a manifest written by `search --manifest` and copies the listed files
-out of the archive — **without searching again**. Honours `--max-size`.
+Re-ingests a manifest written by `grep --manifest` (or `diff --manifest`) and copies
+the listed files out of the archive — **without searching again**. Honours `--max-size`.
 
-> **Vocabulary:** *export* = copy files out of the archive; *extract* is reserved
-> for extracting *meaning* (the `--inspect` analysis).
+> **Vocabulary:** *export* = copy files out; *extract* is reserved for extracting
+> *meaning* (the `--inspect` analysis).
+
+### `diff`
+
+```
+mf-scan diff A B [options]
+```
+
+Compares two sources file-by-file (paired by internal path) and reports each file as
+**added** (only in B), **removed** (only in A), **modified**, or unchanged. Each side
+may be an archive or a `--dir-mode` directory.
+
+| Flag | Meaning |
+|---|---|
+| `--exact` | Compare file **content** with SHA-256 instead of the default mtime+size check (catches edits that preserve the timestamp). |
+| `--inspect` | For a modified file of a recognised format, also report **what changed inside** it (SQLite table row-counts, plist/JSON key paths, text line counts). |
+| `--path` / `--not-path` | Restrict which files are compared. |
+| `--manifest FILE` / `--export DIR` | Write a manifest of / export the added+modified files from side B, through the same pipeline as `grep` — so `mf-scan export` can re-ingest a diff. |
+| `--archive-depth N` / `--dir-mode` | As for `grep`, applied to each side. |
+| `-f`, `--format` / `-o`, `--output` | Output format / sink. |
+
+By default `diff` uses **mtime + size** (fast); add `--exact` when a content-preserving
+timestamp could hide a change. See [docs/diff.md](docs/diff.md) for the full report
+schema and the comparison rules.
 
 ---
 
@@ -144,57 +196,78 @@ path:0x<file_offset>[:line]
 
 The offset is hex (like a hex editor). The matched `line` is shown only for
 **textual** files; binary files (SQLite, bplist, …) show just `path:0x<offset>`.
-`--inspect` appends a labelled tag; `--count` prints `path:count` per file.
+`--inspect` appends a labelled tag; `--count` prints `path:count` per file. For a
+folder source, the path reads like `backup.zip/messages.db` once nested archives are
+opened.
 
-```
-notes.txt:0x1a2:the meeting is at 5pm
-sms.db:0x500000                                  (binary: location only)
-sms.db:0x500000  [sqlite  table: message  column: text  row: 4213  cell: hello there]
-```
-
-`json` emits a `{ run, results }` object — the query and filters, then one object
-per match; `csv` emits a header row plus one row per match. Offsets are `0x…` hex
-in every format. See
+`json` emits a `{ run, stats, results }` object; `csv` emits a header row plus one row
+per match. Offsets are `0x…` hex in every format. See
 [docs/output-and-offsets.md](docs/output-and-offsets.md) for the full schema.
 
 ### Offsets
 
-Every match answers "where", completely:
+Every match answers "where":
 
 | Field | Meaning |
 |---|---|
-| `path` | File name and path inside the archive. |
-| `file_start` | Where the matching file's data begins in the archive. |
+| `path` | File name and path inside the source. |
+| `file_start` | Where the matching file's data begins in the archive (`0` for a loose file). |
 | `file_offset` | The match position **inside the file**. |
 | `archive_offset` | The match's **absolute** byte position in the archive (`= file_start + file_offset` for STORED). |
 
-For **DEFLATE** entries the match lives in the decompressed stream, which has no
-single archive byte, so `archive_offset` (in json/csv) is the compressed blob's
-start, flagged `compressed: true`. txt shows only the in-file offset.
+`archive_offset` is **omitted** (json/csv) when there is no single archive byte: a
+**loose file** in a folder, a file inside an **opened nested archive**, a **DEFLATE**
+entry (compressed blob start, flagged `compressed: true`), or **decrypted** content.
+txt shows only the in-file offset.
 
 ---
 
 ## Deep inspection (`--inspect`)
 
-When a matching file's format is recognised (by content header first, file
-extension as fallback), mf-zipgrep resolves the match to a meaningful location.
-It appends `[format summary]` in txt, and a nested `context` object in json.
+When a matching file's format is recognised (by content header first, file extension
+as fallback), mf-scan resolves the match to a meaningful location: `[format summary]`
+in txt, a nested `context` object in json.
 
 | Format | Resolves a match to |
 |---|---|
 | TXT | line and column |
 | JSON | key path + line, e.g. `$.users[3].token` |
-| XML | element path + line, e.g. `/plist/dict/string` |
+| XML | element path + line |
 | CSV | row, column, and header name |
 | plist (XML & binary `bplist`) | dict-key / array-index path, e.g. `$.Account.Servers[1]` |
-| SQLite | `table`, `column [TYPE]`, `row`, and the **decoded cell value** for live rows; otherwise `page` + offset-in-page |
+| SQLite | `table`, `column [TYPE]`, `row`, and the decoded cell value; else `page` + offset |
 
-For a SQLite **BLOB** cell, the blob's own signature is checked and, if it is a
-recognised format (e.g. an embedded `bplist`), that inspector resolves it too —
-so a match reads `column: payload [BLOB] … blob: bplist  key: $.Account.Servers`.
+The same inspectors power `diff --inspect`'s intra-file comparison. See
+[docs/inspectors.md](docs/inspectors.md).
 
-See [docs/inspectors.md](docs/inspectors.md) for details and the formats planned
-for a future version (ABX, SEGB).
+---
+
+## Decryption
+
+Encrypted app databases inside an acquisition can be decrypted using keys from a
+keychain/keystore dump, then searched and `--inspect`ed as plaintext. By default, when
+a `keychain`-named dump is found **beside the source** (e.g. `case.zip` next to
+`keychain.plist`), profile-matched databases are decrypted automatically; or point at
+one with `--keyfile FILE` (iOS keychain or Android keystore). Use `--no-decrypt` to
+turn it off.
+
+```bash
+mf-scan grep "needle" case.zip                          # auto-detect keyfile beside it
+mf-scan grep "token" case.zip --keyfile keychain.plist --platform ios
+```
+
+Per-app **profiles** (`profiles/{ios,android}/*.yml`) say which database to decrypt,
+how to find its key, and the cipher. Supported ciphers: **SQLCipher** (Signal, Wickr,
+…) and **WhatsApp crypt12/14**. Every decryption is recorded in the scan report with
+the key's provenance and the SHA-256 of the ciphertext and plaintext.
+
+> **Scope:** only works on acquisitions whose keychain was *already decrypted* by the
+> acquisition tool (a raw `keychain-2.db` cannot be decrypted offline).
+>
+> **⚠ Validation:** the ciphers are assembled from documented formats and
+> round-trip-tested, but **not yet validated against real `sqlcipher`/WhatsApp
+> output** — see [docs/decryption.md](docs/decryption.md) before relying on a
+> decryption forensically.
 
 ---
 
@@ -202,33 +275,33 @@ for a future version (ABX, SEGB).
 
 - [docs/architecture.md](docs/architecture.md) — modules, data flow, design decisions.
 - [docs/workflow.md](docs/workflow.md) — forensic workflows end to end.
+- [docs/diff.md](docs/diff.md) — the `diff` command: comparison rules, report schema, intra-file diff.
 - [docs/output-and-offsets.md](docs/output-and-offsets.md) — output formats, offsets, inspection schema.
 - [docs/inspectors.md](docs/inspectors.md) — supported formats, detection, adding one.
+- [docs/decryption.md](docs/decryption.md) — decrypting databases: architecture, formats, profiles, caveats.
+- [docs/adr/](docs/adr/) — architecture decision records (decryption; the source/container abstraction).
 
 ---
 
 ## Forensic notes
 
-- The archive is opened **read-only** and memory-mapped; mf-zipgrep never writes
-  to it. `--verify` adds a SHA-256 attestation (hash before & after the run) for
-  chain-of-custody — the hash matches the system `shasum -a 256`.
-- Offsets are **byte-accurate** for STORED entries (verifiable with `dd`/a hex
-  editor).
-- Long "lines" in binary files are capped to a window around the match for
-  display; the reported offsets are exact regardless.
+- The archive is opened **read-only** and memory-mapped; mf-scan never writes to it.
+  Loose files are read read-only. `--verify` adds a SHA-256 attestation (archive
+  sources only); the hash matches the system `shasum -a 256`.
+- Offsets are **byte-accurate** for STORED entries (verifiable with `dd`/a hex editor).
 - Search is case-sensitive unless `-i`; `--path`/`--not-path` matching is case-sensitive.
-- **All files are searched by default**, including media — completeness is the
-  forensic default, so nothing is silently skipped. `--exclude-media` (or `--fast`)
-  skips image/video/audio for speed when text content is the only target.
+- **All files are searched by default**, including media — completeness is the forensic
+  default, so nothing is silently skipped. `--exclude-media` (or `--fast`) skips
+  image/video/audio for speed when text content is the only target.
 
 ---
 
 ## Development & AI use
 
-Generative AI was used in this project mainly to assist during the coding phase.
-The original ideas and the overall structure are the owner's, and all core logic
-has been reviewed. Even so, mistakes or bugs may have slipped past proof-reading —
-please report anything unexpected.
+Generative AI was used in this project mainly to assist during the coding phase. The
+original ideas and the overall structure are the owner's, and all core logic has been
+reviewed. Even so, mistakes or bugs may have slipped past proof-reading — please report
+anything unexpected.
 
 ## License
 

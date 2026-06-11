@@ -1,0 +1,62 @@
+# _example.yml — decryption profile template.
+#
+# Profiles describe how to decrypt an app's database inside an acquisition ZIP:
+# which file to decrypt, how to find its key in the keychain/keystore dump, and
+# the cipher parameters. They are DATA, not code — add a target by adding a file.
+#
+# Place real profiles under a platform folder so they are loaded:
+#   profiles/ios/<app>.yml
+#   profiles/android/<app>.yml
+# Files at the top level (like this one) and any name starting with "_" are
+# treated as templates and skipped by the loader.
+#
+# The profile's `platform` field must match its folder name, or the loader refuses
+# it (a profile applied to the wrong acquisition type is a forensic hazard).
+#
+# Key acquisition is single-path by design: the key is always located in the
+# supplied keychain/keystore dump via the `keychain` criteria below. There is no
+# command-line key override — provide the dump, the profiles do the rest.
+
+# --- Identity ---------------------------------------------------------------
+name: example-app-ios            # stable id, used in provenance output
+app: ExampleApp                  # display name
+platform: ios                    # ios | android — must match the folder
+description: One-line description shown in help and provenance.   # optional
+
+# --- Which database to decrypt ----------------------------------------------
+# Exactly one of `glob` or `path`:
+db:
+  glob: "*/ExampleApp/**/*.sqlite"   # wildcard match (*, ?), any depth
+# db:
+#   path: "App/ExampleApp/db.sqlite" # one exact internal path
+
+# --- How to locate and decode the key ---------------------------------------
+key:
+  # How the located key bytes are encoded:
+  #   raw        — the bytes are the derived key, used as-is (no KDF)
+  #   hex        — ASCII hex text decoding to the derived key
+  #   base64     — standard-alphabet base64 text decoding to the derived key
+  #   passphrase — the bytes are a passphrase; the cipher runs its KDF over them
+  encoding: raw
+  # Keychain/keystore lookup criteria. Each field is optional; an unset field is
+  # a wildcard. A secret matches when every SET field equals the dump item's
+  # corresponding attribute. (Android Keystore entries are mapped onto these same
+  # iOS-style fields by their loader.)
+  keychain:
+    service: ExampleService      # keychain `svc`
+    account: ExampleAccount      # keychain `acct`
+    # access_group: group.com.example   # keychain `agrp`
+    # label: Example Key
+
+# --- Cipher -----------------------------------------------------------------
+cipher:
+  algorithm: sqlcipher           # the only scheme implemented so far
+  # SQLCipher knobs — shown with their SQLCipher 4 defaults. Omit any you do not
+  # need to change. For a SQLCipher 3 database, set: kdf_iter: 64000, hmac: sha1,
+  # kdf: sha1.
+  page_size: 4096
+  kdf_iter: 256000
+  hmac: sha512                   # sha1 | sha256 | sha512
+  kdf: sha512                    # sha1 | sha256 | sha512
+  use_hmac: true
+  plaintext_header_size: 0       # bytes of cleartext header before the cipher data

@@ -1,0 +1,41 @@
+# _example.yml — preset template.
+# Copy this file, rename it (e.g. mobile.yml), edit the fields you want, then
+# load it with:
+#   mf-zipgrep search PATTERN ARCHIVE --preset mobile
+#
+# All fields are optional. Unset fields leave the CLI default unchanged.
+# CLI flags always take precedence over preset values.
+# Vec fields (path, not_path, file_type) are merged: preset values are appended
+# to any values already given on the command line.
+#
+# See docs/presets.md for the full field reference and examples.
+
+# --- Boolean flags (default: false) ---
+
+# exclude_media: true     # Skip image/video/audio files.
+# ignore_case: false      # Case-insensitive matching.
+# literal_string: false   # Treat the pattern as a literal string, not a regex.
+# recursive: false        # Search directories recursively for *.zip files.
+# match_path: false       # Match the pattern against entry paths, not content.
+# inspect: false          # Enrich matches with format-specific context.
+# count: false            # Print match counts per file instead of each match.
+# verify: false           # SHA-256 archive integrity attestation.
+
+# --- Numeric options ---
+
+# threads: 4              # Number of search threads (default: one per CPU core).
+
+# --- Path filter lists ---
+
+# path:                   # Only search entries whose internal path matches these globs.
+#   - "*/Documents/*"
+#   - "*/Downloads/*"
+
+# not_path:               # Skip entries whose internal path matches these globs.
+#   - "*/Caches/*"
+#   - "*/tmp/*"
+#   - "*.log"
+
+# file_type:              # Only search files of these types (format or category).
+#   - sqlite
+#   - plist

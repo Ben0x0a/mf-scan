@@ -15,11 +15,11 @@
 //! are frequently partial or corrupt. References: the SQLite file format spec
 //! (database header, b-tree pages, record format, varints).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::json;
 
-use crate::models::Inspection;
+use crate::models::{ContentDiff, Inspection};
 
 const TABLE_LEAF: u8 = 0x0d;
 const TABLE_INTERIOR: u8 = 0x05;
@@ -75,6 +75,85 @@ impl super::Inspector for Sqlite {
         // Uncommitted rows live in the WAL; export these so the DB opens complete.
         &["-wal", "-shm", "-journal"]
     }
+    fn diff(&self, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
+        table_diff(old, new)
+    }
+}
+
+/// Diff two databases at the table level: which tables were added/removed and which
+/// changed row count. Row identity (which *rows* changed) is out of scope; a
+/// row-count delta is the high-value "what changed inside" for a forensic DB.
+fn table_diff(old: &[u8], new: &[u8]) -> Option<ContentDiff> {
+    let counts_old = table_counts(old, &parse_header(old)?);
+    let counts_new = table_counts(new, &parse_header(new)?);
+
+    let mut added: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut changed: Vec<(String, usize, usize)> = Vec::new();
+    for (name, &rows_new) in &counts_new {
+        match counts_old.get(name) {
+            None => added.push(name.clone()),
+            Some(&rows_old) if rows_old != rows_new => {
+                changed.push((name.clone(), rows_old, rows_new))
+            }
+            Some(_) => {}
+        }
+    }
+    for name in counts_old.keys() {
+        if !counts_new.contains_key(name) {
+            removed.push(name.clone());
+        }
+    }
+
+    // One-line summary: the first few row-count changes, then table add/remove tallies.
+    let mut parts: Vec<String> = changed
+        .iter()
+        .take(5)
+        .map(|(name, a, b)| format!("{name} {a}→{b} rows"))
+        .collect();
+    if changed.len() > 5 {
+        parts.push(format!("+{} more table(s)", changed.len() - 5));
+    }
+    if !added.is_empty() {
+        parts.push(format!("+{} table(s)", added.len()));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("-{} table(s)", removed.len()));
+    }
+    let summary = if parts.is_empty() {
+        // The file differs (the caller only diffs modified files), but row counts and
+        // the table set are unchanged — e.g. in-place cell edits, which this
+        // table-level view does not resolve.
+        "no table or row-count changes detected (in-place edits)".to_string()
+    } else {
+        parts.join("; ")
+    };
+
+    let detail = json!({
+        "tables_added": added,
+        "tables_removed": removed,
+        "tables_changed": changed
+            .iter()
+            .map(|(name, a, b)| json!({ "table": name, "rows_a": a, "rows_b": b }))
+            .collect::<Vec<_>>(),
+    });
+    Some(ContentDiff {
+        format: "sqlite".into(),
+        summary,
+        detail,
+    })
+}
+
+/// Map every table name to its row count (number of table-leaf cells under its root).
+fn table_counts(content: &[u8], db: &Db) -> BTreeMap<String, usize> {
+    read_schema(content, db)
+        .into_iter()
+        .map(|t| {
+            let mut rows = 0usize;
+            for_each_leaf_cell(content, db, t.rootpage, &mut |_| rows += 1);
+            (t.name, rows)
+        })
+        .collect()
 }
 
 /// Resolve `offset` to a table cell, or fall back to page + offset-in-page.
@@ -159,18 +238,49 @@ fn resolve(
                 let ty = serial_type_name(col.serial);
                 let cell_value = render_cell(content, col);
 
-                let mut summary = format!(
-                    "table: {}  column: {} [{}]  row: {}  cell: {}",
-                    table.name, column, ty, cell.rowid, cell_value
-                );
-                let mut detail = json!({
-                    "page": page,
-                    "table": table.name,
-                    "rowid": cell.rowid,
-                    "column": column,
-                    "type": ty,
-                    "cell": cell_value,
-                });
+                // When the match is in sqlite_schema.sql, check if it lands
+                // on a column name token in the CREATE TABLE definition.
+                let defines_column = if table.name == "sqlite_schema" && column == "sql" {
+                    col_text(content, Some(col)).and_then(|sql_text| {
+                        let rel = offset - col.start;
+                        parse_column_spans(&sql_text)
+                            .into_iter()
+                            .find(|(_, s, e)| rel >= *s && rel < *e)
+                            .map(|(name, _, _)| name)
+                    })
+                } else {
+                    None
+                };
+
+                let mut summary = match &defines_column {
+                    Some(def_col) => format!(
+                        "table: {}  column: {} [{}]  (defines column: {})  row: {}  cell: {}",
+                        table.name, column, ty, def_col, cell.rowid, cell_value
+                    ),
+                    None => format!(
+                        "table: {}  column: {} [{}]  row: {}  cell: {}",
+                        table.name, column, ty, cell.rowid, cell_value
+                    ),
+                };
+                let mut detail = match &defines_column {
+                    Some(def_col) => json!({
+                        "page": page,
+                        "table": table.name,
+                        "rowid": cell.rowid,
+                        "column": column,
+                        "type": ty,
+                        "defines_column": def_col,
+                        "cell": cell_value,
+                    }),
+                    None => json!({
+                        "page": page,
+                        "table": table.name,
+                        "rowid": cell.rowid,
+                        "column": column,
+                        "type": ty,
+                        "cell": cell_value,
+                    }),
+                };
 
                 // A BLOB may itself be a recognised format (e.g. a bplist stored
                 // in a cell). Classify it by signature and, when an inspector
@@ -474,12 +584,17 @@ fn col_int(content: &[u8], col: Option<&Col>) -> Option<i64> {
 }
 
 /// Extract column names from a `CREATE TABLE` statement.
-///
-/// HOW: take the parenthesised body, split it at top-level commas, and read the
-/// first token of each part as the column name — skipping table-level
-/// constraint clauses (PRIMARY KEY, UNIQUE, ...). This is a pragmatic parse, not
-/// a full SQL grammar; it covers the column lists seen in practice.
 fn parse_columns(sql: &str) -> Vec<String> {
+    parse_column_spans(sql)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect()
+}
+
+/// Like `parse_columns` but also returns each name's byte span `[start, end)`
+/// within `sql`, so callers can check whether a match offset lands in a column
+/// name token.
+fn parse_column_spans(sql: &str) -> Vec<(String, usize, usize)> {
     let Some(open) = sql.find('(') else {
         return Vec::new();
     };
@@ -487,49 +602,70 @@ fn parse_columns(sql: &str) -> Vec<String> {
         return Vec::new();
     };
     let inner = &sql[open + 1..close];
+    let base = open + 1;
 
-    let mut columns = Vec::new();
     let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut parts = Vec::new();
+    let mut seg_start = 0usize;
+    let mut parts: Vec<(usize, usize)> = Vec::new();
     for (i, ch) in inner.char_indices() {
         match ch {
             '(' => depth += 1,
             ')' => depth -= 1,
             ',' if depth == 0 => {
-                parts.push(&inner[start..i]);
-                start = i + 1;
+                parts.push((seg_start, i));
+                seg_start = i + 1;
             }
             _ => {}
         }
     }
-    parts.push(&inner[start..]);
+    parts.push((seg_start, inner.len()));
 
-    for part in parts {
-        let token = first_token(part.trim());
-        if token.is_empty() {
+    let mut result = Vec::new();
+    for (ps, pe) in parts {
+        let part = &inner[ps..pe];
+        let trimmed = part.trim_start();
+        if trimmed.is_empty() {
             continue;
         }
-        let upper = token.to_ascii_uppercase();
+        let leading = part.len() - trimmed.len();
+        let (name, name_byte_len) = first_token_with_len(trimmed);
+        if name.is_empty() {
+            continue;
+        }
+        let upper = name.to_ascii_uppercase();
         if matches!(
             upper.as_str(),
             "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "CONSTRAINT" | "KEY"
         ) {
             continue;
         }
-        columns.push(token);
+        let tok_start = base + ps + leading;
+        result.push((name, tok_start, tok_start + name_byte_len));
     }
-    columns
+    result
 }
 
 /// Read the first identifier of a column definition, honouring the quoting
-/// styles SQLite accepts (`"x"`, `` `x` ``, `[x]`, or bare).
-fn first_token(part: &str) -> String {
+/// styles SQLite accepts (`"x"`, `` `x` ``, `[x]`, or bare). Returns the name
+/// and its byte length in `part` (including surrounding quotes when present).
+fn first_token_with_len(part: &str) -> (String, usize) {
     let mut chars = part.chars();
     match chars.next() {
-        Some('"') => chars.take_while(|&c| c != '"').collect(),
-        Some('`') => chars.take_while(|&c| c != '`').collect(),
-        Some('[') => chars.take_while(|&c| c != ']').collect(),
+        Some('"') => {
+            let name: String = chars.take_while(|&c| c != '"').collect();
+            let byte_len = name.len() + 2;
+            (name, byte_len)
+        }
+        Some('`') => {
+            let name: String = chars.take_while(|&c| c != '`').collect();
+            let byte_len = name.len() + 2;
+            (name, byte_len)
+        }
+        Some('[') => {
+            let name: String = chars.take_while(|&c| c != ']').collect();
+            let byte_len = name.len() + 2;
+            (name, byte_len)
+        }
         Some(first) => {
             let mut s = String::from(first);
             for c in chars {
@@ -538,9 +674,10 @@ fn first_token(part: &str) -> String {
                 }
                 s.push(c);
             }
-            s
+            let byte_len = s.len();
+            (s, byte_len)
         }
-        None => String::new(),
+        None => (String::new(), 0),
     }
 }
 

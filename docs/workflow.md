@@ -5,7 +5,7 @@ End-to-end recipes for common forensic tasks.
 ## 1. Find where a value occurs
 
 ```
-mf-zipgrep search 'IMSI' acquisition.zip
+mf-scan grep 'IMSI' acquisition.zip
 ```
 
 Output is `path:0x<file_offset>` plus, for textual files, the matched line. The
@@ -26,16 +26,16 @@ The `--path` filter matches an entry's **internal path** with wildcards
 
 ```
 # only SQLite databases and plists
-mf-zipgrep search 'token' acquisition.zip --path '*.sqlite' --path '*.plist'
+mf-scan grep 'token' acquisition.zip --path '*.sqlite' --path '*.plist'
 
 # anything under a Messages container
-mf-zipgrep search 'hello' acquisition.zip --path '*/Messages/*'
+mf-scan grep 'hello' acquisition.zip --path '*/Messages/*'
 ```
 
 Exclude with `--not-path` (takes precedence over `--path`):
 
 ```
-mf-zipgrep search 'token' acquisition.zip --not-path '*Caches*' --not-path '*.log'
+mf-scan grep 'token' acquisition.zip --not-path '*Caches*' --not-path '*.log'
 ```
 
 **All files are searched by default**, including media. To skip image/video/audio
@@ -51,10 +51,10 @@ and a `.jpg` that is really a renamed database is not mistaken for an image:
 
 ```
 # Only SQLite databases (any name), then resolve matches inside them
-mf-zipgrep search 'token' acquisition.zip --type sqlite --inspect
+mf-scan grep 'token' acquisition.zip --type sqlite --inspect
 
 # A whole category: every image/video/audio file
-mf-zipgrep search -i 'secret' acquisition.zip --type media
+mf-scan grep -i 'secret' acquisition.zip --type media
 ```
 
 Values are format names (`sqlite`, `jpeg`, `plist`, …) or categories (`media`,
@@ -69,10 +69,10 @@ the PATTERN to each file's internal path and lists the matches (no bytes read):
 
 ```
 # Every file with "banking" anywhere in its path
-mf-zipgrep search 'banking' acquisition.zip --match-path
+mf-scan grep 'banking' acquisition.zip --match-path
 
 # Combine with --export to copy them all out
-mf-zipgrep search 'WhatsApp' acquisition.zip --match-path --export ./whatsapp
+mf-scan grep 'WhatsApp' acquisition.zip --match-path --export ./whatsapp
 ```
 
 ## 3. Understand a match (deep inspection)
@@ -81,7 +81,7 @@ Add `--inspect` to resolve a match to a meaningful location inside structured
 files:
 
 ```
-mf-zipgrep search 'alice@example.com' acquisition.zip --path '*.sqlite' --inspect
+mf-scan grep 'alice@example.com' acquisition.zip --path '*.sqlite' --inspect
 # sms.db:0x500000  [sqlite  table: message  column: sender  row: 4213  cell: alice@example.com]
 ```
 
@@ -91,8 +91,8 @@ filter on programmatically (e.g. all hits in a given SQLite table).
 ## 4. Machine-readable output
 
 ```
-mf-zipgrep search 'token' acquisition.zip --format json -o hits.json
-mf-zipgrep search 'token' acquisition.zip --format csv  -o hits.csv
+mf-scan grep 'token' acquisition.zip --format json -o hits.json
+mf-scan grep 'token' acquisition.zip --format csv  -o hits.csv
 ```
 
 Pipe-friendly too: when stdout is not a terminal there is no colour and no
@@ -104,12 +104,12 @@ The recommended pattern separates *deciding what to export* from *exporting it*:
 
 ```
 # 1) Search and record the matched files (and the total size) without copying.
-mf-zipgrep search 'private_key' acquisition.zip --manifest hits.json
+mf-scan grep 'private_key' acquisition.zip --manifest hits.json
 
 #    stderr: "manifest: 37 files, 412300191 bytes total -> hits.json"
 
 # 2) Review hits.json / the total. Then export, with a guard rail.
-mf-zipgrep export acquisition.zip --from-manifest hits.json --to ./exported --max-size 1G
+mf-scan export acquisition.zip --from-manifest hits.json --to ./exported --max-size 1G
 ```
 
 - The manifest is **re-ingestable**: it records each matched file's internal
@@ -126,24 +126,24 @@ mf-zipgrep export acquisition.zip --from-manifest hits.json --to ./exported --ma
 When the review step is not needed:
 
 ```
-mf-zipgrep search 'private_key' acquisition.zip --export ./exported --max-size 1G --manifest hits.json
+mf-scan grep 'private_key' acquisition.zip --export ./exported --max-size 1G --manifest hits.json
 ```
 
 ## 6. Search several archives at once
 
-List several archives after the PATTERN, or point `-r` at a directory to search
+List several archives after the PATTERN, or pass a directory with `-r` to search
 every `*.zip` under it:
 
 ```
-mf-zipgrep search 'IMSI' case-a.zip case-b.zip
-mf-zipgrep search -r 'IMSI' ./acquisitions/
+mf-scan grep 'IMSI' case-a.zip case-b.zip
+mf-scan grep 'IMSI' ./acquisitions/ -r
 ```
 
-With more than one archive each result is tagged with its source: in txt the
-archive joins the path like a folder (`case-a.zip/private/.../sms.db:0x..`); under
-`-r` the archive is shown **relative to the directory** (`sub/case-b.zip/...`).
-json/csv carry it as an `archive` field/column. A single archive is untagged.
-`--export`/`--manifest` require a single archive.
+With more than one source each result is tagged with its origin: in txt the archive
+joins the path like a folder (`case-a.zip/private/.../sms.db:0x..`); under a directory
+it is shown **relative to the directory** (`sub/case-b.zip/...`). json/csv carry it as an
+`archive` field/column. A single source is untagged. `--export`/`--manifest` require a
+single source.
 
 ## 7. Output layout of exported files
 
@@ -178,6 +178,46 @@ exported/
   sms.db_a3f2c1d0e5/sms.db
   sms.db_a3f2c1d0e5/sms.db-wal
 ```
+
+## 8. Scan a folder (and the archives inside it)
+
+When the acquisition is an **extracted folder** rather than a `.zip`, scan it with
+`--dir-mode`. By default a `.zip` found inside the folder is an opaque file;
+`--archive-depth` opens nested archives and searches the files within them:
+
+```
+# Scan the folder's loose files only (nested zips are opaque)
+mf-scan grep 'token' ./extracted --dir-mode
+
+# Also open nested zips one level deep — matches read like backup.zip/messages.db
+mf-scan grep 'token' ./extracted --dir-mode --archive-depth 1
+
+# Two levels: also open a zip found inside a nested zip
+mf-scan grep 'token' ./extracted --dir-mode --archive-depth 2
+```
+
+A folder source has no single archive byte, so `--verify` is skipped for it and
+`archive_offset` is absent in json/csv (see
+[output-and-offsets.md](output-and-offsets.md)). Loose files are read on demand; only
+opened nested archives are held in memory.
+
+## 9. Diff two acquisitions
+
+Compare two captures — which files were added, removed, or modified — and, with
+`--inspect`, what changed inside them:
+
+```
+# Fast metadata diff (size + mtime)
+mf-scan diff before.zip after.zip
+
+# Exact (SHA-256) diff, with intra-file detail and a JSON report
+mf-scan diff before.zip after.zip --exact --inspect -f json -o delta.json
+
+# Diff two extracted folders, then export the changed files
+mf-scan diff before/ after/ --dir-mode --export ./delta
+```
+
+See [diff.md](diff.md) for the comparison rules and report schema.
 
 ## Notes
 

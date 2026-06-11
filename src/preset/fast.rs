@@ -1,25 +1,16 @@
-//! The `--fast` preset — speed-oriented defaults bundled behind one flag.
+//! Compiled-in fallback for the `--fast` preset.
 //!
-//! Defines: `FAST_EXCLUDE_GLOBS`, the editable list of path globs that `--fast`
-//! skips, on top of the always-on speed options.
-//! Used by: `main` (when `--fast` is set, these globs are added to the filter's
-//! excludes, and media is excluded).
+//! Defines: `FAST_EXCLUDE_GLOBS`, the fallback path-glob list used by `--fast`
+//! when `presets/_fast.yml` cannot be found or read.
+//! Used by: `run` (fallback path in the `--fast` preset-loading block).
 //! Uses: nothing.
 //!
-//! What `--fast` does today: excludes media files (which are searched by
-//! default), uses all CPU cores (already the default), and skips the path globs
-//! listed below. As the preset grows, add more here.
-//!
-//! ── Customising the preset ──────────────────────────────────────────────────
-//! Edit `FAST_EXCLUDE_GLOBS` to tune what `--fast` treats as noise. Each entry is
-//! a wildcard matched against an entry's internal path, exactly like `--not-path`
-//! (`*` matches any run including `/`, `?` matches one character). The list is
-//! kept here, in one obvious place, so it is easy to extend without touching the
-//! search logic. For one-off exclusions, prefer `--not-path` on the command line.
-//!
-//! Kept intentionally empty for now (so `--fast` == exclude-media + multithread).
-//! Examples that may be added as reliably-noisy locations are identified:
-//!   "*/Caches/*", "*/tmp/*", "*.log"
+//! The canonical source for `--fast` behaviour is now `presets/_fast.yml`, which
+//! ships alongside the binary and can be edited without recompiling. This file
+//! exists only so that `--fast` still works in environments where the `presets/`
+//! directory is absent (e.g. a bare dev build without the folder copied in).
+//! To customise `--fast`, edit `presets/_fast.yml` — changes here affect only
+//! the fallback path.
 
 /// Path globs skipped by `--fast`, in addition to the always-on speed options.
 /// See the module docs for how to customise this.

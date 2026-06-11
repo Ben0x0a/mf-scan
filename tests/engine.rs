@@ -2,7 +2,7 @@
 //!
 //! Defines: a test that searches an archive containing both a STORED and a
 //! DEFLATE entry and checks ordering, offsets, and the compressed flag.
-//! Uses: `common` (fixture builder), `flate2` (compress), `mf_zipgrep::engine`,
+//! Uses: `common` (fixture builder), `flate2` (compress), `mf_scan::engine`,
 //! `regex::bytes`.
 
 mod common;
@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{FileSpec, build_zip};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
-use mf_zipgrep::engine::{NoProgress, Progress, search_archive, search_with_progress};
-use mf_zipgrep::filter::EntryFilter;
+use mf_scan::engine::{NoProgress, Progress, search_archive, search_with_progress};
+use mf_scan::filter::EntryFilter;
 use regex::bytes::Regex;
 
 /// A filter that searches everything.
@@ -56,7 +56,7 @@ fn searches_stored_and_deflate_in_order() {
     // STORED archive offset is exact.
     assert_eq!(
         stored.archive_offset,
-        stored.file_start + stored.file_offset
+        Some(stored.file_start + stored.file_offset)
     );
 
     // DEFLATE second: offset is into the decompressed stream, archive offset is
@@ -65,7 +65,7 @@ fn searches_stored_and_deflate_in_order() {
     assert_eq!(deflated.path, "c.bin");
     assert!(deflated.compressed);
     assert_eq!(deflated.file_offset, 3);
-    assert_eq!(deflated.archive_offset, deflated.file_start);
+    assert_eq!(deflated.archive_offset, Some(deflated.file_start));
 }
 
 #[test]

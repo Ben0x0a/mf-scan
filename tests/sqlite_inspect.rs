@@ -3,11 +3,11 @@
 //! Defines: tests that a match offset resolves to table/rowid/column for live
 //! table-leaf cells, falls back to page+offset elsewhere, and that header-first
 //! detection works on a misnamed file.
-//! Uses: `mf_zipgrep::inspect` and the committed `fixtures/messages.sqlite`
+//! Uses: `mf_scan::inspect` and the committed `fixtures/messages.sqlite`
 //! (built with sqlite3: tables `messages(id,sender,body)` and
 //! `notes(note_id,content)`).
 
-use mf_zipgrep::inspect::inspect;
+use mf_scan::inspect::{diff, inspect};
 
 const DB: &[u8] = include_bytes!("fixtures/messages.sqlite");
 /// A database whose `items.payload` BLOB holds an Apple binary plist.
@@ -103,4 +103,23 @@ fn blob_cell_is_classified_and_inspected_by_signature() {
         "summary: {}",
         insp.summary
     );
+}
+
+#[test]
+fn diff_reports_table_changes_between_databases() {
+    // messages.sqlite has `messages`+`notes`; blob.sqlite has `items`.
+    let d = diff("messages.sqlite", DB, BLOB_DB).expect("a sqlite content diff");
+    assert_eq!(d.format, "sqlite");
+    let removed = d.detail["tables_removed"].as_array().unwrap();
+    let added = d.detail["tables_added"].as_array().unwrap();
+    assert!(removed.iter().any(|t| t == "messages"));
+    assert!(removed.iter().any(|t| t == "notes"));
+    assert!(added.iter().any(|t| t == "items"));
+}
+
+#[test]
+fn diff_of_identical_databases_reports_no_changes() {
+    let d = diff("messages.sqlite", DB, DB).unwrap();
+    assert_eq!(d.format, "sqlite");
+    assert!(d.summary.contains("no table or row-count changes"));
 }

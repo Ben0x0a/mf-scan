@@ -1,0 +1,37 @@
+# WhatsApp (Android) — msgstore.db.crypt14 (AES-256-GCM over a zlib-compressed DB).
+#
+# ⚠ STATUS — read before relying on this profile:
+#   1. The crypt12/14 CIPHER is implemented (AES-256-GCM + the WhatsApp "backup
+#      encryption" KDF + zlib; the 16-byte IV is located by trying candidate
+#      offsets, with the GCM tag confirming the right one). It is assembled from
+#      the documented format but is NOT yet validated against a real WhatsApp
+#      backup — confirm with a known-answer test (a genuine .crypt14 + `key` file).
+#   2. KEY-SOURCING GAP. On Android the decryption key is the `key` file at
+#      /data/data/com.whatsapp/files/key — a file *inside the acquisition*, NOT a
+#      keystore dump. The current framework loads keys from keychain/keystore
+#      dumps, so this profile only works if you place the raw `key` file bytes into
+#      the supplied dump as a secret matching the criteria below. A "key from an
+#      archive file" provider is a documented follow-up (see docs/decryption.md).
+#   3. crypt15 (the newer, 64-digit-passphrase format) is not covered here; its key
+#      derivation and offsets differ and need a real sample.
+
+name: whatsapp-android
+app: WhatsApp
+platform: android
+description: WhatsApp Android msgstore crypt14 (AES-256-GCM). See the status note above.
+
+db:
+  glob: "*/msgstore.db.crypt14"
+
+key:
+  # The raw `key` file contents; the cipher applies WhatsApp's backup-key KDF.
+  encoding: raw
+  keychain:
+    # Placeholder — populate this from the extracted `key` file (see the gap above).
+    service: WhatsAppKeyFile
+
+cipher:
+  algorithm: whatsapp-crypt
+  # Candidate IV offsets; the GCM tag rejects any wrong guess. Override if needed.
+  iv_offsets: [8, 51, 67, 191]
+  zlib: true

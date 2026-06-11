@@ -28,7 +28,7 @@
 //! category `media`) used by `--type` and the media skip — they detect but do
 //! not resolve.
 
-use crate::models::Inspection;
+use crate::models::{ContentDiff, Inspection};
 
 // Structured / database / text inspectors (resolve offsets).
 mod csv;
@@ -37,6 +37,9 @@ mod plist;
 mod sqlite;
 mod txt;
 mod xml;
+
+// Shared helper: structured diff of two JSON value trees (used by json + plist).
+mod value_diff;
 
 // Media inspectors — the `media` category, one file per format under
 // `inspect/media/` (classify only). Its `mod.rs` is the category aggregator
@@ -71,6 +74,15 @@ pub trait Inspector: Sync {
     /// Resolve a match at `offset` to a meaningful location. Return `None` when
     /// the offset can't be placed; the caller then emits a plain record.
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection>;
+
+    /// Describe what changed *inside* a modified file of this format, comparing the
+    /// `old` (side A) and `new` (side B) bytes, for `diff --inspect`. Return `None`
+    /// when this format has no structured diff or the bytes cannot be parsed; the
+    /// caller then reports the file as modified with no intra-file detail. Default:
+    /// no structured diff.
+    fn diff(&self, _old: &[u8], _new: &[u8]) -> Option<ContentDiff> {
+        None
+    }
 
     /// Sidecar file suffixes exported alongside a matched file of this format
     /// (e.g. SQLite's `-wal`). Default: none. Declaring them here is all it takes
@@ -138,6 +150,14 @@ pub fn inspect(name: &str, content: &[u8], offset: usize) -> Option<Inspection> 
     detect(name, content)?.inspect(content, offset)
 }
 
+/// Describe what changed inside a modified file, comparing `old` (side A) and `new`
+/// (side B) bytes. The format is detected from `new` (the file's name is the same on
+/// both sides). Returns `None` when the format is unsupported/undetected or has no
+/// structured diff — the caller then reports the file as modified without detail.
+pub fn diff(name: &str, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
+    detect(name, new)?.diff(old, new)
+}
+
 /// Sidecar suffixes to export alongside a matched file (empty if unrecognised).
 ///
 /// Lets `export` fetch each format's associated files without hard-coding them:
@@ -170,6 +190,7 @@ pub(crate) fn detect_by_header(content: &[u8]) -> Option<&'static dyn Inspector>
 
 /// The detected format name and category of a file (header-first, then
 /// extension), used by the `--type` filter and the media skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeInfo {
     pub name: &'static str,
     pub category: &'static str,

@@ -3,7 +3,7 @@
 //! Defines: tests covering match offset/line reporting, the match's position
 //! within its line (for highlighting), case-insensitive matching, multiple
 //! matches, no-match, regex (vs literal) behaviour, and DEFLATE search.
-//! Uses: `common` (fixture builder), `mf_zipgrep::{zip, search}`, `regex::bytes`
+//! Uses: `common` (fixture builder), `mf_scan::{zip, search}`, `regex::bytes`
 //! to compile patterns the way `main.rs` does, and `flate2` to compress.
 
 mod common;
@@ -13,9 +13,9 @@ use std::io::Write;
 use common::{FileSpec, build_zip};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
-use mf_zipgrep::models::SearchHit;
-use mf_zipgrep::search::search_entry;
-use mf_zipgrep::zip::parse_entries;
+use mf_scan::models::SearchHit;
+use mf_scan::search::search_entry;
+use mf_scan::source::zip::parse_entries;
 use regex::bytes::{Regex, RegexBuilder};
 
 fn compile(pattern: &str, ignore_case: bool) -> Regex {

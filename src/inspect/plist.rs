@@ -12,11 +12,16 @@
 //!    byte span contains the offset is located, then a path to it is found by
 //!    walking the object graph from the root.
 
+use std::io::Cursor;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::models::Inspection;
+use crate::inspect::value_diff::diff_values;
+use crate::models::{ContentDiff, Inspection};
 
 /// plist inspector — Apple property lists, both binary (`bplist00`) and XML.
 pub struct Plist;
@@ -45,6 +50,44 @@ impl super::Inspector for Plist {
     }
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
         resolve(content, offset)
+    }
+    fn diff(&self, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
+        // Both encodings (XML/binary) parse to one logical tree; convert each to a
+        // JSON value and reuse the shared structured diff (same as the JSON inspector).
+        let old = plist_to_json(&plist::Value::from_reader(Cursor::new(old)).ok()?);
+        let new = plist_to_json(&plist::Value::from_reader(Cursor::new(new)).ok()?);
+        Some(diff_values("plist", &old, &new))
+    }
+}
+
+/// Convert a parsed plist value into a JSON value for the structured diff.
+///
+/// Scalars map directly; `Data` is base64-encoded and `Date`/`Uid` are tagged
+/// strings, so any change in those still surfaces as a value change while keeping
+/// the tree comparable as plain JSON.
+fn plist_to_json(v: &plist::Value) -> Value {
+    match v {
+        plist::Value::Array(a) => Value::Array(a.iter().map(plist_to_json).collect()),
+        plist::Value::Dictionary(d) => Value::Object(
+            d.iter()
+                .map(|(k, val)| (k.clone(), plist_to_json(val)))
+                .collect(),
+        ),
+        plist::Value::Boolean(b) => Value::Bool(*b),
+        plist::Value::String(s) => Value::String(s.clone()),
+        plist::Value::Integer(i) => i
+            .as_signed()
+            .map(Value::from)
+            .or_else(|| i.as_unsigned().map(Value::from))
+            .unwrap_or(Value::Null),
+        plist::Value::Real(r) => {
+            serde_json::Number::from_f64(*r).map_or(Value::Null, Value::Number)
+        }
+        plist::Value::Data(bytes) => Value::String(format!("data:{}", BASE64.encode(bytes))),
+        plist::Value::Date(date) => Value::String(format!("date:{date:?}")),
+        plist::Value::Uid(uid) => Value::String(format!("uid:{}", uid.get())),
+        // `plist::Value` is non-exhaustive; an unknown kind compares as null.
+        _ => Value::Null,
     }
 }
 

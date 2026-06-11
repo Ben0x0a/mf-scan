@@ -1,0 +1,18 @@
+# _fast preset — loaded by --fast.
+# Speed-oriented defaults: exclude media files and skip noisy path globs.
+# CLI flags always override preset values; both --not-path and this preset's
+# not_path list are applied together.
+#
+# Edit not_path to tune what --fast treats as noise for your cases.
+# Each glob is matched against the entry's internal path (* matches any run
+# including /, ? matches one character) — exactly like --not-path.
+#
+# See docs/presets.md for the full field reference.
+
+exclude_media: true
+
+not_path: []
+# Examples:
+#   - "*/Caches/*"
+#   - "*/tmp/*"
+#   - "*.log"

@@ -1,21 +1,27 @@
-//! ZIP central-directory parser (STORED + DEFLATE entries, with ZIP64 support).
+//! ZIP archive source: central-directory parser + the [`ZipSource`] container.
 //!
 //! Defines: `parse_entries`, which reads a ZIP archive's Central Directory and
-//! resolves, for every searchable file, the byte range of its data inside the
-//! archive along with its compression method.
-//! Used by: `main.rs` (orchestration) — the returned ranges feed `search.rs`.
-//! Uses: `crate::models::{Entry, Method}` (data containers) and `anyhow` (error
-//! context). All integer decoding is done by hand so the parsing flow stays
-//! explicit and learnable.
+//! resolves every searchable file's byte range and compression method; `content`,
+//! which borrows a STORED entry's bytes from the archive or inflates a DEFLATE one;
+//! and [`ZipSource`], the [`crate::source::Source`] over a memory-mapped archive.
+//! Used by: `source` (the open helpers), `engine` (search over a `Source`) and
+//! `report::export` (re-reads matched files' bytes).
+//! Uses: `crate::models::{Entry, Location, Method}`, `flate2` (inflate), `anyhow`.
+//! All integer decoding is done by hand so the parsing flow stays explicit.
 //!
 //! Why CD-first instead of a blind linear scan: the Central Directory is the
 //! authoritative record of every entry (local headers may carry zeroed sizes
 //! when a data descriptor is used). Parsing it first gives exact data ranges,
 //! lets us skip header bytes, and tells us each entry's method.
 
-use anyhow::{Context, Result, bail, ensure};
+use std::borrow::Cow;
+use std::io::Read;
 
-use crate::models::{Entry, Method};
+use anyhow::{Context, Result, bail, ensure};
+use flate2::read::DeflateDecoder;
+
+use crate::models::{Entry, Location, Method};
+use crate::source::Source;
 
 // --- ZIP record signatures (little-endian on disk) ---------------------------
 // These are fixed by the ZIP specification (APPNOTE.TXT), not operator-tunable,
@@ -125,6 +131,9 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     );
 
     let method_code = read_u16(data, pos + 10)?;
+    // Last-modified DOS time/date (2 bytes each), decoded for `diff`'s mtime compare.
+    let dos_time = read_u16(data, pos + 12)?;
+    let dos_date = read_u16(data, pos + 14)?;
     let mut comp_size = read_u32(data, pos + 20)? as u64;
     let mut uncomp_size = read_u32(data, pos + 24)? as u64;
     let name_len = read_u16(data, pos + 28)? as usize;
@@ -178,10 +187,13 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     Ok((
         CdScan::Searchable(Entry {
             name,
-            method,
-            data_offset,
-            data_len: comp_size,
             uncompressed_size: uncomp_size,
+            mtime: dos_to_unix(dos_date, dos_time),
+            location: Location::Zip {
+                method,
+                data_offset,
+                data_len: comp_size,
+            },
         }),
         next,
     ))
@@ -315,4 +327,174 @@ fn read_u64(data: &[u8], off: usize) -> Result<u64> {
     Ok(u64::from_le_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))
+}
+
+/// Convert a ZIP DOS date+time pair into Unix epoch seconds (UTC-interpreted).
+///
+/// DOS date packs `(year-1980):7 | month:4 | day:5`; DOS time packs
+/// `hour:5 | minute:6 | (second/2):5` (2-second resolution). The timestamp has no
+/// timezone, so it is read as UTC — fine for `diff`, where both sides are decoded
+/// the same way. Returns `None` for an unset (zero) or out-of-range date.
+fn dos_to_unix(date: u16, time: u16) -> Option<u64> {
+    if date == 0 {
+        return None;
+    }
+    let day = (date & 0x1f) as i64;
+    let month = ((date >> 5) & 0x0f) as i64;
+    let year = 1980 + ((date >> 9) & 0x7f) as i64;
+    let second = ((time & 0x1f) * 2) as i64;
+    let minute = ((time >> 5) & 0x3f) as i64;
+    let hour = ((time >> 11) & 0x1f) as i64;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since the Unix epoch via Howard Hinnant's days_from_civil algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(secs).ok()
+}
+
+// --- Byte access + the Source container --------------------------------------
+
+/// Return a ZIP entry's logical content: a borrowed slice of the archive for
+/// STORED, or an owned decompressed buffer for DEFLATE.
+///
+/// Exposed so callers (the engine, the export step) can search *and* inspect the
+/// same content without decompressing a DEFLATE entry twice. STORED entries are
+/// returned in place over the memory-mapped archive (no copy); DEFLATE entries are
+/// decompressed into an owned buffer, so reported offsets are positions within the
+/// *decompressed* stream. A non-ZIP entry is a caller bug and errors.
+pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Cow<'a, [u8]>> {
+    let Location::Zip {
+        method,
+        data_offset,
+        data_len,
+    } = &entry.location
+    else {
+        bail!("zip::content called on a non-ZIP entry: {}", entry.name);
+    };
+    read_range(
+        archive,
+        *method,
+        *data_offset,
+        *data_len,
+        entry.uncompressed_size,
+        &entry.name,
+    )
+}
+
+/// Read a ZIP data range from `archive` by explicit fields: borrow the slice for
+/// STORED, inflate it for DEFLATE.
+///
+/// The lower-level twin of [`content`], used to read an entry that lives inside an
+/// in-memory *nested* archive (where the offsets are into a folder source's blob, not
+/// a top-level `Entry`'s mmap). `uncompressed_size` is the inflate capacity hint and
+/// `name` only labels errors.
+pub fn read_range<'a>(
+    archive: &'a [u8],
+    method: Method,
+    data_offset: u64,
+    data_len: u64,
+    uncompressed_size: u64,
+    name: &str,
+) -> Result<Cow<'a, [u8]>> {
+    let start = data_offset as usize;
+    let end = start + data_len as usize;
+    // A data range outside the file means the Central Directory disagreed with
+    // the archive's real size; bailing here surfaces a corrupt/truncated image
+    // rather than silently searching the wrong bytes.
+    let raw = archive
+        .get(start..end)
+        .with_context(|| format!("data range of {name} is out of bounds"))?;
+
+    match method {
+        Method::Stored => Ok(Cow::Borrowed(raw)),
+        Method::Deflate => {
+            let inflated = inflate(raw, uncompressed_size)
+                .with_context(|| format!("failed to inflate {name}"))?;
+            Ok(Cow::Owned(inflated))
+        }
+    }
+}
+
+/// Inflate a raw DEFLATE stream (ZIP method 8 stores no zlib header).
+///
+/// `expected_size` is only a capacity hint to avoid reallocations; the decoder
+/// reads to the end of the stream regardless.
+fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(compressed);
+    let mut out = Vec::with_capacity(expected_size as usize);
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// A [`Source`] backed by a memory-mapped ZIP archive.
+///
+/// Parses the central directory once on [`ZipSource::open`] and then serves each
+/// entry's bytes straight from the mapped archive (zero-copy for STORED). The
+/// borrowed `data` is the read-only mmap held by the caller for the source's life.
+pub struct ZipSource<'d> {
+    data: &'d [u8],
+    entries: Vec<Entry>,
+}
+
+impl<'d> ZipSource<'d> {
+    /// Parse `data`'s central directory and build the source.
+    pub fn open(data: &'d [u8]) -> Result<Self> {
+        let entries = parse_entries(data)?;
+        Ok(Self { data, entries })
+    }
+}
+
+impl Source for ZipSource<'_> {
+    fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    fn content(&self, entry: &Entry) -> Result<Cow<'_, [u8]>> {
+        content(self.data, entry)
+    }
+
+    fn byte_size(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dos_to_unix;
+
+    /// Pack a DOS date/time the way a ZIP central directory stores them.
+    fn dos(y: u16, mo: u16, d: u16, h: u16, mi: u16, s: u16) -> (u16, u16) {
+        let date = ((y - 1980) << 9) | (mo << 5) | d;
+        let time = (h << 11) | (mi << 5) | (s / 2);
+        (date, time)
+    }
+
+    #[test]
+    fn decodes_known_dos_timestamps() {
+        // 2021-01-01 00:00:00 UTC == 1609459200.
+        let (date, time) = dos(2021, 1, 1, 0, 0, 0);
+        assert_eq!(dos_to_unix(date, time), Some(1_609_459_200));
+
+        // The DOS epoch, 1980-01-01 00:00:00 UTC == 315532800.
+        let (date, time) = dos(1980, 1, 1, 0, 0, 0);
+        assert_eq!(dos_to_unix(date, time), Some(315_532_800));
+
+        // 2s resolution: an odd second is rounded down to the even slot.
+        let (date, time) = dos(2000, 6, 15, 12, 30, 44);
+        assert_eq!(dos_to_unix(date, time), Some(961_072_244));
+    }
+
+    #[test]
+    fn rejects_unset_or_invalid_dates() {
+        assert_eq!(dos_to_unix(0, 0), None); // unset
+        // A date with month 13 (year 1990, day 1) is out of range.
+        assert_eq!(dos_to_unix((10u16 << 9) | (13 << 5) | 1, 0), None);
+    }
 }

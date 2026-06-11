@@ -1,28 +1,31 @@
-//! Per-entry byte search: obtain an entry's content, then scan it for a regex.
+//! Per-entry byte search: scan a regex over content read from a source.
 //!
-//! Defines: the search module surface — [`entry_content`] (borrow/decompress an
-//! entry's bytes), [`search_bytes`] (run the regex, with line previews), and
-//! [`search_entry`] (the two combined for one entry).
-//! Used by: `engine` (orchestration), `export` (content), and the tests.
-//! Uses: `content` (STORED/DEFLATE access) and `scan` (regex + preview).
+//! Defines: the search module surface — [`search_bytes`] (run the regex, with line
+//! previews), [`search_entry`] (read a ZIP entry's bytes and scan them), and the
+//! [`base64`] submodule (alignment fragments for `--base64`).
+//! Used by: `engine` (orchestration) and the tests.
+//! Uses: `scan` (regex + preview) and `crate::source::zip` (entry byte access).
 //!
-//! Why split: content acquisition (an mmap borrow vs DEFLATE inflate) and match
-//! scanning (regex, line bounds, preview windowing) are independent concerns, so
-//! each lives in its own file while this module ties them together.
+//! Why split: content acquisition (mmap borrow vs DEFLATE inflate, now owned by the
+//! `source` containers) and match scanning (regex, line bounds, preview windowing)
+//! are independent concerns; this module owns the scanning half.
 
-mod content;
+pub mod base64;
 mod scan;
 
-pub use content::entry_content;
 pub use scan::search_bytes;
 
 use anyhow::Result;
 use regex::bytes::Regex;
 
 use crate::models::{Entry, SearchHit};
+use crate::source::zip;
 
-/// Search one entry for every (non-overlapping) match of `re`.
+/// Search one ZIP entry for every (non-overlapping) match of `re`.
+///
+/// A convenience for callers (and tests) that hold the raw archive bytes; the
+/// engine reads through a [`crate::source::Source`] instead.
 pub fn search_entry(archive: &[u8], entry: &Entry, re: &Regex) -> Result<Vec<SearchHit>> {
-    let content = entry_content(archive, entry)?;
+    let content = zip::content(archive, entry)?;
     Ok(search_bytes(&content, re))
 }

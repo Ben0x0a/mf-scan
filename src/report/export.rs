@@ -8,8 +8,8 @@
 //! subcommand); "extract" is reserved for extracting *meaning* from a file (the
 //! inspectors). So the functions here are `export_*`, not `extract`.
 //! Used by: `main.rs`.
-//! Uses: `crate::engine::MatchedFile`, `crate::models::Method`, `crate::search`
-//! (content), `serde`/`serde_json`, `anyhow`.
+//! Uses: `crate::engine::MatchedFile`, `crate::models::Entry`, `crate::source::zip`
+//! (parse + content), `serde`/`serde_json`, `anyhow`.
 //!
 //! Layout: each matched file is written to `DIR/<basename>_<hash>/<basename>` —
 //! the file keeps its real name inside a folder named after the basename plus a
@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::engine::MatchedFile;
-use crate::models::{Entry, Method, RunInfo};
-use crate::{search, zip};
+use crate::models::{Entry, RunInfo};
+use crate::source::Source;
 
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
 const HASH_HEX_LEN: usize = 10;
@@ -130,11 +130,11 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
             let folder = format!("{name}_{}", path_hash(&file.entry.name));
             ExportItem {
                 internal_path: file.entry.name.clone(),
-                file_start: file.entry.data_offset,
+                file_start: file.entry.archive_data_start().unwrap_or(0),
                 folder,
                 name,
                 size: file.entry.uncompressed_size,
-                compressed: file.entry.method == Method::Deflate,
+                compressed: file.entry.is_compressed(),
                 offsets: file.offsets.clone(),
             }
         })
@@ -179,7 +179,7 @@ pub fn write_manifest(plan: &ExportPlan, run: &RunInfo, w: &mut dyn Write) -> Re
 /// the operator can inspect the total and adjust before retrying.
 pub fn export_files(
     plan: &ExportPlan,
-    archive: &[u8],
+    source: &dyn Source,
     files: &[MatchedFile],
     dir: &Path,
     max_size: Option<u64>,
@@ -194,14 +194,17 @@ pub fn export_files(
     }
 
     // The full entry list lets us also export each database's SQLite sidecars.
-    let entries = zip::parse_entries(archive)?;
-    let by_path: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let by_path: HashMap<&str, &Entry> = source
+        .entries()
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
 
     let mut report: Vec<ExportedFile> = Vec::new();
     let mut bytes = 0u64;
     for (item, file) in plan.items.iter().zip(files) {
-        // Content is read (and decompressed for DEFLATE) once, here.
-        let content = search::entry_content(archive, &file.entry)?;
+        // Content is read (and decompressed/read-from-disk) once, here.
+        let content = source.content(&file.entry)?;
         let dest = dir.join(&item.folder).join(&item.name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
@@ -214,7 +217,7 @@ pub fn export_files(
         // Sidecars to export come from the file's inspector (e.g. SQLite's -wal).
         let suffixes = crate::inspect::sidecars_for(&file.entry.name, &content);
         let mut sidecars =
-            export_sidecars(archive, &by_path, &file.entry.name, &dest, dir, suffixes)?;
+            export_sidecars(source, &by_path, &file.entry.name, &dest, dir, suffixes)?;
         bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
         report.append(&mut sidecars);
     }
@@ -240,7 +243,7 @@ pub fn read_manifest(reader: impl Read) -> Result<Manifest> {
 /// with a fresh export, the size cap is honoured up front.
 pub fn export_from_manifest(
     manifest: &Manifest,
-    archive: &[u8],
+    source: &dyn Source,
     dir: &Path,
     max_size: Option<u64>,
 ) -> Result<ExportOutcome> {
@@ -253,7 +256,7 @@ pub fn export_from_manifest(
         });
     }
 
-    let entries = zip::parse_entries(archive)?;
+    let entries = source.entries();
     let by_path: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
     let mut report: Vec<ExportedFile> = Vec::new();
@@ -264,7 +267,7 @@ pub fn export_from_manifest(
             skipped += 1; // listed file is absent from this archive
             continue;
         };
-        let content = search::entry_content(archive, found)?;
+        let content = source.content(found)?;
         let dest = safe_join(dir, &entry.output_path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
@@ -275,14 +278,8 @@ pub fn export_from_manifest(
         report.push(exported_file(&entry.internal_path, &dest, dir, &content));
 
         let suffixes = crate::inspect::sidecars_for(&entry.internal_path, &content);
-        let mut sidecars = export_sidecars(
-            archive,
-            &by_path,
-            &entry.internal_path,
-            &dest,
-            dir,
-            suffixes,
-        )?;
+        let mut sidecars =
+            export_sidecars(source, &by_path, &entry.internal_path, &dest, dir, suffixes)?;
         bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
         report.append(&mut sidecars);
     }
@@ -304,7 +301,7 @@ pub fn export_from_manifest(
 /// present. For SQLite this keeps the exported database complete — uncommitted
 /// rows live in the `-wal`.
 fn export_sidecars(
-    archive: &[u8],
+    source: &dyn Source,
     by_path: &HashMap<&str, &Entry>,
     internal_path: &str,
     main_dest: &Path,
@@ -322,7 +319,7 @@ fn export_sidecars(
         let Some(entry) = by_path.get(sidecar_path.as_str()) else {
             continue;
         };
-        let content = search::entry_content(archive, entry)?;
+        let content = source.content(entry)?;
         let mut dest = main_dest.to_path_buf();
         dest.set_file_name(format!("{main_name}{suffix}"));
         fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;

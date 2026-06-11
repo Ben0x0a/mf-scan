@@ -3,16 +3,17 @@
 //! Defines: tests asserting each format's content, plus colour behaviour for
 //! txt. Builds `MatchRecord`s directly (no archive needed) so the formatting is
 //! tested in isolation from parsing/searching.
-//! Uses: `mf_zipgrep::{models, output}`, `serde_json` (to parse JSON back).
+//! Uses: `mf_scan::{models, output}`, `serde_json` (to parse JSON back).
 
-use mf_zipgrep::models::{Inspection, MatchRecord, RunInfo};
-use mf_zipgrep::output::{OutputFormat, write_counts, write_results};
+use mf_scan::models::{Encoding, Inspection, MatchRecord, RunInfo};
+use mf_scan::report::output::{OutputFormat, write_counts, write_results};
+use mf_scan::report::stats::ScanStats;
 use serde_json::json;
 
 /// Minimal run metadata for output tests.
 fn run_info() -> RunInfo {
     RunInfo {
-        tool: "mf-zipgrep".into(),
+        tool: "mf-scan".into(),
         version: "test".into(),
         pattern: "SECRET".into(),
         literal: false,
@@ -24,6 +25,10 @@ fn run_info() -> RunInfo {
         not_path_globs: vec![],
         types: vec![],
         exclude_media: false,
+        base64: false,
+        base64_urlsafe: false,
+        keyfiles: vec![],
+        platform: None,
     }
 }
 
@@ -35,11 +40,14 @@ fn binary_record() -> Vec<MatchRecord> {
         path: "db.sqlite".into(),
         file_start: 0,
         file_offset: 4096, // 0x1000
-        archive_offset: 4096,
+        archive_offset: Some(4096),
         compressed: false,
+        decrypted: false,
         line: b"\x00\x01record\x00data".to_vec(),
         match_in_line: 2..8,
         inspection: None,
+        encoding: Encoding::Plain,
+        decoded: None,
     }]
 }
 
@@ -51,11 +59,14 @@ fn sample() -> Vec<MatchRecord> {
             path: "sub/b.log".into(),
             file_start: 100,
             file_offset: 17,
-            archive_offset: 117,
+            archive_offset: Some(117),
             compressed: false,
+            decrypted: false,
             line: b"another SECRET line".to_vec(),
             match_in_line: 8..14,
             inspection: None,
+            encoding: Encoding::Plain,
+            decoded: None,
         },
         MatchRecord {
             archive: None,
@@ -63,18 +74,31 @@ fn sample() -> Vec<MatchRecord> {
             path: "a.txt".into(),
             file_start: 200,
             file_offset: 12,
-            archive_offset: 212,
+            archive_offset: Some(212),
             compressed: false,
+            decrypted: false,
             line: b"secret token: ABC".to_vec(),
             match_in_line: 0..6,
             inspection: None,
+            encoding: Encoding::Plain,
+            decoded: None,
         },
     ]
 }
 
 fn render(records: &[MatchRecord], format: OutputFormat, colourise: bool) -> String {
     let mut buf = Vec::new();
-    write_results(records, format, colourise, false, &run_info(), &mut buf).unwrap();
+    let stats = ScanStats::default();
+    write_results(
+        records,
+        format,
+        colourise,
+        false,
+        &run_info(),
+        &stats,
+        &mut buf,
+    )
+    .unwrap();
     String::from_utf8(buf).unwrap()
 }
 
@@ -104,7 +128,7 @@ fn json_wraps_run_metadata_and_results_with_hex_offsets() {
 
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     // Run metadata heads the report.
-    assert_eq!(parsed["run"]["tool"], "mf-zipgrep");
+    assert_eq!(parsed["run"]["tool"], "mf-scan");
     assert_eq!(parsed["run"]["pattern"], "SECRET");
     assert_eq!(parsed["run"]["archives"][0], "case.zip");
 
@@ -125,13 +149,13 @@ fn csv_has_header_and_rows() {
     let mut lines = out.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "archive,path,file_start,file_offset,archive_offset,compressed,format,context,line"
+        "archive,path,file_start,file_offset,archive_offset,compressed,decrypted,encoding,decoded,format,context,line"
     );
-    // Single archive => empty archive column; format/context empty without
-    // inspect; offsets are 0x… hex (100, 17, 117).
+    // Single archive => empty archive column; not decrypted; plain encoding with no
+    // decoded value; format/context empty without inspect; offsets are 0x… hex.
     assert_eq!(
         lines.next().unwrap(),
-        ",sub/b.log,0x64,0x11,0x75,false,,,another SECRET line"
+        ",sub/b.log,0x64,0x11,0x75,false,false,plain,,,,another SECRET line"
     );
 }
 
@@ -143,11 +167,14 @@ fn txt_shows_hex_file_offset_for_compressed() {
         path: "c.bin".into(),
         file_start: 50,
         file_offset: 10,
-        archive_offset: 50, // blob start for a DEFLATE entry
+        archive_offset: Some(50), // blob start for a DEFLATE entry
         compressed: true,
+        decrypted: false,
         line: b"NEEDLE inside".to_vec(),
         match_in_line: 0..6,
         inspection: None,
+        encoding: Encoding::Plain,
+        decoded: None,
     }];
 
     let out = render(&records, OutputFormat::Txt, false);
@@ -164,8 +191,9 @@ fn inspected() -> Vec<MatchRecord> {
         path: "a.txt".into(),
         file_start: 0,
         file_offset: 12,
-        archive_offset: 12,
+        archive_offset: Some(12),
         compressed: false,
+        decrypted: false,
         line: b"has TARGET here".to_vec(),
         match_in_line: 4..10,
         inspection: Some(Inspection {
@@ -173,6 +201,8 @@ fn inspected() -> Vec<MatchRecord> {
             summary: "line 2, col 5".into(),
             detail: json!({ "line": 2, "col": 5 }),
         }),
+        encoding: Encoding::Plain,
+        decoded: None,
     }]
 }
 

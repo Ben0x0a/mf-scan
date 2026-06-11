@@ -12,9 +12,10 @@
 //! target offset. It is tolerant of minor malformation (it locates, it does not
 //! validate).
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::models::Inspection;
+use crate::inspect::value_diff::diff_values;
+use crate::models::{ContentDiff, Inspection};
 
 /// One step in a JSON path: an object key or an array index.
 enum Seg {
@@ -40,6 +41,13 @@ impl super::Inspector for Json {
     }
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
         resolve(content, offset)
+    }
+    fn diff(&self, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
+        // For the diff we want the parsed tree, not byte spans, so serde_json is the
+        // right tool here (the hand-rolled scanner above exists only for offsets).
+        let old: Value = serde_json::from_slice(old).ok()?;
+        let new: Value = serde_json::from_slice(new).ok()?;
+        Some(diff_values("json", &old, &new))
     }
 }
 

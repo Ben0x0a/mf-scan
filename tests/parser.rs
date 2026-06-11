@@ -3,17 +3,33 @@
 //! Defines: tests covering entry enumeration, exact data-offset resolution,
 //! ZIP64 offset recovery, method detection (STORED/DEFLATE), skipping of
 //! unsupported methods, and truncation errors.
-//! Uses: `common` (fixture builder) and `mf_zipgrep::{zip, models}`.
+//! Uses: `common` (fixture builder) and `mf_scan::{source, models}`.
 
 mod common;
 
 use common::{FileSpec, build_zip};
-use mf_zipgrep::models::{Entry, Method};
-use mf_zipgrep::zip::parse_entries;
+use mf_scan::models::{Entry, Location, Method};
+use mf_scan::source::zip::parse_entries;
 
 /// The bytes the parser points at must be exactly the file's stored data.
 fn entry_bytes<'a>(archive: &'a [u8], e: &Entry) -> &'a [u8] {
-    &archive[e.data_offset as usize..(e.data_offset + e.data_len) as usize]
+    let Location::Zip {
+        data_offset,
+        data_len,
+        ..
+    } = &e.location
+    else {
+        panic!("expected a ZIP entry");
+    };
+    &archive[*data_offset as usize..(*data_offset + *data_len) as usize]
+}
+
+/// The compression method of a (ZIP) entry.
+fn method(e: &Entry) -> Method {
+    let Location::Zip { method, .. } = &e.location else {
+        panic!("expected a ZIP entry");
+    };
+    *method
 }
 
 #[test]
@@ -41,9 +57,9 @@ fn resolves_data_offset_and_method() {
 
     let entries = parse_entries(&zip).unwrap();
 
-    assert_eq!(entries[0].method, Method::Stored);
+    assert_eq!(method(&entries[0]), Method::Stored);
     assert_eq!(entry_bytes(&zip, &entries[0]), b"hello");
-    assert_eq!(entries[1].method, Method::Deflate);
+    assert_eq!(method(&entries[1]), Method::Deflate);
     assert_eq!(entries[1].uncompressed_size, 9);
     assert_eq!(entry_bytes(&zip, &entries[1]), b"\x01\x02\x03");
 }

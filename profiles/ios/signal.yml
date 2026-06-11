@@ -1,0 +1,35 @@
+# Signal (iOS) — GRDB database encrypted with SQLCipher.
+#
+# Signal iOS keeps its message database as a GRDB SQLite file in the app-group
+# container and stores the SQLCipher key spec in the keychain.
+#
+# ⚠ VERIFY before relying on this profile (forensic soundness):
+#   • The keychain service/account below are the commonly documented Signal iOS
+#     identifiers, but they have changed across releases — confirm them against
+#     the keychain dump of the specific build under examination.
+#   • Signal's keyspec is the 32-byte SQLCipher key, in recent builds concatenated
+#     with a 16-byte salt (48 bytes total). The SQLCipher decryptor (added in a
+#     later milestone) must use that salt instead of the database's first 16 bytes
+#     when the keyspec carries one. Until then this profile is a starting point.
+#   • The database file name/location varies (signal.sqlite under a grdb/ folder).
+
+name: signal-ios
+app: Signal
+platform: ios
+description: Signal iOS GRDB message database (SQLCipher 4), key from the keychain.
+
+db:
+  glob: "*/grdb/signal.sqlite"
+
+key:
+  encoding: raw
+  keychain:
+    service: TSKeyChainService
+    account: OWSDatabaseCipherKeySpec
+
+cipher:
+  algorithm: sqlcipher
+  page_size: 4096
+  kdf_iter: 256000
+  hmac: sha512
+  kdf: sha512
