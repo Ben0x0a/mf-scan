@@ -103,8 +103,17 @@ Globs are matched against the entry's full internal path:
 |---|---|
 | `*` | Any sequence of characters, including `/` |
 | `?` | Any single character |
-| `*/Caches/*` | Any entry with `Caches` as a path segment |
+| `*/Caches/*` | Any entry with `Caches` as a **non-root** path segment |
 | `*.log` | Any entry whose name ends in `.log` |
+
+Two caveats:
+
+- There is no gitignore-style `**` — a single `*` already crosses `/`, so `**`
+  would behave identically; write `*`.
+- `*/Caches/*` requires a literal `/` before `Caches`, so it does **not** match
+  a path that *starts* with `Caches/` (common when the extraction root is the
+  directory's parent). To cover both, list the root-level twin too:
+  `*/Caches/*` **and** `Caches/*` — as `presets/_fast.yml` does.
 
 ### File type values (file_type)
 

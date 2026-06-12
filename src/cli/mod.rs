@@ -44,3 +44,33 @@ pub(crate) enum Command {
     /// Diff two sources (archives or folders): which files were added/removed/modified.
     Diff(DiffArgs),
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    /// `--count` never exports, so the sink flags must be rejected up front
+    /// instead of silently writing nothing (review finding L1).
+    #[test]
+    fn count_conflicts_with_the_export_sink() {
+        assert!(
+            Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "-c", "--export", "out"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mf-scan",
+                "grep",
+                "x",
+                "a.zip",
+                "-c",
+                "--manifest",
+                "m.json"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "-c"]).is_ok());
+    }
+}

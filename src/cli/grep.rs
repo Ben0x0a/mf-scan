@@ -112,7 +112,9 @@ pub(crate) struct GrepArgs {
     pub(crate) decrypt: DecryptArgs,
 
     /// Print only the match count per file (one line per file), not each match.
-    #[arg(short = 'c', long = "count")]
+    /// Counting never exports, so combining it with `--manifest`/`--export` is
+    /// rejected rather than silently ignoring the sink.
+    #[arg(short = 'c', long = "count", conflicts_with_all = ["manifest", "export"])]
     pub(crate) count: bool,
 
     #[command(flatten)]

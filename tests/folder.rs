@@ -124,3 +124,39 @@ fn search_and_export_run_over_a_folder_source() {
     let written = fs::read(out.path().join(&plan.items[0].folder).join("hit.txt")).unwrap();
     assert_eq!(written, b"find SECRET here");
 }
+
+/// One unreadable file must not abort the scan: it is tallied as unreadable
+/// while every other file is still searched (review finding L3 — acquisitions
+/// are routinely partial; degrade, don't die).
+#[cfg(unix)]
+#[test]
+fn unreadable_file_is_counted_and_does_not_abort_the_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("hit.txt"), b"find SECRET here").unwrap();
+    let blocked = dir.path().join("blocked.txt");
+    fs::write(&blocked, b"SECRET but unreadable").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let re = Regex::new("SECRET").unwrap();
+    let findings = search_source(
+        &src,
+        &Query::plain(&re),
+        false,
+        false,
+        &EntryFilter::all(),
+        None,
+        &NoProgress,
+    )
+    .unwrap();
+
+    // Restore permissions so the tempdir can be cleaned up.
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(findings.files.len(), 1);
+    assert_eq!(findings.files[0].entry.name, "hit.txt");
+    assert_eq!(findings.stats.unreadable.count, 1);
+    assert_eq!(findings.stats.files_scanned, 1);
+}

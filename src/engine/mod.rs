@@ -232,6 +232,14 @@ pub fn search_source(
                 stats.bytes_total += bytes;
                 stats.add_type(bytes);
             }
+            Class::Unreadable { bytes } => {
+                stats.bytes_total += bytes;
+                stats.add_unreadable(bytes);
+            }
+            Class::DecryptFailed { bytes } => {
+                stats.bytes_total += bytes;
+                stats.add_decrypt_failed(bytes);
+            }
             Class::Scanned {
                 bytes,
                 type_name,

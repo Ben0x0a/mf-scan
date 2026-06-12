@@ -37,6 +37,15 @@ pub(super) enum Class {
     SkippedMedia { bytes: u64 },
     /// The `--type` allowlist excluded this file.
     SkippedType { bytes: u64 },
+    /// The file's content could not be read (permission denied, corrupt entry).
+    /// Counted, not fatal: forensic acquisitions are routinely partial, so one
+    /// unreadable file must never abort the scan of the rest ("degrade, don't
+    /// die" — the same rule the inspectors follow).
+    Unreadable { bytes: u64 },
+    /// A decryption profile matched but no candidate key decrypted the entry —
+    /// its ciphertext was **not** searched, so it must not count as scanned or
+    /// the coverage figures would overstate what was actually looked at.
+    DecryptFailed { bytes: u64 },
     /// The file was searched.
     Scanned {
         bytes: u64,
@@ -124,7 +133,21 @@ pub(super) fn classify_entry(
         });
     }
 
-    let mut content = source.content(entry)?;
+    // A read failure (permission-denied loose file, corrupt compressed entry) is
+    // classified and counted instead of propagated — propagating would cancel the
+    // whole parallel map and kill the scan of every other file.
+    let mut content = match source.content(entry) {
+        Ok(content) => content,
+        Err(_) => {
+            progress.inc();
+            return Ok(EntryResult {
+                records: Vec::new(),
+                file: None,
+                class: Class::Unreadable { bytes },
+                decryption: None,
+            });
+        }
+    };
 
     // Decryption transform: if a profile matches this entry, decrypt it and search
     // the plaintext from here on (type detection, search, inspection all see the
@@ -153,11 +176,7 @@ pub(super) fn classify_entry(
                 return Ok(EntryResult {
                     records: Vec::new(),
                     file: None,
-                    class: Class::Scanned {
-                        bytes,
-                        type_name: None,
-                        matches: 0,
-                    },
+                    class: Class::DecryptFailed { bytes },
                     decryption: Some(DecryptionRecord::failed(
                         entry.name.clone(),
                         profile,

@@ -70,6 +70,33 @@ fn exact_catches_same_size_content_change() {
 }
 
 #[test]
+fn size_only_ignores_mismatched_clock_mtimes() {
+    use std::fs;
+
+    use mf_scan::source::folder::FolderSource;
+
+    // Zip-vs-folder: the zip entry carries no mtime, the loose file a real one,
+    // so the Meta compare flags the file as modified on timestamp alone. The
+    // SizeOnly fallback (chosen by `run::diff` for mixed container kinds) must
+    // call equal-sized files unchanged.
+    let a = build_zip(&[FileSpec::stored("x.bin", b"AAAA")], false);
+    let sa = ZipSource::open(&a).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("x.bin"), b"AAAA").unwrap();
+    fs::write(dir.path().join("bigger.bin"), b"BBBBBBBB").unwrap();
+    let sb = FolderSource::open(dir.path(), 0).unwrap();
+
+    let meta = diff_sources(&sa, &sb, CompareMode::Meta, &EntryFilter::all(), false).unwrap();
+    assert_eq!(change_of(&meta, "x.bin"), Change::Modified); // mtime clocks differ
+
+    let size_only =
+        diff_sources(&sa, &sb, CompareMode::SizeOnly, &EntryFilter::all(), false).unwrap();
+    assert_eq!(change_of(&size_only, "x.bin"), Change::Unchanged);
+    assert_eq!(change_of(&size_only, "bigger.bin"), Change::Added);
+}
+
+#[test]
 fn inspect_reports_intra_file_json_changes() {
     let a = build_zip(
         &[FileSpec::stored(

@@ -5,7 +5,11 @@
 #
 # Edit not_path to tune what --fast treats as noise for your cases.
 # Each glob is matched against the entry's internal path (* matches any run
-# including /, ? matches one character) — exactly like --not-path.
+# including /, ? matches one character) — exactly like --not-path. There is no
+# gitignore-style ** (a single * already crosses /). NOTE: "*/x/*" requires a
+# literal / before x, so it does NOT match a path that *starts* with "x/" —
+# each directory glob therefore has a root-level twin ("x/*") for the case
+# where the extraction root is the directory's parent.
 #
 # See docs/presets.md for the full field reference.
 
@@ -21,18 +25,28 @@ not_path:
   - "*.oat"
   - "*.art"
   # ART ahead-of-time cache directories.
-  - "*/dalvik-cache/**"
-  - "*/oat/**"
+  - "*/dalvik-cache/*"
+  - "dalvik-cache/*"
+  - "*/oat/*"
+  - "oat/*"
   # Per-ABI native-library folders inside APKs / app data.
-  - "*/lib/arm64-v8a/**"
-  - "*/lib/armeabi-v7a/**"
-  - "*/lib/x86_64/**"
-  - "*/lib/x86/**"
+  - "*/lib/arm64-v8a/*"
+  - "lib/arm64-v8a/*"
+  - "*/lib/armeabi-v7a/*"
+  - "lib/armeabi-v7a/*"
+  - "*/lib/x86_64/*"
+  - "lib/x86_64/*"
+  - "*/lib/x86/*"
+  - "lib/x86/*"
   # Android system and vendor library trees.
-  - "*/system/lib/**"
-  - "*/system/lib64/**"
-  - "*/vendor/lib/**"
-  - "*/vendor/lib64/**"
+  - "*/system/lib/*"
+  - "system/lib/*"
+  - "*/system/lib64/*"
+  - "system/lib64/*"
+  - "*/vendor/lib/*"
+  - "vendor/lib/*"
+  - "*/vendor/lib64/*"
+  - "vendor/lib64/*"
 
   # ── iOS / macOS: compiled binary libraries ───────────────────────────────────
   # Dynamic libraries — compiled Mach-O, no text content.
@@ -42,14 +56,22 @@ not_path:
   # Compiled Interface Builder / XIB files.
   - "*.nib"
   # iOS system and user-space library trees (full-filesystem acquisitions).
-  - "*/System/Library/**"
-  - "*/usr/lib/**"
-  - "*/usr/libexec/**"
+  - "*/System/Library/*"
+  - "System/Library/*"
+  - "*/usr/lib/*"
+  - "usr/lib/*"
+  - "*/usr/libexec/*"
+  - "usr/libexec/*"
   # Bundled frameworks inside apps (.framework bundles contain the Mach-O binary).
-  - "*/Frameworks/*.framework/Versions/**"
-  - "*/Frameworks/*.framework/Headers/**"
-  - "*/Frameworks/*.framework/Modules/**"
+  - "*/Frameworks/*.framework/Versions/*"
+  - "Frameworks/*.framework/Versions/*"
+  - "*/Frameworks/*.framework/Headers/*"
+  - "Frameworks/*.framework/Headers/*"
+  - "*/Frameworks/*.framework/Modules/*"
+  - "Frameworks/*.framework/Modules/*"
   # App extensions — compiled bundles, rarely contain plain-text evidence.
-  - "*/PlugIns/*.appex/**"
+  - "*/PlugIns/*.appex/*"
+  - "PlugIns/*.appex/*"
   # Code-signing artefacts — binary, no forensic text.
-  - "*/_CodeSignature/**"
+  - "*/_CodeSignature/*"
+  - "_CodeSignature/*"

@@ -91,6 +91,20 @@ pub(crate) fn print_stats_summary(stats: &ScanStats) {
             human_bytes(tally.bytes)
         );
     }
+    if stats.unreadable.count > 0 {
+        eprintln!(
+            "  unreadable (read failed, NOT searched): {} file(s), {}",
+            stats.unreadable.count,
+            human_bytes(stats.unreadable.bytes)
+        );
+    }
+    if stats.decrypt_failed.count > 0 {
+        eprintln!(
+            "  decryption failed (ciphertext NOT searched): {} file(s), {}",
+            stats.decrypt_failed.count,
+            human_bytes(stats.decrypt_failed.bytes)
+        );
+    }
     if !stats.scanned_by_type.is_empty() {
         let breakdown: Vec<String> = stats
             .scanned_by_type

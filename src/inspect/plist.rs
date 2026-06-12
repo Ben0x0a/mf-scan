@@ -171,15 +171,25 @@ fn inspect_xml(content: &[u8], offset: usize) -> Option<Inspection> {
                     }
                 }
             }
-            Event::Text(t) if covers => {
+            Event::Text(t) => {
+                // Accumulate key text BEFORE the covers check, so when the
+                // covering event is itself inside a <key> the full accumulated
+                // key (not just this fragment) names the hit. One arm for both
+                // concerns — two guard-ordered arms here once regressed silently
+                // when reordered (review finding L6).
                 if in_key {
-                    let mut p = path.clone();
-                    p.push(String::from_utf8_lossy(t.as_ref()).into_owned());
-                    hit = Some(render(&p));
-                } else if let Some(seg) = &value_seg {
-                    let mut p = path.clone();
-                    p.push(seg.clone());
-                    hit = Some(render(&p));
+                    key_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
+                }
+                if covers {
+                    if in_key {
+                        let mut p = path.clone();
+                        p.push(key_buf.clone());
+                        hit = Some(render(&p));
+                    } else if let Some(seg) = &value_seg {
+                        let mut p = path.clone();
+                        p.push(seg.clone());
+                        hit = Some(render(&p));
+                    }
                 }
             }
             Event::End(e) => {
@@ -201,9 +211,6 @@ fn inspect_xml(content: &[u8], offset: usize) -> Option<Inspection> {
                     b"plist" => {}
                     _ => value_seg = None,
                 }
-            }
-            Event::Text(t) if in_key => {
-                key_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
             }
             _ => {}
         }

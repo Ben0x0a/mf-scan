@@ -85,6 +85,13 @@ pub struct ScanStats {
     pub skipped_type: SkipTally,
     /// Files skipped per `--not-path` glob (one entry per glob that hit).
     pub skipped_not_path: Vec<GlobTally>,
+    /// Files whose content could not be read (permission denied, corrupt entry).
+    /// Not searched, but the scan continued — "what did you not look at" must
+    /// stay exact for a forensic run.
+    pub unreadable: SkipTally,
+    /// Profile-matched files no candidate key could decrypt: their ciphertext
+    /// was not searched, so they are excluded from the scanned figures.
+    pub decrypt_failed: SkipTally,
     /// Count of scanned files per detected type name (sorted, stable order).
     pub scanned_by_type: BTreeMap<String, usize>,
     /// Files that contained at least one match.
@@ -124,6 +131,16 @@ impl ScanStats {
         self.files_skipped += 1;
     }
 
+    /// Record a file whose content could not be read (the scan continued).
+    pub fn add_unreadable(&mut self, bytes: u64) {
+        self.unreadable.add(bytes);
+    }
+
+    /// Record a profile-matched file no candidate key could decrypt.
+    pub fn add_decrypt_failed(&mut self, bytes: u64) {
+        self.decrypt_failed.add(bytes);
+    }
+
     /// Attribute a `--not-path` skip to `glob` (the glob at the decision's index).
     ///
     /// HOW: tallies are keyed by the glob string and created lazily on first hit,
@@ -157,6 +174,8 @@ impl ScanStats {
         self.skipped_not_included.merge(other.skipped_not_included);
         self.skipped_media.merge(other.skipped_media);
         self.skipped_type.merge(other.skipped_type);
+        self.unreadable.merge(other.unreadable);
+        self.decrypt_failed.merge(other.decrypt_failed);
         self.files_with_matches += other.files_with_matches;
         self.total_matches += other.total_matches;
         self.elapsed += other.elapsed;

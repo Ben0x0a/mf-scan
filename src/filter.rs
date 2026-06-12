@@ -197,6 +197,20 @@ mod tests {
         assert!(!wildcard_match(b"?at", b"at"));
     }
 
+    /// `*/x/*` needs a literal `/` before `x`, so a path *starting* with `x/`
+    /// is NOT matched — that is what the root-level twin glob (`x/*`) is for.
+    /// Locks the semantics `presets/_fast.yml` and docs/presets.md rely on
+    /// (review finding L4).
+    #[test]
+    fn leading_star_slash_does_not_match_a_root_level_path() {
+        assert!(wildcard_match(
+            b"*/lib/arm64-v8a/*",
+            b"data/app/lib/arm64-v8a/x.so"
+        ));
+        assert!(!wildcard_match(b"*/lib/arm64-v8a/*", b"lib/arm64-v8a/x.so"));
+        assert!(wildcard_match(b"lib/arm64-v8a/*", b"lib/arm64-v8a/x.so"));
+    }
+
     fn media() -> Option<TypeInfo> {
         Some(TypeInfo {
             name: "jpeg",

@@ -37,6 +37,16 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
 
     let mode = if args.exact {
         CompareMode::Hash
+    } else if args.a.is_dir() != args.b.is_dir() {
+        // A ZIP entry's mtime is a 2-second local-time DOS stamp; a folder file's
+        // is a UTC filesystem epoch. Comparing them flags nearly every file as
+        // modified, so a mixed zip-vs-folder diff falls back to size only.
+        eprintln!(
+            "warning: comparing an archive against a folder — their timestamps come \
+             from different clocks, so the fast compare uses size only (pass --exact \
+             to compare content)"
+        );
+        CompareMode::SizeOnly
     } else {
         CompareMode::Meta
     };

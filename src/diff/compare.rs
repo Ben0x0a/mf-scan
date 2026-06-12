@@ -17,6 +17,11 @@ pub enum CompareMode {
     /// Fast (default): equal size *and* last-modified time means unchanged. Misses a
     /// content edit that preserves both — use [`CompareMode::Hash`] when that matters.
     Meta,
+    /// Size only: for sides whose timestamps come from different clocks (a ZIP's
+    /// 2-second local-time DOS stamp vs a filesystem's UTC epoch), where comparing
+    /// mtimes would flag almost every file as modified. Misses any edit that
+    /// preserves the size — use [`CompareMode::Hash`] when that matters.
+    SizeOnly,
     /// Exact: equal SHA-256 of the content means unchanged. Reads both files.
     Hash,
 }
@@ -34,6 +39,7 @@ pub fn differs(
         CompareMode::Meta => {
             Ok(ea.uncompressed_size != eb.uncompressed_size || ea.mtime != eb.mtime)
         }
+        CompareMode::SizeOnly => Ok(ea.uncompressed_size != eb.uncompressed_size),
         CompareMode::Hash => Ok(sha256(&a.content(ea)?) != sha256(&b.content(eb)?)),
     }
 }
