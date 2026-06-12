@@ -2,16 +2,23 @@
 //!
 //! Defines: [`ResolvedSource`] (a resolved operand: an archive file or a folder,
 //! plus its display label and [`ResolvedKind`]), [`resolve_sources`] (apply
-//! `--dir-mode` to the operands), and [`open_archive`] (memory-map an archive
-//! read-only).
-//! Used by: `run::grep` and `run::export` (which open the resolved sources).
-//! Uses: `memmap2` (read-only mmap), `crate::cli::DirMode`, `anyhow`, the std library.
+//! `--dir-mode` to the operands), [`open_archive`] (memory-map an archive
+//! read-only), and [`with_operand_source`] (the single open/dispatch point that
+//! opens an [`Operand`] as a live [`Source`] for a closure).
+//! Used by: `run::grep`, `run::diff` and `run::export` (which open the resolved
+//! sources).
+//! Uses: `memmap2` (read-only mmap), `mf_scan::source` (the `Source` trait and the
+//! `ZipSource`/`FolderSource` openers), `anyhow`, the std library.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
+
+use mf_scan::source::Source;
+use mf_scan::source::folder::FolderSource;
+use mf_scan::source::zip::ZipSource;
 
 /// How a resolved operand is opened by `run`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +101,52 @@ pub(crate) fn resolve_sources(
         }
     }
     Ok(sources)
+}
+
+/// One operand to open as a live [`Source`], independent of how it was resolved.
+///
+/// WHY this small enum exists: the two subcommands describe an operand
+/// differently — `grep` drives off a pre-resolved [`ResolvedKind`], `diff` off a
+/// raw path plus a `--dir-mode` flag — yet the actual open/dispatch (mmap an
+/// archive into a `ZipSource`, or open a directory as a `FolderSource`) is one
+/// piece of logic. Funnelling both through this enum means a *third* source kind
+/// (a future encrypted iOS backup) is added in ONE match arm here, not in each
+/// subcommand's wrapper.
+pub(crate) enum Operand<'a> {
+    /// A single archive file — opened as a `ZipSource` over its mmap.
+    Archive(&'a Path),
+    /// A directory scanned as a folder of loose files, expanding nested `.zip`
+    /// files up to `archive_depth` levels.
+    Folder { path: &'a Path, archive_depth: u32 },
+}
+
+/// Open `operand` as a live [`Source`] and run `f` with it, plus the raw archive
+/// bytes for an archive operand (so a caller's `--verify` can hash them); a folder
+/// has no single backing buffer, so it passes `None`.
+///
+/// WHY this is closure-passing rather than returning a `Source`: a `ZipSource`
+/// borrows the mmap it reads from, so the mmap must outlive it. Keeping both in
+/// this one scope ties their lifetimes together correctly and lets callers nest
+/// two of these (diff's two sides) with both backing buffers alive across the
+/// inner body. This is the single open/dispatch point both subcommands share.
+pub(crate) fn with_operand_source<R>(
+    operand: Operand<'_>,
+    f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
+) -> Result<R> {
+    match operand {
+        Operand::Archive(path) => {
+            let mmap = open_archive(path)?;
+            let source = ZipSource::open(&mmap)?;
+            f(&source, Some(&mmap))
+        }
+        Operand::Folder {
+            path,
+            archive_depth,
+        } => {
+            let source = FolderSource::open(path, archive_depth)?;
+            f(&source, None)
+        }
+    }
 }
 
 /// Recursively collect `*.zip` files under `dir` into `out`.

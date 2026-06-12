@@ -25,8 +25,6 @@ use mf_scan::report::output::{OutputFormat, write_counts, write_results};
 use mf_scan::report::stats::ScanStats;
 use mf_scan::search;
 use mf_scan::source::Source;
-use mf_scan::source::folder::FolderSource;
-use mf_scan::source::zip::ZipSource;
 
 use crate::cli::{ColourWhen, GrepArgs};
 use crate::support::decryption::{build_decryption_context, report_decryptions};
@@ -37,7 +35,9 @@ use crate::support::reporting::{
     emit, log_skip_rules, print_stats_summary, report_verify, sha256_hex,
     write_scan_report_if_enabled,
 };
-use crate::support::sources::{ResolvedKind, ResolvedSource, open_archive, resolve_sources};
+use crate::support::sources::{
+    Operand, ResolvedKind, ResolvedSource, resolve_sources, with_operand_source,
+};
 
 /// Run the `grep` subcommand.
 pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
@@ -399,29 +399,23 @@ fn with_searched_source(
     })
 }
 
-/// Open `resolved` as a live [`Source`] and run `f` with it, plus the raw archive
-/// bytes for an archive operand (so `--verify` can hash them). A folder has no
-/// single backing buffer, so it passes `None`.
-///
-/// Centralising the open here keeps the borrow of the mmap and the `ZipSource` that
-/// reads from it in the same scope, and lets the two output branches share one
-/// archive-vs-folder dispatch.
+/// Adapt a pre-resolved [`ResolvedSource`] onto the shared [`with_operand_source`]
+/// open/dispatch point. Grep drives off the [`ResolvedKind`] decided by
+/// `resolve_sources`; the folder case keeps `--archive-depth` so nested `.zip`
+/// files expand. The raw archive bytes flow straight through (used by `--verify`).
 fn with_source<R>(
     resolved: &ResolvedSource,
     archive_depth: u32,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
-    match resolved.kind {
-        ResolvedKind::Archive => {
-            let mmap = open_archive(&resolved.path)?;
-            let source = ZipSource::open(&mmap)?;
-            f(&source, Some(&mmap))
-        }
-        ResolvedKind::Folder => {
-            let source = FolderSource::open(&resolved.path, archive_depth)?;
-            f(&source, None)
-        }
-    }
+    let operand = match resolved.kind {
+        ResolvedKind::Archive => Operand::Archive(&resolved.path),
+        ResolvedKind::Folder => Operand::Folder {
+            path: &resolved.path,
+            archive_depth,
+        },
+    };
+    with_operand_source(operand, f)
 }
 
 /// Emit the `--verify` attestation for one source: the before/after archive hash

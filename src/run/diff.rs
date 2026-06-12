@@ -23,13 +23,11 @@ use mf_scan::filter::EntryFilter;
 use mf_scan::models::{Entry, RunInfo};
 use mf_scan::report::diff::write_diff;
 use mf_scan::source::Source;
-use mf_scan::source::folder::FolderSource;
-use mf_scan::source::zip::ZipSource;
 
 use crate::cli::DiffArgs;
 use crate::support::exporting::run_export_sink;
 use crate::support::reporting::emit;
-use crate::support::sources::open_archive;
+use crate::support::sources::{Operand, with_operand_source};
 
 /// Run the `diff` subcommand.
 pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
@@ -102,29 +100,31 @@ fn decryption_requested(args: &DiffArgs) -> bool {
 
 /// Open one diff side as a single [`Source`] and run `f` with it.
 ///
-/// A file is an archive (`ZipSource` over its mmap); a directory must be given with
-/// `--dir-mode` (a single `FolderSource`) — a diff side is one source, so there is no
-/// archive-harvesting (`-r`) mode here. Keeping the mmap and `ZipSource` in this scope
-/// lets the caller nest two sides safely.
+/// A file is an archive; a directory must be given with `--dir-mode` (a single
+/// folder source) — a diff side is one source, so there is no archive-harvesting
+/// (`-r`) mode here, and a bare directory without `--dir-mode` is rejected rather
+/// than guessed. The open itself is delegated to the shared [`with_operand_source`]
+/// point; diff needs no raw bytes, so it ignores the `Option<&[u8]>`.
 fn with_diff_side<R>(
     path: &Path,
     dir_mode: bool,
     archive_depth: u32,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
-    if !path.is_dir() {
-        let mmap = open_archive(path)?;
-        let source = ZipSource::open(&mmap)?;
-        f(&source)
+    let operand = if !path.is_dir() {
+        Operand::Archive(path)
     } else if dir_mode {
-        let source = FolderSource::open(path, archive_depth)?;
-        f(&source)
+        Operand::Folder {
+            path,
+            archive_depth,
+        }
     } else {
         bail!(
             "{} is a directory; pass --dir-mode to diff it as a folder",
             path.display()
         )
-    }
+    };
+    with_operand_source(operand, |source, _raw| f(source))
 }
 
 /// Export the added/modified files from side B and/or write a manifest, reusing the

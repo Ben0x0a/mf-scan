@@ -162,10 +162,10 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// zip-bomb or a corrupt / adversarially crafted backup.
 fn inflate_zlib(compressed: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(compressed.len() * 4);
-    // `.take(cap)` stops the decoder at the cap.  We read into `out`; if the
-    // decoder reaches `cap` bytes without hitting the zlib end-of-stream marker
-    // it returns `Ok(cap)`.  We then check whether the stream was exhausted by
-    // trying to read one more byte — if something remains, the cap was hit.
+    // `.take(cap)` caps the reader at `cap` bytes, so `read_to_end` inflates at most
+    // that many and returns the count `n` actually produced. WHY this bounds RAM:
+    // the decoder physically cannot grow `out` past `cap`, so a zip-bomb stops there
+    // instead of exhausting memory.
     let cap = INFLATE_WHATSAPP_CAP;
     let n = ZlibDecoder::new(compressed)
         .take(cap)
@@ -173,9 +173,12 @@ fn inflate_zlib(compressed: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| {
             anyhow::anyhow!("GCM verified but the plaintext is not a valid zlib stream: {e}")
         })?;
-    // If we read exactly `cap` bytes the stream may not be exhausted — check
-    // that the decompressor really finished (n == out.len() and the zlib stream
-    // ended).  The simplest, zero-copy probe: re-inflate one more byte.
+    // `n == cap` means inflation was truncated AT the cap: the real database is at
+    // least `cap` bytes, so we conservatively reject rather than hand back a silently
+    // truncated (corrupt) SQLite file. WHY reject rather than probe for more: there is
+    // no need to confirm bytes remain — a legitimate database is far below 2 GiB, so a
+    // database whose inflated size lands *exactly* on the cap (an astronomically
+    // unlikely 2 GiB-exact edge) is rejected too, which is acceptable.
     if n as u64 == cap {
         return Err(anyhow::anyhow!(
             "inflated WhatsApp database exceeds the {} byte safety cap; \
