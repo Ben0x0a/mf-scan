@@ -76,11 +76,14 @@ pub(crate) struct GrepArgs {
     #[arg(long = "fast")]
     pub(crate) fast: bool,
 
-    /// Load a named preset from the `presets/` directory next to the binary
-    /// (e.g. `--preset mobile` loads `presets/mobile.yml`). Preset values are
-    /// applied before CLI flags; CLI flags always take precedence.
-    /// Vec fields (path, not_path, file_type) are merged with CLI values.
-    #[arg(long = "preset", value_name = "NAME")]
+    /// Load a preset by name from the `presets/` directory next to the binary
+    /// (e.g. `--preset mobile` loads `presets/mobile.yml`), or by path to any
+    /// YAML file (e.g. `--preset ./my-preset.yml`). A reference containing a
+    /// path separator or a `.yml`/`.yaml` extension is treated as a file path;
+    /// anything else is a name. Preset values are applied before CLI flags;
+    /// CLI flags always take precedence. Vec fields (path, not_path, file_type)
+    /// are merged with CLI values.
+    #[arg(long = "preset", value_name = "NAME|PATH")]
     pub(crate) preset: Option<String>,
 
     /// Match the PATTERN against each file's internal path instead of its

@@ -2,7 +2,8 @@
 
 A preset is a YAML file that sets default search options. Instead of typing the
 same flags every time, save them once in a `.yml` file and load them with
-`--preset <name>`.
+`--preset <name>` (a preset shipped in `presets/`) or `--preset <path>` (any
+YAML file on disk).
 
 ## Location
 
@@ -26,6 +27,22 @@ mf-scan grep PATTERN archive.zip --preset mobile
 ```
 
 This loads `presets/mobile.yml` and applies its values before your CLI flags.
+
+### By name or by path
+
+The `--preset` argument accepts either form:
+
+| You pass | Resolved as |
+|---|---|
+| `mobile` | `presets/mobile.yml` next to the binary |
+| `./my-preset.yml` | the file at that relative path |
+| `/cases/2026/ios.yml` | the file at that absolute path |
+| `custom.yaml` | the file `custom.yaml` in the current directory |
+
+The rule: a reference that contains a path separator or ends in `.yml`/`.yaml`
+is treated as a **file path**; anything else is a **name** looked up in
+`presets/`. This lets you keep a one-off preset alongside a case without copying
+it into the binary's `presets/` directory.
 
 ## Precedence
 
@@ -122,7 +139,7 @@ mf-scan grep "alice@example.com" acquisition.zip --preset ios-sqlite
 ```mermaid
 flowchart LR
     CLI["CLI flags\n(--preset, --fast, …)"]
-    LOAD["Load preset YAML\nfrom presets/<name>.yml"]
+    LOAD["Load preset YAML\nfrom presets/<name>.yml or a file path"]
     APPLY["apply_preset()\nmerge into SearchArgs"]
     RUN["search engine"]
 

@@ -13,24 +13,21 @@
 //! rejected for now rather than silently ignored — they arrive in later milestones.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use mf_scan::diff::{Change, CompareMode, DiffReport, diff_sources};
 use mf_scan::engine::MatchedFile;
 use mf_scan::filter::EntryFilter;
 use mf_scan::models::{Entry, RunInfo};
 use mf_scan::report::diff::write_diff;
-use mf_scan::report::export::{self, ExportOutcome};
 use mf_scan::source::Source;
 use mf_scan::source::folder::FolderSource;
 use mf_scan::source::zip::ZipSource;
 
 use crate::cli::DiffArgs;
-use crate::support::exporting::write_export_report_file;
+use crate::support::exporting::run_export_sink;
 use crate::support::reporting::emit;
 use crate::support::sources::open_archive;
 
@@ -142,44 +139,7 @@ fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> R
         })
         .collect();
 
-    let plan = export::plan(&files);
-    let run = diff_run_info(args);
-
-    if let Some(path) = &args.sink.manifest {
-        let file =
-            File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let mut w = BufWriter::new(file);
-        export::write_manifest(&plan, &run, &mut w)?;
-        w.flush().context("failed flushing manifest")?;
-        eprintln!(
-            "manifest: {} changed file(s), {} bytes total -> {}",
-            plan.items.len(),
-            plan.total_size,
-            path.display()
-        );
-    }
-
-    if let Some(dir) = &args.sink.export {
-        match export::export_files(&plan, b_src, &files, dir, Some(args.sink.max_size))? {
-            ExportOutcome::Exported {
-                files: n,
-                bytes,
-                report: rep,
-                ..
-            } => {
-                write_export_report_file(dir, &run, &rep)?;
-                eprintln!(
-                    "exported {n} changed file(s) ({bytes} bytes) to {}",
-                    dir.display()
-                );
-            }
-            ExportOutcome::Refused { total_size, cap } => eprintln!(
-                "refusing to export: changed total {total_size} bytes exceeds --max-size {cap}; \
-                 nothing written (use --manifest to review)"
-            ),
-        }
-    }
-    Ok(())
+    run_export_sink(&args.sink, b_src, &files, &diff_run_info(args), "changed")
 }
 
 /// Run metadata for the diff manifest/export report — informational provenance

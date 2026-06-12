@@ -169,14 +169,8 @@ fn scan_report_path(cli: &GrepArgs) -> PathBuf {
     PathBuf::from("mf-scan-report.json")
 }
 
-/// SHA-256 of `bytes` as lowercase hex.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
+/// SHA-256 of `bytes` as lowercase hex (single definition in the library).
+pub(crate) use mf_scan::util::sha256_hex;
 
 /// Print the before/after archive hashes and whether the evidence was unchanged.
 ///
@@ -212,22 +206,5 @@ pub(crate) fn emit(
             let mut w = stdout.lock();
             render(&mut w)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sha256_hex;
-
-    #[test]
-    fn sha256_matches_known_vectors() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 }

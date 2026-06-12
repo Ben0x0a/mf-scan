@@ -11,8 +11,45 @@
 
 exclude_media: true
 
-not_path: []
-# Examples:
-#   - "*/Caches/*"
-#   - "*/tmp/*"
-#   - "*.log"
+not_path:
+  # ── Android: compiled native libraries ───────────────────────────────────────
+  # Shared objects (.so) — JNI/NDK native code, no searchable text.
+  - "*.so"
+  # ART/Dalvik compiled artefacts — no text, often large.
+  - "*.odex"
+  - "*.vdex"
+  - "*.oat"
+  - "*.art"
+  # ART ahead-of-time cache directories.
+  - "*/dalvik-cache/**"
+  - "*/oat/**"
+  # Per-ABI native-library folders inside APKs / app data.
+  - "*/lib/arm64-v8a/**"
+  - "*/lib/armeabi-v7a/**"
+  - "*/lib/x86_64/**"
+  - "*/lib/x86/**"
+  # Android system and vendor library trees.
+  - "*/system/lib/**"
+  - "*/system/lib64/**"
+  - "*/vendor/lib/**"
+  - "*/vendor/lib64/**"
+
+  # ── iOS / macOS: compiled binary libraries ───────────────────────────────────
+  # Dynamic libraries — compiled Mach-O, no text content.
+  - "*.dylib"
+  # Compiled asset catalogs — binary, no searchable strings.
+  - "*.car"
+  # Compiled Interface Builder / XIB files.
+  - "*.nib"
+  # iOS system and user-space library trees (full-filesystem acquisitions).
+  - "*/System/Library/**"
+  - "*/usr/lib/**"
+  - "*/usr/libexec/**"
+  # Bundled frameworks inside apps (.framework bundles contain the Mach-O binary).
+  - "*/Frameworks/*.framework/Versions/**"
+  - "*/Frameworks/*.framework/Headers/**"
+  - "*/Frameworks/*.framework/Modules/**"
+  # App extensions — compiled bundles, rarely contain plain-text evidence.
+  - "*/PlugIns/*.appex/**"
+  # Code-signing artefacts — binary, no forensic text.
+  - "*/_CodeSignature/**"

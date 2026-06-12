@@ -30,7 +30,7 @@ use mf_scan::source::zip::ZipSource;
 use crate::cli::{ColourWhen, GrepArgs};
 use crate::support::decryption::{build_decryption_context, report_decryptions};
 use crate::support::exporting::export_if_requested;
-use crate::support::presets::{apply_preset, load_named_preset};
+use crate::support::presets::{apply_preset, load_preset};
 use crate::support::progress::search_with_reporter;
 use crate::support::reporting::{
     emit, log_skip_rules, print_stats_summary, report_verify, sha256_hex,
@@ -44,17 +44,18 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     // so it counts as read while documenting that acceptance is deliberate.
     let _ = cli.extended_regexp;
 
-    // Apply named preset first so CLI flags can override it.
-    if let Some(name) = cli.preset.clone() {
-        let preset =
-            load_named_preset(&name).with_context(|| format!("failed to load preset '{name}'"))?;
+    // Apply the preset first so CLI flags can override it. The reference is
+    // either a name resolved against presets/ or a path to a YAML file.
+    if let Some(reference) = cli.preset.clone() {
+        let preset = load_preset(&reference)
+            .with_context(|| format!("failed to load preset '{reference}'"))?;
         apply_preset(&mut cli, &preset);
     }
 
     // --fast loads _fast.yml; falls back to compiled-in behaviour if the file
     // is absent (e.g. dev build without the presets folder copied in).
     if cli.fast {
-        match load_named_preset("_fast") {
+        match load_preset("_fast") {
             Ok(preset) => apply_preset(&mut cli, &preset),
             Err(_) => {
                 cli.filter

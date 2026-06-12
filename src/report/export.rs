@@ -27,11 +27,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::engine::MatchedFile;
 use crate::models::{Entry, RunInfo};
 use crate::source::Source;
+use crate::util::sha256_hex;
 
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
 const HASH_HEX_LEN: usize = 10;
@@ -86,14 +86,6 @@ pub enum ExportOutcome {
         total_size: u64,
         cap: u64,
     },
-}
-
-/// SHA-256 of `bytes` as lowercase hex.
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The export report: the run metadata plus every written file and its hash.

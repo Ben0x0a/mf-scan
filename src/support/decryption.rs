@@ -139,24 +139,8 @@ fn autodetect_in_dir(dir: &Path, secrets: &mut SecretStore) {
 }
 
 /// Resolve the `profiles/` directory sitting next to the running binary.
-///
-/// Mirrors `support::presets::find_presets_dir`: the folder must be in the same
-/// directory as the binary (shipped alongside it in releases; copy or symlink the
-/// repo's `profiles/` into `target/debug/` for dev builds).
 fn find_profiles_dir() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("cannot determine binary path")?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("binary has no parent directory"))?
-        .join("profiles");
-    if dir.is_dir() {
-        Ok(dir)
-    } else {
-        Err(anyhow::anyhow!(
-            "cannot find 'profiles/' directory next to the binary (looked in {})",
-            dir.display()
-        ))
-    }
+    crate::support::dir_beside_binary("profiles")
 }
 
 /// Print the decryption audit trail to stderr (so it never mixes with results).

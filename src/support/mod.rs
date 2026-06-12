@@ -24,3 +24,32 @@ pub(crate) mod presets;
 pub(crate) mod progress;
 pub(crate) mod reporting;
 pub(crate) mod sources;
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+
+/// Resolve a data directory sitting next to the running binary (`presets/`,
+/// `profiles/`).
+///
+/// The directory must be in the same folder as the binary — no parent-directory
+/// walking is attempted. In releases the folder is shipped alongside the binary.
+/// In dev builds, copy or symlink the repo's folder into `target/debug/`.
+///
+/// Lives in the module root (not a submodule) so the submodules stay leaves
+/// that never import one another.
+pub(crate) fn dir_beside_binary(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot determine binary path")?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("binary has no parent directory"))?
+        .join(name);
+    if dir.is_dir() {
+        Ok(dir)
+    } else {
+        Err(anyhow::anyhow!(
+            "cannot find '{name}/' directory next to the binary (looked in {})",
+            dir.display()
+        ))
+    }
+}

@@ -258,12 +258,12 @@ pub fn search_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decrypt::cipher::sqlcipher::encrypt_db;
     use crate::decrypt::keyfile::{Secret, SecretStore};
     use crate::decrypt::profile::{
         CipherSpec, DbBinding, HashAlgorithm, KeyEncoding, KeySpec, KeychainMatch, Platform,
         Profile, ProfileRegistry, SqlCipherParams,
     };
-    use crate::decrypt::cipher::sqlcipher::encrypt_db;
 
     fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         fn pu16(buf: &mut Vec<u8>, v: u16) {

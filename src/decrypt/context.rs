@@ -25,11 +25,11 @@
 //! decrypts and verifies.
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::decrypt::cipher;
 use crate::decrypt::keyfile::SecretStore;
 use crate::decrypt::profile::{Platform, Profile, ProfileRegistry};
+use crate::util::sha256_hex;
 
 /// Everything the engine needs to decrypt entries: the profile registry, the
 /// secrets, and an optional platform scope.
@@ -234,24 +234,16 @@ impl DecryptionRecord {
     }
 }
 
-/// Lowercase-hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decrypt::cipher::sqlcipher::encrypt_db;
     use crate::decrypt::keyfile::Secret;
     use crate::decrypt::profile::{
         CipherSpec, DbBinding, HashAlgorithm, KeyEncoding, KeySpec, KeychainMatch, Profile,
         SqlCipherParams,
     };
     use crate::search::search_bytes;
-    use crate::decrypt::cipher::sqlcipher::encrypt_db;
     use regex::bytes::Regex;
 
     const PAGE_SIZE: usize = 1024;
