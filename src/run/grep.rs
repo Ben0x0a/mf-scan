@@ -1,8 +1,9 @@
 //! The `grep` subcommand orchestration.
 //!
-//! Defines: [`run_grep`], which wires the parsed CLI arguments through preset
-//! application, query building, source resolution, decryption setup, the search
-//! itself, and result/report output.
+//! Defines: [`run_grep`] (the orchestration) and its phase helpers — preset
+//! application (`apply_presets`), query building (`BuiltQuery`), flag
+//! cross-validation (`validate_flags`), run metadata (`build_run_info`), and the
+//! shared per-source search skeleton (`with_searched_source`).
 //! Used by: `run` (dispatched from `main`).
 //! Uses: the `mf_scan` library plus the `crate::support::{sources, presets,
 //! decryption, progress, reporting, exporting}` modules — each owning one concern.
@@ -12,7 +13,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use regex::bytes::RegexBuilder;
+use regex::bytes::{Regex, RegexBuilder};
 
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::engine::Query;
@@ -44,92 +45,13 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     // so it counts as read while documenting that acceptance is deliberate.
     let _ = cli.extended_regexp;
 
-    // Apply the preset first so CLI flags can override it. The reference is
-    // either a name resolved against presets/ or a path to a YAML file.
-    if let Some(reference) = cli.preset.clone() {
-        let preset = load_preset(&reference)
-            .with_context(|| format!("failed to load preset '{reference}'"))?;
-        apply_preset(&mut cli, &preset);
-    }
+    apply_presets(&mut cli)?;
 
-    // --fast loads _fast.yml; falls back to compiled-in behaviour if the file
-    // is absent (e.g. dev build without the presets folder copied in).
-    if cli.fast {
-        match load_preset("_fast") {
-            Ok(preset) => apply_preset(&mut cli, &preset),
-            Err(_) => {
-                cli.filter
-                    .not_path
-                    .extend(FAST_EXCLUDE_GLOBS.iter().map(|s| s.to_string()));
-                cli.filter.exclude_media = true;
-            }
-        }
-    }
+    // The compiled regexes outlive `query`, which borrows them.
+    let built = BuiltQuery::build(&cli)?;
+    let query = built.query(&cli);
 
-    // -l means "match this exact text", so escape any regex metacharacters.
-    let pattern = if cli.literal_string {
-        regex::escape(&cli.pattern)
-    } else {
-        cli.pattern.clone()
-    };
-    let re = RegexBuilder::new(&pattern)
-        .case_insensitive(cli.ignore_case)
-        .build()
-        .context("invalid regular expression")?;
-
-    // --base64 also searches for the pattern's base64 encoding. Only a literal
-    // can be encoded (a regex has no byte form), and a path is not base64, so the
-    // mode requires -l and is incompatible with --match-path.
-    let base64_enabled = cli.base64 || cli.base64_urlsafe;
-    let base64_re = if base64_enabled {
-        if !cli.literal_string {
-            anyhow::bail!(
-                "--base64 requires -l/--literal-string (a regex cannot be base64-encoded)"
-            );
-        }
-        if cli.match_path {
-            anyhow::bail!("--base64 cannot be combined with --match-path (a path is not base64)");
-        }
-        let frags = search::base64::fragments(cli.pattern.as_bytes(), cli.base64_urlsafe);
-        if frags.is_empty() {
-            anyhow::bail!("pattern is too short to search as base64; give a longer literal");
-        }
-        if frags.iter().map(String::len).min().unwrap_or(0) < 4 {
-            eprintln!(
-                "warning: base64 fragments are very short; base64 matches may be unreliable for such a short term"
-            );
-        }
-        // Alternation of the (already alphabet-correct) fragments. Base64 is
-        // case-sensitive, so this regex never takes the -i flag even if set.
-        let alt = frags
-            .iter()
-            .map(|f| regex::escape(f))
-            .collect::<Vec<_>>()
-            .join("|");
-        Some(
-            RegexBuilder::new(&alt)
-                .build()
-                .context("failed to build base64 search pattern")?,
-        )
-    } else {
-        None
-    };
-    let query = Query {
-        plain: &re,
-        base64: base64_re.as_ref(),
-        decoded: base64_enabled.then_some(cli.pattern.as_str()),
-    };
-
-    // Colour is meaningful only for txt sent to a terminal; never inject ANSI
-    // into a file or a machine-readable format.
-    let to_stdout = cli.output.is_none();
-    let colourise = to_stdout
-        && cli.format == OutputFormat::Txt
-        && match cli.colour {
-            ColourWhen::Always => true,
-            ColourWhen::Never => false,
-            ColourWhen::Auto => std::io::stdout().is_terminal(),
-        };
+    let colourise = should_colourise(&cli);
 
     if let Some(n) = cli.threads {
         rayon::ThreadPoolBuilder::new()
@@ -151,68 +73,18 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
         anyhow::bail!("--export/--manifest require a single source");
     }
 
+    validate_flags(&cli)?;
+
     // Preset and --fast have already merged their values into cli.filter.not_path
     // and cli.filter.exclude_media, so use those fields directly.
-    let excludes = cli.filter.not_path.clone();
-    let exclude_media = cli.filter.exclude_media;
-    for t in &cli.filter.file_type {
-        if !is_known_type(t) {
-            anyhow::bail!(
-                "unknown --type '{t}'; valid values: {}",
-                type_names().join(", ")
-            );
-        }
-    }
-
-    // --match-path reads no content, so anything needing the file's bytes is
-    // meaningless alongside it.
-    if cli.match_path {
-        if cli.inspect {
-            anyhow::bail!("--match-path cannot be combined with --inspect (no content is read)");
-        }
-        if !cli.filter.file_type.is_empty() {
-            anyhow::bail!("--match-path cannot be combined with --type (no content is read)");
-        }
-    }
-
     let filter = EntryFilter::new(
         &cli.filter.path,
-        &excludes,
+        &cli.filter.not_path,
         &cli.filter.file_type,
-        exclude_media,
+        cli.filter.exclude_media,
     );
 
-    // Run metadata: the query and every filter in effect, recorded so JSON output
-    // and the export report are self-describing.
-    let run = RunInfo {
-        tool: "mf-scan".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        pattern: cli.pattern.clone(),
-        literal: cli.literal_string,
-        ignore_case: cli.ignore_case,
-        match_path: cli.match_path,
-        inspect: cli.inspect,
-        archives: sources
-            .iter()
-            .map(|s| s.path.display().to_string())
-            .collect(),
-        path_globs: cli.filter.path.clone(),
-        not_path_globs: cli.filter.not_path.clone(),
-        types: cli.filter.file_type.clone(),
-        exclude_media,
-        base64: base64_enabled,
-        base64_urlsafe: cli.base64_urlsafe,
-        keyfiles: cli
-            .decrypt
-            .keyfile
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect(),
-        platform: cli
-            .decrypt
-            .platform
-            .map(|p| p.to_platform().as_str().to_string()),
-    };
+    let run = build_run_info(&cli, &sources, built.base64_enabled);
 
     // Announce the active skip rules before any result, so the analyst knows what
     // --fast/presets will exclude up front rather than discovering it afterwards.
@@ -231,18 +103,19 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
 
     if cli.count {
         // Per-file counts aggregated across sources (path tagged when multi).
+        // Counting needs no inspection, so `deep` is always false here.
         let mut counts: Vec<(String, usize)> = Vec::new();
         for src in &sources {
-            with_source(src, cli.archive_depth, |source, raw| {
-                let verify_before = (cli.verify).then(|| raw.map(sha256_hex)).flatten();
-                let findings = search_with_reporter(
-                    source,
-                    &query,
-                    false,
-                    cli.match_path,
-                    &filter,
-                    decrypt_ctx.as_ref(),
-                )?;
+            let ctx = SearchCtx {
+                cli: &cli,
+                query: &query,
+                filter: &filter,
+                decrypt_ctx: decrypt_ctx.as_ref(),
+                deep: false,
+                stats: &mut stats,
+                decryptions: &mut decryptions,
+            };
+            with_searched_source(src, ctx, |findings, _source| {
                 for f in &findings.files {
                     let path = if multi {
                         format!("{}/{}", src.label, f.entry.name)
@@ -251,9 +124,6 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                     };
                     counts.push((path, f.offsets.len()));
                 }
-                decryptions.extend(findings.decryptions);
-                stats.merge(findings.stats);
-                report_verify_for(cli.verify, verify_before, raw);
                 Ok(())
             })?;
         }
@@ -265,16 +135,16 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
         // Match records aggregated across sources (tagged when multi).
         let mut records = Vec::new();
         for src in &sources {
-            with_source(src, cli.archive_depth, |source, raw| {
-                let verify_before = (cli.verify).then(|| raw.map(sha256_hex)).flatten();
-                let mut findings = search_with_reporter(
-                    source,
-                    &query,
-                    cli.inspect,
-                    cli.match_path,
-                    &filter,
-                    decrypt_ctx.as_ref(),
-                )?;
+            let ctx = SearchCtx {
+                cli: &cli,
+                query: &query,
+                filter: &filter,
+                decrypt_ctx: decrypt_ctx.as_ref(),
+                deep: cli.inspect,
+                stats: &mut stats,
+                decryptions: &mut decryptions,
+            };
+            with_searched_source(src, ctx, |findings, source| {
                 // Every record carries its source's full path (for JSON); multi-source
                 // runs also get the short display label (for txt/csv).
                 let full = src.path.display().to_string();
@@ -286,12 +156,9 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 }
                 if !multi {
                     // --manifest/--export only apply to a single source (guarded above).
-                    export_if_requested(&cli.sink, source, &findings, &run)?;
+                    export_if_requested(&cli.sink, source, findings, &run)?;
                 }
                 records.append(&mut findings.records);
-                decryptions.append(&mut findings.decryptions);
-                stats.merge(findings.stats);
-                report_verify_for(cli.verify, verify_before, raw);
                 Ok(())
             })?;
         }
@@ -316,6 +183,220 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     write_scan_report_if_enabled(&cli, &run, &stats, &decryptions)?;
 
     Ok(())
+}
+
+/// Merge `--preset` and `--fast` values into the CLI arguments.
+///
+/// The preset is applied first so explicit CLI flags can override it. `--fast`
+/// loads `_fast.yml`, falling back to the compiled-in exclude list if the file
+/// is absent (e.g. a dev build without the presets folder copied in).
+fn apply_presets(cli: &mut GrepArgs) -> Result<()> {
+    if let Some(reference) = cli.preset.clone() {
+        let preset = load_preset(&reference)
+            .with_context(|| format!("failed to load preset '{reference}'"))?;
+        apply_preset(cli, &preset);
+    }
+    if cli.fast {
+        match load_preset("_fast") {
+            Ok(preset) => apply_preset(cli, &preset),
+            Err(_) => {
+                cli.filter
+                    .not_path
+                    .extend(FAST_EXCLUDE_GLOBS.iter().map(|s| s.to_string()));
+                cli.filter.exclude_media = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The compiled search regexes. Owns what [`Query`] borrows, so it must outlive
+/// the query handed to the engine.
+struct BuiltQuery {
+    plain: Regex,
+    base64: Option<Regex>,
+    base64_enabled: bool,
+}
+
+impl BuiltQuery {
+    /// Compile the plain pattern and, when `--base64` is set, the alternation of
+    /// its base64 fragments.
+    fn build(cli: &GrepArgs) -> Result<Self> {
+        // -l means "match this exact text", so escape any regex metacharacters.
+        let pattern = if cli.literal_string {
+            regex::escape(&cli.pattern)
+        } else {
+            cli.pattern.clone()
+        };
+        let plain = RegexBuilder::new(&pattern)
+            .case_insensitive(cli.ignore_case)
+            .build()
+            .context("invalid regular expression")?;
+
+        // --base64 also searches for the pattern's base64 encoding. Only a literal
+        // can be encoded (a regex has no byte form), and a path is not base64, so the
+        // mode requires -l and is incompatible with --match-path.
+        let base64_enabled = cli.base64 || cli.base64_urlsafe;
+        let base64 = if base64_enabled {
+            if !cli.literal_string {
+                anyhow::bail!(
+                    "--base64 requires -l/--literal-string (a regex cannot be base64-encoded)"
+                );
+            }
+            if cli.match_path {
+                anyhow::bail!(
+                    "--base64 cannot be combined with --match-path (a path is not base64)"
+                );
+            }
+            let frags = search::base64::fragments(cli.pattern.as_bytes(), cli.base64_urlsafe);
+            if frags.is_empty() {
+                anyhow::bail!("pattern is too short to search as base64; give a longer literal");
+            }
+            if frags.iter().map(String::len).min().unwrap_or(0) < 4 {
+                eprintln!(
+                    "warning: base64 fragments are very short; base64 matches may be unreliable for such a short term"
+                );
+            }
+            // Alternation of the (already alphabet-correct) fragments. Base64 is
+            // case-sensitive, so this regex never takes the -i flag even if set.
+            let alt = frags
+                .iter()
+                .map(|f| regex::escape(f))
+                .collect::<Vec<_>>()
+                .join("|");
+            Some(
+                RegexBuilder::new(&alt)
+                    .build()
+                    .context("failed to build base64 search pattern")?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            plain,
+            base64,
+            base64_enabled,
+        })
+    }
+
+    /// The engine-facing view borrowing the compiled regexes.
+    fn query<'a>(&'a self, cli: &'a GrepArgs) -> Query<'a> {
+        Query {
+            plain: &self.plain,
+            base64: self.base64.as_ref(),
+            decoded: self.base64_enabled.then_some(cli.pattern.as_str()),
+        }
+    }
+}
+
+/// Whether to inject ANSI colour: only meaningful for txt sent to a terminal —
+/// never into a file or a machine-readable format.
+fn should_colourise(cli: &GrepArgs) -> bool {
+    cli.output.is_none()
+        && cli.format == OutputFormat::Txt
+        && match cli.colour {
+            ColourWhen::Always => true,
+            ColourWhen::Never => false,
+            ColourWhen::Auto => std::io::stdout().is_terminal(),
+        }
+}
+
+/// Cross-validate flags that clap cannot relate on its own.
+fn validate_flags(cli: &GrepArgs) -> Result<()> {
+    for t in &cli.filter.file_type {
+        if !is_known_type(t) {
+            anyhow::bail!(
+                "unknown --type '{t}'; valid values: {}",
+                type_names().join(", ")
+            );
+        }
+    }
+    // --match-path reads no content, so anything needing the file's bytes is
+    // meaningless alongside it.
+    if cli.match_path {
+        if cli.inspect {
+            anyhow::bail!("--match-path cannot be combined with --inspect (no content is read)");
+        }
+        if !cli.filter.file_type.is_empty() {
+            anyhow::bail!("--match-path cannot be combined with --type (no content is read)");
+        }
+    }
+    Ok(())
+}
+
+/// Run metadata: the query and every filter in effect, recorded so JSON output
+/// and the export report are self-describing.
+fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bool) -> RunInfo {
+    RunInfo {
+        tool: "mf-scan".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        pattern: cli.pattern.clone(),
+        literal: cli.literal_string,
+        ignore_case: cli.ignore_case,
+        match_path: cli.match_path,
+        inspect: cli.inspect,
+        archives: sources
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect(),
+        path_globs: cli.filter.path.clone(),
+        not_path_globs: cli.filter.not_path.clone(),
+        types: cli.filter.file_type.clone(),
+        exclude_media: cli.filter.exclude_media,
+        base64: base64_enabled,
+        base64_urlsafe: cli.base64_urlsafe,
+        keyfiles: cli
+            .decrypt
+            .keyfile
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        platform: cli
+            .decrypt
+            .platform
+            .map(|p| p.to_platform().as_str().to_string()),
+    }
+}
+
+/// Everything one per-source search pass needs, bundled so the `--count` and
+/// records branches share a single signature.
+struct SearchCtx<'a> {
+    cli: &'a GrepArgs,
+    query: &'a Query<'a>,
+    filter: &'a EntryFilter,
+    decrypt_ctx: Option<&'a mf_scan::decrypt::DecryptionContext>,
+    /// Whether matches are inspected (`--inspect`); counting never inspects.
+    deep: bool,
+    stats: &'a mut ScanStats,
+    decryptions: &'a mut Vec<DecryptionRecord>,
+}
+
+/// Open one source, search it, and hand the findings to `handle`; then fold the
+/// source's stats/decryptions into the run totals and emit the `--verify`
+/// attestation. The shared skeleton of the `--count` and records branches —
+/// only their handling of the findings differs.
+fn with_searched_source(
+    src: &ResolvedSource,
+    ctx: SearchCtx<'_>,
+    handle: impl FnOnce(&mut mf_scan::engine::Findings, &dyn Source) -> Result<()>,
+) -> Result<()> {
+    with_source(src, ctx.cli.archive_depth, |source, raw| {
+        let verify_before = (ctx.cli.verify).then(|| raw.map(sha256_hex)).flatten();
+        let mut findings = search_with_reporter(
+            source,
+            ctx.query,
+            ctx.deep,
+            ctx.cli.match_path,
+            ctx.filter,
+            ctx.decrypt_ctx,
+        )?;
+        handle(&mut findings, source)?;
+        ctx.decryptions.append(&mut findings.decryptions);
+        ctx.stats.merge(findings.stats);
+        report_verify_for(ctx.cli.verify, verify_before, raw);
+        Ok(())
+    })
 }
 
 /// Open `resolved` as a live [`Source`] and run `f` with it, plus the raw archive
