@@ -113,8 +113,10 @@ pub(crate) struct GrepArgs {
 
     /// Print only the match count per file (one line per file), not each match.
     /// Counting never exports, so combining it with `--manifest`/`--export` is
-    /// rejected rather than silently ignoring the sink.
-    #[arg(short = 'c', long = "count", conflicts_with_all = ["manifest", "export"])]
+    /// rejected rather than silently ignoring the sink.  Counting also forces
+    /// `deep = false`, so `--inspect` would be silently ignored — rejected here
+    /// instead (no silent flag ignores in this tool).
+    #[arg(short = 'c', long = "count", conflicts_with_all = ["manifest", "export", "inspect"])]
     pub(crate) count: bool,
 
     #[command(flatten)]

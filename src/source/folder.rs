@@ -161,21 +161,33 @@ fn collect(
         // A nested `.zip`, with depth budget: read and expand it. An unreadable or
         // unparseable one falls back to an opaque loose file; an exhausted arena
         // budget aborts the scan loudly (it is a resource limit, not a bad file).
-        if depth >= 1
-            && has_zip_extension(&path)
-            && let Ok(bytes) = fs::read(&path)
-        {
-            match nested::expand(
-                bytes,
-                &format!("{name}/"),
-                depth - 1,
-                entries,
-                blobs,
-                budget,
-            ) {
-                Ok(()) => continue,
-                Err(e) if e.is::<nested::ArenaBudgetExceeded>() => return Err(e),
-                Err(_) => {} // fall through to the opaque loose-file entry
+        if depth >= 1 && has_zip_extension(&path) {
+            // WHY pre-read budget check: fs::read materialises the entire file on
+            // the heap. A 20 GB inner zip would be fully loaded *before* expand()
+            // checked it against the remaining budget. Checking the on-disk size
+            // first means we never allocate what we would immediately refuse —
+            // important because the budget exists precisely to prevent exhaustion.
+            // Note: we keep the in-expand check too (defense in depth; it also
+            // guards the recursive in-memory pending path).
+            let file_size = child.metadata().ok().map(|m| m.len()).unwrap_or(0);
+            if file_size > *budget {
+                return Err(anyhow::Error::new(nested::ArenaBudgetExceeded {
+                    budget: nested::NESTED_ARENA_BUDGET,
+                }));
+            }
+            if let Ok(bytes) = fs::read(&path) {
+                match nested::expand(
+                    bytes,
+                    &format!("{name}/"),
+                    depth - 1,
+                    entries,
+                    blobs,
+                    budget,
+                ) {
+                    Ok(()) => continue,
+                    Err(e) if e.is::<nested::ArenaBudgetExceeded>() => return Err(e),
+                    Err(_) => {} // fall through to the opaque loose-file entry
+                }
             }
         }
 
@@ -236,5 +248,33 @@ mod tests {
 
         // The reported size is also the byte_size sum for the coverage report.
         assert_eq!(src.byte_size(), 5 + 5 + 8);
+    }
+
+    /// A nested `.zip` larger than the arena budget must be rejected BEFORE being
+    /// read into memory — not after.
+    ///
+    /// WHY: `fs::read` materialises the entire file on the heap. A 20 GB inner zip
+    /// would be fully allocated before `nested::expand` could reject it. The
+    /// pre-read stat check ensures we never allocate what the budget disallows.
+    /// Setting a tiny budget (1 byte) means even a small file triggers the guard.
+    #[test]
+    fn nested_zip_larger_than_budget_rejected_before_read() {
+        let dir = tempdir().unwrap();
+        // Write a file with a `.zip` extension that is larger than the tiny budget
+        // we will set.  Its contents do not need to be a valid ZIP — the budget
+        // check fires before fs::read, so the file is never loaded or parsed.
+        let zip_path = dir.path().join("large.zip");
+        fs::write(&zip_path, b"not a real zip but definitely > 1 byte").unwrap();
+
+        // Budget of 1 byte: any file bigger than that must be refused immediately.
+        let result = FolderSource::open_with_arena_budget(dir.path(), 1, 1);
+        let err = match result {
+            Ok(_) => panic!("expected ArenaBudgetExceeded but got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is::<nested::ArenaBudgetExceeded>(),
+            "expected ArenaBudgetExceeded, got: {err}"
+        );
     }
 }

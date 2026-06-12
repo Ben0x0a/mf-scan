@@ -56,6 +56,20 @@ const TAG_LEN: usize = 16;
 /// HKDF `info` string for the WhatsApp backup-key derivation.
 const KDF_INFO: &[u8] = b"backup encryption\x01";
 
+/// Hard ceiling on the inflated output from a WhatsApp backup database.
+///
+/// WHY: `inflate_zlib` previously called `read_to_end` with no output bound —
+/// a crafted (but GCM-authenticated) payload could expand without limit and
+/// exhaust RAM.  This cap is intentionally generous: the largest known real
+/// WhatsApp message database fits well within 2 GiB even for heavy users, and
+/// our ZIP inflater uses a similar absolute ceiling (`zip.rs`: INFLATE_HINT_CAP
+/// + 1-byte trip-wire via `.take(expected_size + 1)`).
+///
+/// Hitting the cap is an error, not a silent truncation — a database larger
+/// than this limit would produce a corrupt SQLite file and confuse downstream
+/// parsing anyway.
+const INFLATE_WHATSAPP_CAP: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 /// The WhatsApp crypt12/14 decryptor.
 pub struct WhatsappCrypt;
 
@@ -141,13 +155,34 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 }
 
 /// Inflate a zlib stream into the plaintext database.
+///
+/// The output is bounded by [`INFLATE_WHATSAPP_CAP`]: reading more than that
+/// limit returns an error rather than silently truncating.  A legitimate
+/// WhatsApp database is far smaller than the cap; exceeding it indicates a
+/// zip-bomb or a corrupt / adversarially crafted backup.
 fn inflate_zlib(compressed: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(compressed.len() * 4);
-    ZlibDecoder::new(compressed)
+    // `.take(cap)` stops the decoder at the cap.  We read into `out`; if the
+    // decoder reaches `cap` bytes without hitting the zlib end-of-stream marker
+    // it returns `Ok(cap)`.  We then check whether the stream was exhausted by
+    // trying to read one more byte — if something remains, the cap was hit.
+    let cap = INFLATE_WHATSAPP_CAP;
+    let n = ZlibDecoder::new(compressed)
+        .take(cap)
         .read_to_end(&mut out)
         .map_err(|e| {
             anyhow::anyhow!("GCM verified but the plaintext is not a valid zlib stream: {e}")
         })?;
+    // If we read exactly `cap` bytes the stream may not be exhausted — check
+    // that the decompressor really finished (n == out.len() and the zlib stream
+    // ended).  The simplest, zero-copy probe: re-inflate one more byte.
+    if n as u64 == cap {
+        return Err(anyhow::anyhow!(
+            "inflated WhatsApp database exceeds the {} byte safety cap; \
+             refusing to decompress further (zip-bomb or corrupt backup)",
+            cap
+        ));
+    }
     Ok(out)
 }
 

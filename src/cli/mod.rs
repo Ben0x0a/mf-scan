@@ -73,4 +73,24 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "-c"]).is_ok());
     }
+
+    /// `--count` forces `deep = false`, so `--inspect` would be silently ignored —
+    /// reject the combination up front rather than accepting a flag that does nothing.
+    #[test]
+    fn count_conflicts_with_inspect() {
+        assert!(
+            Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "-c", "--inspect"]).is_err(),
+            "-c --inspect must be rejected"
+        );
+        // -c alone is still valid (regression guard).
+        assert!(
+            Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "-c"]).is_ok(),
+            "-c alone must parse successfully"
+        );
+        // --inspect alone is still valid (regression guard).
+        assert!(
+            Cli::try_parse_from(["mf-scan", "grep", "x", "a.zip", "--inspect"]).is_ok(),
+            "--inspect alone must parse successfully"
+        );
+    }
 }

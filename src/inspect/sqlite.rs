@@ -487,10 +487,20 @@ fn interior_children(content: &[u8], db: &Db, pg: u32) -> Option<Vec<u32>> {
 }
 
 /// Parse a table-leaf cell at `cell_file`.
+///
+/// All offset and length arithmetic uses `checked_add` (and `checked_sub` for
+/// `max_local`).  The lengths derive from untrusted varints in the database
+/// file: in debug builds unchecked `usize` addition wraps and panics; in
+/// release builds it wraps silently and the subsequent `content.get(…)` slice
+/// is bounds-checked — but debug/release parity matters for a forensic tool
+/// that may be run in either mode.  Returning `None` on overflow lets the
+/// caller fall back to the page+offset summary, consistent with the
+/// lenient-parser contract.
 fn parse_cell(content: &[u8], db: &Db, cell_file: usize) -> Option<Cell> {
     let (payload_len, n1) = varint(content, cell_file)?;
-    let (rowid, n2) = varint(content, cell_file + n1)?;
-    let record_start = cell_file + n1 + n2;
+    let after_payload = cell_file.checked_add(n1)?;
+    let (rowid, n2) = varint(content, after_payload)?;
+    let record_start = after_payload.checked_add(n2)?;
     let payload = payload_len as usize;
 
     // Local payload size (the rest, if any, lives on overflow pages — which are
@@ -500,29 +510,34 @@ fn parse_cell(content: &[u8], db: &Db, cell_file: usize) -> Option<Cell> {
     let local = if payload <= max_local {
         payload
     } else {
-        let min_local = (usable - 12) * 32 / 255 - 23;
-        let k = min_local + (payload - min_local) % (usable - 4);
+        let min_local = (usable.checked_sub(12)? * 32 / 255).checked_sub(23)?;
+        let excess = payload.checked_sub(min_local)?;
+        let divisor = usable.checked_sub(4)?;
+        let k = min_local.checked_add(excess % divisor)?;
         if k <= max_local { k } else { min_local }
     };
     let overflow = payload > local;
-    let total_len = n1 + n2 + local + if overflow { 4 } else { 0 };
+    let total_len = n1
+        .checked_add(n2)?
+        .checked_add(local)?
+        .checked_add(if overflow { 4 } else { 0 })?;
 
     // Record header: a varint header length, then one serial type per column.
     let (header_len, h1) = varint(content, record_start)?;
-    let header_end = record_start + header_len as usize;
-    let mut p = record_start + h1;
+    let header_end = record_start.checked_add(header_len as usize)?;
+    let mut p = record_start.checked_add(h1)?;
     let mut body = header_end;
     let mut columns = Vec::new();
     while p < header_end {
         let (serial, sn) = varint(content, p)?;
-        p += sn;
+        p = p.checked_add(sn)?;
         let len = serial_len(serial);
         columns.push(Col {
             serial,
             start: body,
             len,
         });
-        body += len;
+        body = body.checked_add(len)?;
     }
 
     Some(Cell {

@@ -338,9 +338,18 @@ fn exported_file(internal_path: &str, dest: &Path, dir: &Path, content: &[u8]) -
 
 /// Join a manifest `output_path` under `dir`, dropping any `..`/empty/absolute
 /// components so a tampered manifest can never escape the destination.
+///
+/// WHY backslashes are split too: a path like `a\..\..\evil.exe` contains no `/`,
+/// so a `/`-only split would hand it to the OS as a single opaque segment. On
+/// Windows the OS then resolves the backslashes and `..`, escaping the destination
+/// directory (zip-slip via a tampered manifest). Treating `\` as a separator on all
+/// platforms decomposes such paths into individual segments and subjects every `..`
+/// to the same rejection as a `/`-separated traversal.
 fn safe_join(dir: &Path, output_path: &str) -> std::path::PathBuf {
     let mut dest = dir.to_path_buf();
-    for segment in output_path.split('/') {
+    // Split on both `/` and `\` so backslash-encoded traversal is decomposed and
+    // any `..` components are rejected just like a forward-slash traversal would be.
+    for segment in output_path.split(['/', '\\']) {
         if segment.is_empty() || segment == "." || segment == ".." {
             continue;
         }
@@ -430,5 +439,47 @@ impl From<&ExportItem> for ManifestEntry {
             compressed: item.compressed,
             offsets: item.offsets.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `safe_join` must not let a backslash-encoded traversal escape the destination.
+    ///
+    /// A tampered manifest entry like `a\..\..\evil.exe` contains no `/`, so a
+    /// `/`-only split would pass it to the OS as one segment; on Windows the OS
+    /// resolves the `..` components and escapes the destination directory.  Splitting
+    /// on `\` too decomposes the payload so every `..` is dropped.
+    #[test]
+    fn safe_join_blocks_backslash_traversal() {
+        let dir = PathBuf::from("/export/out");
+
+        // Forward-slash traversal (already blocked before this fix).
+        let result = safe_join(&dir, "../../etc/passwd");
+        assert!(
+            result.starts_with(&dir),
+            "forward-slash traversal escaped: {result:?}"
+        );
+
+        // Backslash traversal — the fix under test.
+        let result = safe_join(&dir, r"a\..\..\evil.exe");
+        assert!(
+            result.starts_with(&dir),
+            "backslash traversal escaped: {result:?}"
+        );
+
+        // Mixed separators.
+        let result = safe_join(&dir, r"a\..\../secret");
+        assert!(
+            result.starts_with(&dir),
+            "mixed traversal escaped: {result:?}"
+        );
+
+        // A legitimate path must still resolve correctly under the dir.
+        let result = safe_join(&dir, "folder/file.db");
+        assert_eq!(result, dir.join("folder").join("file.db"));
     }
 }
