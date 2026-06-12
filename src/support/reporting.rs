@@ -62,6 +62,13 @@ pub(crate) fn print_stats_summary(stats: &ScanStats) {
         "matches: {} in {} file(s)",
         stats.total_matches, stats.files_with_matches
     );
+    if stats.files_truncated > 0 {
+        eprintln!(
+            "  match list truncated after {} match(es) in {} file(s) — more matches exist",
+            mf_scan::search::MAX_HITS_PER_FILE,
+            stats.files_truncated
+        );
+    }
     if stats.skipped_not_included.count > 0 {
         eprintln!(
             "  skipped (not in --path): {} file(s), {}",

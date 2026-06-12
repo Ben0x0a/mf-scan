@@ -75,6 +75,18 @@ pub trait Inspector: Sync {
     /// the offset can't be placed; the caller then emits a plain record.
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection>;
 
+    /// Resolve several match offsets within ONE file in a single call,
+    /// returning one (positional) result per offset.
+    ///
+    /// The default just loops over [`Inspector::inspect`]. Override when
+    /// resolution re-derives expensive per-file state for every offset —
+    /// SQLite re-walks the schema and every table's b-tree per call, which is
+    /// O(matches × tables × pages) on a match-heavy database; building that
+    /// state once per file makes it O(tables × pages + matches).
+    fn inspect_many(&self, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+        offsets.iter().map(|&o| self.inspect(content, o)).collect()
+    }
+
     /// Describe what changed *inside* a modified file of this format, comparing the
     /// `old` (side A) and `new` (side B) bytes, for `diff --inspect`. Return `None`
     /// when this format has no structured diff or the bytes cannot be parsed; the
@@ -148,6 +160,17 @@ static INSPECTORS: &[&dyn Inspector] = &[
 /// emits the plain match record.
 pub fn inspect(name: &str, content: &[u8], offset: usize) -> Option<Inspection> {
     detect(name, content)?.inspect(content, offset)
+}
+
+/// Produce inspection context for several match offsets in one file, one
+/// (positional) result per offset. The batch twin of [`inspect`]: detection
+/// runs once, and inspectors with per-file state derive it once for all
+/// offsets (see [`Inspector::inspect_many`]).
+pub fn inspect_many(name: &str, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+    match detect(name, content) {
+        Some(insp) => insp.inspect_many(content, offsets),
+        None => offsets.iter().map(|_| None).collect(),
+    }
 }
 
 /// Describe what changed inside a modified file, comparing `old` (side A) and `new`
@@ -260,4 +283,28 @@ pub(crate) fn riff_form(content: &[u8], form: &[u8; 4]) -> bool {
 /// the MP4/MOV/HEIF/M4A family of media inspectors.
 pub(crate) fn ftyp_brand(content: &[u8], brands: &[&[u8; 4]]) -> bool {
     content.len() >= 12 && &content[4..8] == b"ftyp" && brands.iter().any(|b| &content[8..12] == *b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INSPECTORS;
+
+    /// Position of the inspector named `name` in the registry.
+    fn index_of(name: &str) -> usize {
+        INSPECTORS
+            .iter()
+            .position(|i| i.name() == name)
+            .unwrap_or_else(|| panic!("{name} missing from INSPECTORS"))
+    }
+
+    /// Detection correctness depends on registry ORDER for formats that share a
+    /// magic: the more specific one must come first or it is never detected.
+    /// The comments in the registry say so; this test makes a reorder fail loud
+    /// instead of silently misclassifying (review finding C7).
+    #[test]
+    fn registry_lists_specific_formats_before_their_generic_twins() {
+        assert!(index_of("plist") < index_of("xml"), "plist IS xml + magic");
+        assert!(index_of("webm") < index_of("mkv"), "WebM shares EBML magic");
+        assert!(index_of("opus") < index_of("ogg"), "Opus shares OggS magic");
+    }
 }

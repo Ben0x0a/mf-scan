@@ -10,7 +10,7 @@ mod common;
 use std::fs;
 
 use common::{FileSpec, build_zip};
-use mf_scan::engine::search_archive;
+use mf_scan::engine::{NoProgress, Query, search_with_query};
 use mf_scan::filter::EntryFilter;
 use mf_scan::models::RunInfo;
 use mf_scan::report::export::{self, ExportOutcome};
@@ -46,11 +46,15 @@ fn findings_two_infoplists() -> (Vec<u8>, mf_scan::engine::Findings) {
         FileSpec::stored("AppB/Info.plist", b"key TARGET two"),
     ];
     let zip = build_zip(&files, false);
-    let findings = search_archive(
+    let re = Regex::new("TARGET").unwrap();
+    let findings = search_with_query(
         &zip,
-        &Regex::new("TARGET").unwrap(),
+        &Query::plain(&re),
+        false,
         false,
         &EntryFilter::all(),
+        None,
+        &NoProgress,
     )
     .unwrap();
     (zip, findings)
@@ -143,11 +147,15 @@ fn export_includes_sqlite_sidecars() {
         FileSpec::stored("Library/sms.db-shm", b"shm-bytes"),
     ];
     let zip = build_zip(&files, false);
-    let findings = search_archive(
+    let re = Regex::new("TARGET").unwrap();
+    let findings = search_with_query(
         &zip,
-        &Regex::new("TARGET").unwrap(),
+        &Query::plain(&re),
+        false,
         false,
         &EntryFilter::all(),
+        None,
+        &NoProgress,
     )
     .unwrap();
     assert_eq!(findings.files.len(), 1); // only sms.db matched

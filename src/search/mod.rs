@@ -13,7 +13,7 @@
 pub mod base64;
 mod scan;
 
-pub use scan::search_bytes;
+pub use scan::{MAX_HITS_PER_FILE, SearchHits, search_bytes, search_bytes_capped};
 
 use anyhow::Result;
 use regex::bytes::Regex;

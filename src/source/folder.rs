@@ -12,15 +12,21 @@
 //! tree). Loose files are never loaded until read; only opened nested archives are
 //! held in memory.
 
-use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
 use crate::models::{Entry, Location};
-use crate::source::Source;
+use crate::source::{Content, Source};
 use crate::source::{nested, zip};
+
+/// Loose files at or above this size are memory-mapped instead of read onto the
+/// heap. Mirrors the top-level ZIP path (which is always an mmap): without it a
+/// 4 GB video in a folder scan would be fully materialised just to be searched.
+/// Small files stay on the simple read path — a map costs syscalls and page
+/// faults that only pay off once the copy is expensive.
+const MMAP_THRESHOLD: u64 = 16 * 1024 * 1024;
 
 /// A [`Source`] over a directory on disk.
 ///
@@ -71,12 +77,26 @@ impl Source for FolderSource {
         &self.entries
     }
 
-    fn content(&self, entry: &Entry) -> Result<Cow<'_, [u8]>> {
+    fn content(&self, entry: &Entry) -> Result<Content<'_>> {
         match &entry.location {
             Location::Loose { path } => {
+                let file = fs::File::open(path)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
+                let len = file
+                    .metadata()
+                    .with_context(|| format!("cannot stat {}", path.display()))?
+                    .len();
+                if len >= MMAP_THRESHOLD {
+                    // SAFETY: the map is read-only. A file mutated while mapped
+                    // could yield torn reads — the same hazard the top-level
+                    // archive mmap already accepts for evidence opened read-only.
+                    let map = unsafe { memmap2::Mmap::map(&file) }
+                        .with_context(|| format!("cannot map {}", path.display()))?;
+                    return Ok(Content::Mapped(map));
+                }
                 let bytes =
                     fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-                Ok(Cow::Owned(bytes))
+                Ok(Content::Owned(bytes))
             }
             // A file inside an opened nested archive: read its range from the blob.
             Location::Nested {

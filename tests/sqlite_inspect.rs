@@ -123,3 +123,28 @@ fn diff_of_identical_databases_reports_no_changes() {
     assert_eq!(d.format, "sqlite");
     assert!(d.summary.contains("no table or row-count changes"));
 }
+
+/// The batch path (one schema map per file — review finding P1) must resolve
+/// every offset exactly as the per-match path does, including the page+offset
+/// fallback for a non-cell byte.
+#[test]
+fn inspect_many_matches_per_offset_inspect() {
+    use mf_scan::inspect::inspect_many;
+
+    let offsets = [
+        at("UNIQUE_NEEDLE_42"),
+        at("FINDSENDER"),
+        at("MARKER_NOTE"),
+        20, // inside the database header -> page+offset fallback
+    ];
+    let batch = inspect_many("messages.sqlite", DB, &offsets);
+    assert_eq!(batch.len(), offsets.len());
+    for (&off, batched) in offsets.iter().zip(&batch) {
+        let single = inspect("messages.sqlite", DB, off);
+        assert_eq!(
+            batched.as_ref().map(|i| (&i.summary, &i.detail)),
+            single.as_ref().map(|i| (&i.summary, &i.detail)),
+            "batch and single inspection disagree at offset {off}"
+        );
+    }
+}

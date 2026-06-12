@@ -8,8 +8,6 @@
 //! Uses: `crate::{filter, search, inspect, models, decrypt}` and `super` (for the
 //! engine's public types `Query` / `Progress` / `MatchedFile`).
 
-use std::borrow::Cow;
-
 use anyhow::Result;
 use regex::bytes::Regex;
 
@@ -51,6 +49,9 @@ pub(super) enum Class {
         bytes: u64,
         type_name: Option<&'static str>,
         matches: usize,
+        /// The per-file hit cap stopped collection: the file has MORE matches
+        /// than `matches` reports (surfaced in the statistics).
+        truncated: bool,
     },
 }
 
@@ -66,7 +67,7 @@ pub(super) struct EntryResult {
 }
 
 /// Classify and (when selected) search a single entry — the body of the parallel
-/// map in [`search_with_progress`].
+/// map in [`super::search_source`].
 ///
 /// Returns the entry's output records, its matched-file record, and a [`Class`]
 /// describing how it was handled for the statistics. The order of checks mirrors
@@ -128,6 +129,7 @@ pub(super) fn classify_entry(
                 bytes,
                 type_name: None,
                 matches,
+                truncated: false,
             },
             decryption: None,
         });
@@ -165,7 +167,7 @@ pub(super) fn classify_entry(
                     &decrypted,
                     &content,
                 ));
-                content = Cow::Owned(decrypted.plaintext);
+                content = crate::source::Content::Owned(decrypted.plaintext);
             }
             Some(TryOutcome::Failed {
                 profile,
@@ -218,16 +220,17 @@ pub(super) fn classify_entry(
     // Search the plain pattern, then (when `--base64`) the base64 fragments. Each
     // hit is tagged with its encoding; base64 hits also carry the decoded value.
     // Combining into one list keeps a single record/offset stream per file.
-    let mut hits: Vec<(SearchHit, Encoding)> = search::search_bytes(&content, query.plain)
+    let plain_hits = search::search_bytes_capped(&content, query.plain);
+    let mut truncated = plain_hits.truncated;
+    let mut hits: Vec<(SearchHit, Encoding)> = plain_hits
+        .hits
         .into_iter()
         .map(|h| (h, Encoding::Plain))
         .collect();
     if let Some(b64) = query.base64 {
-        hits.extend(
-            search::search_bytes(&content, b64)
-                .into_iter()
-                .map(|h| (h, Encoding::Base64)),
-        );
+        let b64_hits = search::search_bytes_capped(&content, b64);
+        truncated |= b64_hits.truncated;
+        hits.extend(b64_hits.hits.into_iter().map(|h| (h, Encoding::Base64)));
     }
     // Sort by in-file offset so records and export offsets stay in position order
     // regardless of which pattern produced each hit.
@@ -241,7 +244,16 @@ pub(super) fn classify_entry(
     let (records, file) = if hits.is_empty() {
         (Vec::new(), None)
     } else {
-        let offsets = hits.iter().map(|(hit, _)| hit.offset).collect();
+        let offsets: Vec<u64> = hits.iter().map(|(hit, _)| hit.offset).collect();
+        // One batch inspection call per entry: format detection and any per-file
+        // inspector state (e.g. SQLite's schema map) are derived once for all of
+        // this entry's matches instead of once per match.
+        let mut inspections = if deep {
+            let offs: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
+            inspect::inspect_many(&entry.name, &content, &offs).into_iter()
+        } else {
+            Vec::new().into_iter()
+        };
         let records = hits
             .into_iter()
             .map(|(hit, encoding)| {
@@ -258,8 +270,9 @@ pub(super) fn classify_entry(
                     record.archive_offset = entry.archive_data_start();
                 }
                 if deep {
-                    record.inspection =
-                        inspect::inspect(&entry.name, &content, record.file_offset as usize);
+                    // Positional: inspect_many returns one result per offset, in
+                    // the same (sorted) order as `hits`.
+                    record.inspection = inspections.next().flatten();
                 }
                 record
             })
@@ -279,6 +292,7 @@ pub(super) fn classify_entry(
             bytes,
             type_name,
             matches,
+            truncated,
         },
         decryption,
     })

@@ -1,7 +1,8 @@
 //! Match scanning: run a byte regex and build a readable line preview per match.
 //!
-//! Defines: `search_bytes` (one `SearchHit` per match) plus the private
-//! `preview`/`line_bounds` helpers and the preview-size constants.
+//! Defines: `search_bytes_capped`/`SearchHits` (one `SearchHit` per match, with
+//! a per-file cap), the `search_bytes` convenience, plus the private
+//! `preview`/`line_bounds` helpers and the preview/cap constants.
 //! Used by: `search::search_entry`, `engine`.
 //! Uses: `regex::bytes` (the engine), `crate::models::SearchHit`.
 //!
@@ -24,13 +25,40 @@ use crate::models::SearchHit;
 /// reported byte offsets are exact regardless — this caps only the preview text.
 const MAX_PREVIEW: usize = 200;
 
+/// Maximum hits collected per file. Each hit holds up to ~200 bytes of preview,
+/// so a pathological pattern (a typo'd `.` with `-i` over a multi-GB binary)
+/// could otherwise hold gigabytes of previews until output. Hitting the cap is
+/// reported via [`SearchHits::truncated`] and the scan statistics — never
+/// silently, since "what did you not see" must stay exact for a forensic run.
+pub const MAX_HITS_PER_FILE: usize = 100_000;
+
 /// Unicode horizontal ellipsis (U+2026) marking a truncated line edge.
 const ELLIPSIS: &[u8] = "…".as_bytes();
 
-/// Run the regex over a haystack, producing one hit per match.
-pub fn search_bytes(haystack: &[u8], re: &Regex) -> Vec<SearchHit> {
+/// The hits found in one haystack, plus whether the per-file cap cut them off.
+pub struct SearchHits {
+    pub hits: Vec<SearchHit>,
+    /// True when matching stopped at [`MAX_HITS_PER_FILE`]: the file contains
+    /// more matches than `hits` reports.
+    pub truncated: bool,
+}
+
+/// Run the regex over a haystack, producing one hit per match, stopping at
+/// [`MAX_HITS_PER_FILE`].
+pub fn search_bytes_capped(haystack: &[u8], re: &Regex) -> SearchHits {
+    capped(haystack, re, MAX_HITS_PER_FILE)
+}
+
+/// [`search_bytes_capped`] with an explicit cap — separate so the truncation
+/// path is testable without generating 100 000 real matches.
+fn capped(haystack: &[u8], re: &Regex, cap: usize) -> SearchHits {
     let mut hits = Vec::new();
+    let mut truncated = false;
     for m in re.find_iter(haystack) {
+        if hits.len() >= cap {
+            truncated = true;
+            break;
+        }
         let (line_start, line_end) = line_bounds(haystack, m.start(), m.end());
         let (line, match_in_line) = preview(haystack, line_start, line_end, m.start(), m.end());
         hits.push(SearchHit {
@@ -39,7 +67,13 @@ pub fn search_bytes(haystack: &[u8], re: &Regex) -> Vec<SearchHit> {
             match_in_line,
         });
     }
-    hits
+    SearchHits { hits, truncated }
+}
+
+/// Plain-`Vec` convenience over [`search_bytes_capped`] for callers that do not
+/// track truncation (tests, `search_entry`).
+pub fn search_bytes(haystack: &[u8], re: &Regex) -> Vec<SearchHit> {
+    search_bytes_capped(haystack, re).hits
 }
 
 /// Build the line shown for a match: the whole line when short, otherwise a
@@ -108,4 +142,24 @@ fn line_bounds(haystack: &[u8], match_start: usize, match_end: usize) -> (usize,
         .position(|&b| b == b'\n')
         .map_or(haystack.len(), |i| match_end + i);
     (line_start, line_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-file cap stops collection and reports truncation (review P2).
+    #[test]
+    fn hit_cap_truncates_and_reports_it() {
+        let re = Regex::new("x").unwrap();
+        let hay = b"xxxxx";
+
+        let cut = capped(hay, &re, 3);
+        assert_eq!(cut.hits.len(), 3);
+        assert!(cut.truncated);
+
+        let all = capped(hay, &re, 5);
+        assert_eq!(all.hits.len(), 5);
+        assert!(!all.truncated);
+    }
 }

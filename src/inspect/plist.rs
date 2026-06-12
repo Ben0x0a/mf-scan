@@ -51,6 +51,21 @@ impl super::Inspector for Plist {
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
         resolve(content, offset)
     }
+    /// Batch resolution for binary plists: parse (and sort the offset table)
+    /// once per file instead of once per match. XML plists keep the default
+    /// per-offset walk (their scan is already a single linear pass).
+    fn inspect_many(&self, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+        if !content.starts_with(b"bplist00") {
+            return offsets.iter().map(|&o| self.inspect(content, o)).collect();
+        }
+        match Bplist::parse(content) {
+            Some(bp) => offsets
+                .iter()
+                .map(|&o| inspect_binary_with(&bp, o))
+                .collect(),
+            None => offsets.iter().map(|_| None).collect(),
+        }
+    }
     fn diff(&self, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
         // Both encodings (XML/binary) parse to one logical tree; convert each to a
         // JSON value and reuse the shared structured diff (same as the JSON inspector).
@@ -254,6 +269,10 @@ struct Bplist<'a> {
     num_objects: usize,
     top: usize,
     offset_table: usize,
+    /// `(object start offset, oid)` sorted by start, built once at parse time
+    /// so per-match lookups are a binary search instead of an O(num_objects)
+    /// scan (review finding P4).
+    sorted_offsets: Vec<(usize, usize)>,
 }
 
 /// The structural children of one binary-plist object.
@@ -265,7 +284,12 @@ enum Children {
 
 fn inspect_binary(content: &[u8], offset: usize) -> Option<Inspection> {
     let bp = Bplist::parse(content)?;
+    inspect_binary_with(&bp, offset)
+}
 
+/// [`inspect_binary`] against an already-parsed [`Bplist`] (the batch path
+/// parses once and resolves every offset against it).
+fn inspect_binary_with(bp: &Bplist<'_>, offset: usize) -> Option<Inspection> {
     // A match in the offset table or trailer is structural, not a value.
     if offset >= bp.offset_table {
         return Some(Inspection {
@@ -311,6 +335,14 @@ impl<'a> Bplist<'a> {
         {
             return None;
         }
+        // Sorted (start, oid) lookup table — see the field docs.
+        let mut sorted_offsets: Vec<(usize, usize)> = (0..num_objects)
+            .filter_map(|oid| {
+                read_be(content, offset_table + oid * offset_size, offset_size)
+                    .map(|start| (start as usize, oid))
+            })
+            .collect();
+        sorted_offsets.sort_unstable();
         Some(Self {
             content,
             offset_size,
@@ -318,6 +350,7 @@ impl<'a> Bplist<'a> {
             num_objects,
             top,
             offset_table,
+            sorted_offsets,
         })
     }
 
@@ -331,17 +364,12 @@ impl<'a> Bplist<'a> {
     }
 
     /// The object whose data region contains `target` (largest start ≤ target).
+    /// Binary search over the sorted offset table built at parse time.
     fn object_at_offset(&self, target: usize) -> Option<usize> {
-        let mut best: Option<(usize, usize)> = None; // (oid, start)
-        for oid in 0..self.num_objects {
-            if let Some(start) = self.obj_offset(oid)
-                && start <= target
-                && best.is_none_or(|(_, b)| start > b)
-            {
-                best = Some((oid, start));
-            }
-        }
-        best.map(|(oid, _)| oid)
+        let idx = self
+            .sorted_offsets
+            .partition_point(|&(start, _)| start <= target);
+        idx.checked_sub(1).map(|i| self.sorted_offsets[i].1)
     }
 
     /// Decode an object's structural children (dict pairs / array elements).

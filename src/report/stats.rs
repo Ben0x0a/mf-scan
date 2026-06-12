@@ -98,6 +98,9 @@ pub struct ScanStats {
     pub files_with_matches: usize,
     /// Total matches across all scanned files.
     pub total_matches: usize,
+    /// Files whose match list was cut at the per-file hit cap — they contain
+    /// MORE matches than `total_matches` accounts for.
+    pub files_truncated: usize,
     /// Wall-clock time of the search, filled by the caller.
     #[serde(serialize_with = "elapsed_as_secs")]
     pub elapsed: Duration,
@@ -178,6 +181,7 @@ impl ScanStats {
         self.decrypt_failed.merge(other.decrypt_failed);
         self.files_with_matches += other.files_with_matches;
         self.total_matches += other.total_matches;
+        self.files_truncated += other.files_truncated;
         self.elapsed += other.elapsed;
         for tally in other.skipped_not_path {
             if let Some(slot) = self

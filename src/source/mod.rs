@@ -1,14 +1,13 @@
 //! Sources: the container abstraction the search and diff engines read through.
 //!
 //! Defines: the [`Source`] trait — enumerate a container's files ([`Source::entries`])
-//! and read any file's logical bytes ([`Source::content`]) — plus the concrete
-//! containers. A `Source` is whatever yields located files with bytes: a ZIP archive
+//! and read any file's logical bytes ([`Source::content`]) — plus [`Content`]
+//! (the borrowed/owned/mapped byte carrier) and the concrete containers. A
+//! `Source` is whatever yields located files with bytes: a ZIP archive
 //! ([`zip::ZipSource`]) or a directory of loose files ([`folder::FolderSource`]).
-//! Opening nested archives found inside a folder (`--archive-depth`) is a later
-//! addition.
-//! Used by: `engine` (search), `report::export` and (later) `diff`. Built by the
+//! Used by: `engine` (search), `report::export` and `diff`. Built by the
 //! binary's `support::sources`.
-//! Uses: `crate::models::Entry`, `anyhow`, `std::borrow::Cow`.
+//! Uses: `crate::models::Entry`, `anyhow`, `memmap2` (large loose files).
 //!
 //! Why a trait rather than passing `&[u8]` around: the engine used to assume every
 //! source was a memory-mapped ZIP addressed by byte offsets. Reading bytes through
@@ -16,7 +15,7 @@
 //! the exact same search/inspect/export pipeline, with the offset model
 //! (`MatchRecord::archive_offset`) becoming `None` where there is no archive.
 
-use std::borrow::Cow;
+use std::ops::Deref;
 
 use anyhow::Result;
 
@@ -25,6 +24,51 @@ use crate::models::Entry;
 pub mod folder;
 mod nested;
 pub mod zip;
+
+/// One entry's logical bytes, however the source backs them.
+///
+/// Like `Cow<'a, [u8]>` with a third, self-owning variant: a memory map. The
+/// map is what lets [`folder::FolderSource`] serve a multi-GB loose file
+/// without materialising it on the heap — a `Cow` could only *borrow* a map
+/// owned by `&self`, but the map is created per call — mirroring the zero-copy
+/// path the top-level ZIP mmap already has.
+pub enum Content<'a> {
+    /// Borrowed from the source's backing store (a STORED ZIP entry over the mmap).
+    Borrowed(&'a [u8]),
+    /// Owned heap bytes (DEFLATE inflate, decrypted plaintext, small loose file).
+    Owned(Vec<u8>),
+    /// A read-only memory map of a large loose file.
+    Mapped(memmap2::Mmap),
+}
+
+impl Deref for Content<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Content::Borrowed(b) => b,
+            Content::Owned(v) => v,
+            Content::Mapped(m) => m,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Content<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Content<'_> {
+    /// The bytes as an owned `Vec`, copying only when not already owned.
+    pub fn into_owned(self) -> Vec<u8> {
+        match self {
+            Content::Borrowed(b) => b.to_vec(),
+            Content::Owned(v) => v,
+            Content::Mapped(m) => m.to_vec(),
+        }
+    }
+}
 
 /// A container of located files: enumerate them, and read any one's bytes.
 ///
@@ -38,9 +82,9 @@ pub trait Source: Sync {
     fn entries(&self) -> &[Entry];
 
     /// The logical bytes of `entry`: borrowed from the backing store when possible
-    /// (a STORED ZIP entry over the mmap), otherwise owned (DEFLATE inflate, or a
-    /// loose file read from disk).
-    fn content(&self, entry: &Entry) -> Result<Cow<'_, [u8]>>;
+    /// (a STORED ZIP entry over the mmap), owned otherwise (DEFLATE inflate, a
+    /// small loose file), or a fresh memory map (a large loose file).
+    fn content(&self, entry: &Entry) -> Result<Content<'_>>;
 
     /// The source's physical size in bytes — the archive file size for a ZIP, the
     /// summed file sizes for a folder. Used only for the coverage report; the

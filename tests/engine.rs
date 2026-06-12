@@ -13,13 +13,35 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{FileSpec, build_zip};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
-use mf_scan::engine::{NoProgress, Progress, search_archive, search_with_progress};
+use mf_scan::engine::{Findings, NoProgress, Progress, Query, search_with_query};
 use mf_scan::filter::EntryFilter;
 use regex::bytes::Regex;
 
 /// A filter that searches everything.
 fn no_filter() -> EntryFilter {
     EntryFilter::all()
+}
+
+/// Plain-pattern search through the one engine entry point (no decryption,
+/// no progress) — what the removed `search_archive` wrapper used to do.
+fn search_plain(
+    zip: &[u8],
+    pattern: &str,
+    deep: bool,
+    match_path: bool,
+    filter: &EntryFilter,
+) -> Findings {
+    let re = Regex::new(pattern).unwrap();
+    search_with_query(
+        zip,
+        &Query::plain(&re),
+        deep,
+        match_path,
+        filter,
+        None,
+        &NoProgress,
+    )
+    .unwrap()
 }
 
 fn deflate(plain: &[u8]) -> Vec<u8> {
@@ -38,8 +60,7 @@ fn searches_stored_and_deflate_in_order() {
     ];
     let zip = build_zip(&files, false);
 
-    let findings =
-        search_archive(&zip, &Regex::new("TARGET").unwrap(), false, &no_filter()).unwrap();
+    let findings = search_plain(&zip, "TARGET", false, false, &no_filter());
     let records = &findings.records;
 
     assert_eq!(records.len(), 2);
@@ -76,9 +97,7 @@ fn deep_inspects_recognised_formats_only() {
     ];
     let zip = build_zip(&files, false);
 
-    let records = search_archive(&zip, &Regex::new("TARGET").unwrap(), true, &no_filter())
-        .unwrap()
-        .records;
+    let records = search_plain(&zip, "TARGET", true, false, &no_filter()).records;
 
     // .txt is inspected (line 2, after the first '\n'); .bin is not recognised.
     let txt = &records[0];
@@ -98,7 +117,7 @@ fn path_filter_restricts_searched_entries() {
     let zip = build_zip(&files, false);
     let filter = EntryFilter::new(&["*.db".to_string()], &[], &[], false);
 
-    let findings = search_archive(&zip, &Regex::new("TARGET").unwrap(), false, &filter).unwrap();
+    let findings = search_plain(&zip, "TARGET", false, false, &filter);
 
     // Only the .db file is searched, so only it matches.
     assert_eq!(findings.files.len(), 1);
@@ -119,7 +138,7 @@ fn type_filter_keeps_only_requested_category() {
 
     // --type database keeps only the SQLite file (header-detected).
     let only_db = EntryFilter::new(&[], &[], &["database".to_string()], false);
-    let findings = search_archive(&zip, &Regex::new("TARGET").unwrap(), false, &only_db).unwrap();
+    let findings = search_plain(&zip, "TARGET", false, false, &only_db);
     assert_eq!(findings.files.len(), 1);
     assert_eq!(findings.records[0].path, "a.db");
 }
@@ -137,8 +156,7 @@ fn skip_media_drops_media_files_by_signature() {
     let zip = build_zip(&files, false);
 
     let skip_media = EntryFilter::new(&[], &[], &[], true);
-    let findings =
-        search_archive(&zip, &Regex::new("TARGET").unwrap(), false, &skip_media).unwrap();
+    let findings = search_plain(&zip, "TARGET", false, false, &skip_media);
     assert_eq!(findings.files.len(), 1);
     assert_eq!(findings.records[0].path, "notes.txt");
 }
@@ -151,10 +169,8 @@ fn match_path_lists_files_whose_path_matches() {
         FileSpec::stored("notes.txt", b"banking"),
     ];
     let zip = build_zip(&files, false);
-    let re = Regex::new("banking").unwrap();
 
-    let findings =
-        search_with_progress(&zip, &re, false, true, &EntryFilter::all(), &NoProgress).unwrap();
+    let findings = search_plain(&zip, "banking", false, true, &EntryFilter::all());
 
     // Only the file with "banking" in its PATH is reported (content ignored).
     assert_eq!(findings.records.len(), 1);
@@ -194,14 +210,32 @@ fn progress_counts_every_searched_entry() {
 
     // No filter: total and inc count all three entries (matching or not).
     let all = CountProgress::default();
-    search_with_progress(&zip, &re, false, false, &no_filter(), &all).unwrap();
+    search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        false,
+        &no_filter(),
+        None,
+        &all,
+    )
+    .unwrap();
     assert_eq!(all.total.load(Ordering::Relaxed), 3);
     assert_eq!(all.done.load(Ordering::Relaxed), 3);
 
     // With a filter, the total reflects only the entries actually searched.
     let filtered = CountProgress::default();
     let only_db = EntryFilter::new(&["*.db".to_string()], &[], &[], false);
-    search_with_progress(&zip, &re, false, false, &only_db, &filtered).unwrap();
+    search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        false,
+        &only_db,
+        None,
+        &filtered,
+    )
+    .unwrap();
     assert_eq!(filtered.total.load(Ordering::Relaxed), 1);
     assert_eq!(filtered.done.load(Ordering::Relaxed), 1);
 }

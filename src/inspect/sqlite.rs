@@ -71,6 +71,20 @@ impl super::Inspector for Sqlite {
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
         locate(content, offset)
     }
+    /// Batch resolution: the schema and each table's page set are derived once
+    /// per file instead of once per match — a message DB with thousands of
+    /// matches would otherwise re-walk the schema b-trees for every one
+    /// (review finding P1).
+    fn inspect_many(&self, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+        let Some(db) = parse_header(content) else {
+            return offsets.iter().map(|_| None).collect();
+        };
+        let schema = SchemaMap::build(content, &db);
+        offsets
+            .iter()
+            .map(|&o| locate_with(content, &db, &schema, o))
+            .collect()
+    }
     fn sidecars(&self) -> &'static [&'static str] {
         // Uncommitted rows live in the WAL; export these so the DB opens complete.
         &["-wal", "-shm", "-journal"]
@@ -156,9 +170,43 @@ fn table_counts(content: &[u8], db: &Db) -> BTreeMap<String, usize> {
         .collect()
 }
 
+/// Per-file resolution state: every table with the set of pages its b-tree
+/// owns. Built once per file (one schema read + one page walk per table) and
+/// reused for every offset resolved in that file.
+struct SchemaMap {
+    tables: Vec<(Table, HashSet<u32>)>,
+}
+
+impl SchemaMap {
+    fn build(content: &[u8], db: &Db) -> Self {
+        let tables = read_schema(content, db)
+            .into_iter()
+            .map(|t| {
+                let pages = pages_of(content, db, t.rootpage);
+                (t, pages)
+            })
+            .collect();
+        Self { tables }
+    }
+
+    /// The table whose b-tree owns `page`, if any.
+    fn owner(&self, page: u32) -> Option<&Table> {
+        self.tables
+            .iter()
+            .find(|(_, pages)| pages.contains(&page))
+            .map(|(t, _)| t)
+    }
+}
+
 /// Resolve `offset` to a table cell, or fall back to page + offset-in-page.
 fn locate(content: &[u8], offset: usize) -> Option<Inspection> {
     let db = parse_header(content)?;
+    let schema = SchemaMap::build(content, &db);
+    locate_with(content, &db, &schema, offset)
+}
+
+/// [`locate`] against pre-built per-file state (the batch path shares it).
+fn locate_with(content: &[u8], db: &Db, schema: &SchemaMap, offset: usize) -> Option<Inspection> {
     if offset >= content.len() {
         return None;
     }
@@ -166,7 +214,7 @@ fn locate(content: &[u8], offset: usize) -> Option<Inspection> {
     let page_off = offset % db.page_size;
 
     Some(
-        resolve(content, &db, offset, page, page_off).unwrap_or_else(|| Inspection {
+        resolve(content, db, schema, offset, page, page_off).unwrap_or_else(|| Inspection {
             format: "sqlite".into(),
             summary: format!("page: {page}  offset: {page_off}  (not in a table cell)"),
             detail: json!({ "page": page, "page_offset": page_off }),
@@ -197,6 +245,7 @@ fn parse_header(content: &[u8]) -> Option<Db> {
 fn resolve(
     content: &[u8],
     db: &Db,
+    schema: &SchemaMap,
     offset: usize,
     page: u32,
     page_off: usize,
@@ -210,10 +259,7 @@ fn resolve(
     }
 
     // Which table's b-tree owns this page?
-    let tables = read_schema(content, db);
-    let table = tables
-        .into_iter()
-        .find(|t| pages_of(content, db, t.rootpage).contains(&page))?;
+    let table = schema.owner(page)?;
 
     let num_cells = read_u16(content, page_start + header_off + 3)?;
     let ptr_base = page_start + header_off + 8; // leaf header is 8 bytes

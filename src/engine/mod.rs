@@ -1,7 +1,8 @@
 //! Search orchestration: archive → findings (match records + matched files).
 //!
-//! Defines: `Findings`, `MatchedFile`, and `search_archive`, which parses an
-//! archive's entries and searches them in parallel, returning both the
+//! Defines: `Findings`, `MatchedFile`, and the two search entry points —
+//! [`search_source`] (any [`Source`]) and the [`search_with_query`] convenience
+//! over raw archive bytes — which search entries in parallel and return both the
 //! per-match records (for output) and the de-duplicated matched files (for the
 //! export step).
 //! Used by: `main.rs` (the binary) and `tests/engine.rs`.
@@ -96,42 +97,6 @@ pub struct NoProgress;
 impl Progress for NoProgress {
     fn set_total(&self, _total: usize) {}
     fn inc(&self) {}
-}
-
-/// Parse `archive` and return all matches of `re`, in entry order.
-///
-/// `filter` restricts which entries are searched (include/exclude globs and the
-/// media skip); see [`EntryFilter`]. When `deep` is set, each match is annotated
-/// with format-specific context where the file's format is recognised (see
-/// [`crate::inspect`]).
-pub fn search_archive(
-    archive: &[u8],
-    re: &Regex,
-    deep: bool,
-    filter: &EntryFilter,
-) -> Result<Findings> {
-    search_with_progress(archive, re, deep, false, filter, &NoProgress)
-}
-
-/// Like [`search_archive`], but reports scan progress via `progress`. A
-/// plain-only convenience wrapper over [`search_with_query`].
-pub fn search_with_progress(
-    archive: &[u8],
-    re: &Regex,
-    deep: bool,
-    match_path: bool,
-    filter: &EntryFilter,
-    progress: &dyn Progress,
-) -> Result<Findings> {
-    search_with_query(
-        archive,
-        &Query::plain(re),
-        deep,
-        match_path,
-        filter,
-        None,
-        progress,
-    )
 }
 
 /// Search a ZIP `archive` for `query` — a thin wrapper that opens a [`ZipSource`]
@@ -244,12 +209,16 @@ pub fn search_source(
                 bytes,
                 type_name,
                 matches,
+                truncated,
             } => {
                 stats.bytes_total += bytes;
                 stats.add_scanned(bytes, type_name);
                 stats.total_matches += matches;
                 if matches > 0 {
                     stats.files_with_matches += 1;
+                }
+                if truncated {
+                    stats.files_truncated += 1;
                 }
             }
         }

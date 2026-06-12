@@ -14,14 +14,13 @@
 //! when a data descriptor is used). Parsing it first gives exact data ranges,
 //! lets us skip header bytes, and tells us each entry's method.
 
-use std::borrow::Cow;
 use std::io::Read;
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::DeflateDecoder;
 
 use crate::models::{Entry, Location, Method};
-use crate::source::Source;
+use crate::source::{Content, Source};
 
 // --- ZIP record signatures (little-endian on disk) ---------------------------
 // These are fixed by the ZIP specification (APPNOTE.TXT), not operator-tunable,
@@ -373,7 +372,7 @@ fn dos_to_unix(date: u16, time: u16) -> Option<u64> {
 /// returned in place over the memory-mapped archive (no copy); DEFLATE entries are
 /// decompressed into an owned buffer, so reported offsets are positions within the
 /// *decompressed* stream. A non-ZIP entry is a caller bug and errors.
-pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Cow<'a, [u8]>> {
+pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Content<'a>> {
     let Location::Zip {
         method,
         data_offset,
@@ -406,7 +405,7 @@ pub fn read_range<'a>(
     data_len: u64,
     uncompressed_size: u64,
     name: &str,
-) -> Result<Cow<'a, [u8]>> {
+) -> Result<Content<'a>> {
     let start = data_offset as usize;
     // A data range outside the file means the Central Directory disagreed with
     // the archive's real size; bailing here surfaces a corrupt/truncated image
@@ -418,11 +417,11 @@ pub fn read_range<'a>(
         .with_context(|| format!("data range of {name} is out of bounds"))?;
 
     match method {
-        Method::Stored => Ok(Cow::Borrowed(raw)),
+        Method::Stored => Ok(Content::Borrowed(raw)),
         Method::Deflate => {
             let inflated = inflate(raw, uncompressed_size)
                 .with_context(|| format!("failed to inflate {name}"))?;
-            Ok(Cow::Owned(inflated))
+            Ok(Content::Owned(inflated))
         }
     }
 }
@@ -475,7 +474,7 @@ impl Source for ZipSource<'_> {
         &self.entries
     }
 
-    fn content(&self, entry: &Entry) -> Result<Cow<'_, [u8]>> {
+    fn content(&self, entry: &Entry) -> Result<Content<'_>> {
         content(self.data, entry)
     }
 
