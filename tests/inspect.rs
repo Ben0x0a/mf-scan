@@ -63,6 +63,15 @@ fn json_top_level_array_index() {
     assert_eq!(insp.detail["path"], "$[1]");
 }
 
+/// Crafted-input DoS guard (review finding S2): a file that is nothing but
+/// 100 000 `[` characters once overflowed the scanner's recursion and crashed
+/// the whole process. Past the depth cap, inspection must degrade to `None`.
+#[test]
+fn json_pathological_nesting_does_not_overflow_the_stack() {
+    let content = vec![b'['; 100_000];
+    assert!(inspect("bomb.json", &content, 50_000).is_none());
+}
+
 #[test]
 fn xml_resolves_element_path() {
     // Non-plist XML, so it is handled by the generic XML inspector (element

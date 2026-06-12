@@ -296,7 +296,19 @@ impl<'a> Bplist<'a> {
         let num_objects = read_be(content, trailer + 8, 8)? as usize;
         let top = read_be(content, trailer + 16, 8)? as usize;
         let offset_table = read_be(content, trailer + 24, 8)? as usize;
-        if offset_size == 0 || ref_size == 0 {
+        // The trailer values are untrusted (crafted evidence): every later
+        // lookup iterates `0..num_objects` or indexes the offset table, so a
+        // trailer claiming 2^60 objects would spin effectively forever. The
+        // table cannot hold more entries than the bytes available for it, and
+        // the table itself (plus the root reference) must lie inside the file.
+        if offset_size == 0
+            || offset_size > 8
+            || ref_size == 0
+            || ref_size > 8
+            || offset_table >= trailer
+            || num_objects > (trailer - offset_table) / offset_size
+            || top >= num_objects
+        {
             return None;
         }
         Some(Self {
@@ -419,9 +431,21 @@ impl<'a> Bplist<'a> {
     fn path_to(&self, target: usize) -> Option<Vec<String>> {
         let mut result = None;
         let mut visited = std::collections::HashSet::new();
-        self.walk(self.top, target, &mut Vec::new(), &mut result, &mut visited);
+        self.walk(
+            self.top,
+            target,
+            &mut Vec::new(),
+            &mut result,
+            &mut visited,
+            0,
+        );
         result
     }
+
+    /// Maximum nesting `walk` descends into. The visited set stops cycles but
+    /// not a crafted *chain* of 100 000 nested containers, which would overflow
+    /// the stack; past the cap the subtree is abandoned (degrade, don't die).
+    const MAX_WALK_DEPTH: usize = 128;
 
     fn walk(
         &self,
@@ -430,8 +454,9 @@ impl<'a> Bplist<'a> {
         path: &mut Vec<String>,
         result: &mut Option<Vec<String>>,
         visited: &mut std::collections::HashSet<usize>,
+        depth: usize,
     ) {
-        if result.is_some() {
+        if result.is_some() || depth > Self::MAX_WALK_DEPTH {
             return;
         }
         if oid == target {
@@ -452,7 +477,7 @@ impl<'a> Bplist<'a> {
                         return;
                     }
                     path.push(key);
-                    self.walk(v, target, path, result, visited);
+                    self.walk(v, target, path, result, visited, depth + 1);
                     path.pop();
                     if result.is_some() {
                         return;
@@ -462,7 +487,7 @@ impl<'a> Bplist<'a> {
             Children::Array(elems) => {
                 for (i, e) in elems.into_iter().enumerate() {
                     path.push(format!("[{i}]"));
-                    self.walk(e, target, path, result, visited);
+                    self.walk(e, target, path, result, visited, depth + 1);
                     path.pop();
                     if result.is_some() {
                         return;

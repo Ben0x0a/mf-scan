@@ -38,10 +38,27 @@ impl FolderSource {
     /// relative to `root` (using `/` separators). `archive_depth` is how many levels
     /// of nested `.zip` to open and descend into (0 = treat them as opaque files).
     pub fn open(root: &Path, archive_depth: u32) -> Result<Self> {
+        Self::open_with_arena_budget(root, archive_depth, nested::NESTED_ARENA_BUDGET)
+    }
+
+    /// Like [`FolderSource::open`], but with an explicit cap on the bytes the
+    /// nested-archive arena may hold. Opening more nested archives than the
+    /// budget allows fails loudly (crafted archives-of-archives could otherwise
+    /// exhaust memory at depth 1). Exposed for tests and callers that need a
+    /// tighter bound; `open` uses the built-in default.
+    pub fn open_with_arena_budget(root: &Path, archive_depth: u32, budget: u64) -> Result<Self> {
         let mut entries = Vec::new();
         let mut blobs = Vec::new();
-        collect(root, root, archive_depth, &mut entries, &mut blobs)
-            .with_context(|| format!("cannot scan folder {}", root.display()))?;
+        let mut budget = budget;
+        collect(
+            root,
+            root,
+            archive_depth,
+            &mut entries,
+            &mut blobs,
+            &mut budget,
+        )
+        .with_context(|| format!("cannot scan folder {}", root.display()))?;
         // Deterministic order (the OS does not guarantee read_dir ordering), so
         // results and the coverage report are stable across runs and platforms.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -101,6 +118,7 @@ fn collect(
     depth: u32,
     entries: &mut Vec<Entry>,
     blobs: &mut Vec<Vec<u8>>,
+    budget: &mut u64,
 ) -> Result<()> {
     let mut children: Vec<fs::DirEntry> =
         fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
@@ -112,7 +130,7 @@ fn collect(
         }
         let path = child.path();
         if file_type.is_dir() {
-            collect(root, &path, depth, entries, blobs)?;
+            collect(root, &path, depth, entries, blobs, budget)?;
             continue;
         }
         if !file_type.is_file() {
@@ -120,14 +138,25 @@ fn collect(
         }
         let name = relative_name(root, &path);
 
-        // A nested `.zip`, with depth budget: read and expand it. On any failure
-        // (unreadable, unparseable) fall back to treating it as an opaque loose file.
+        // A nested `.zip`, with depth budget: read and expand it. An unreadable or
+        // unparseable one falls back to an opaque loose file; an exhausted arena
+        // budget aborts the scan loudly (it is a resource limit, not a bad file).
         if depth >= 1
             && has_zip_extension(&path)
             && let Ok(bytes) = fs::read(&path)
-            && nested::expand(bytes, &format!("{name}/"), depth - 1, entries, blobs).is_ok()
         {
-            continue;
+            match nested::expand(
+                bytes,
+                &format!("{name}/"),
+                depth - 1,
+                entries,
+                blobs,
+                budget,
+            ) {
+                Ok(()) => continue,
+                Err(e) if e.is::<nested::ArenaBudgetExceeded>() => return Err(e),
+                Err(_) => {} // fall through to the opaque loose-file entry
+            }
         }
 
         let meta = child.metadata().ok();

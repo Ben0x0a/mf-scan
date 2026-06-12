@@ -308,7 +308,11 @@ fn find_eocd(data: &[u8]) -> Result<usize> {
 // clean error instead of a panic — important when parsing untrusted evidence.
 
 fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
-    data.get(off..off + len)
+    // checked_add keeps debug and release behaviour identical on absurd
+    // offsets: an overflowing `off + len` must error like any other
+    // out-of-bounds read, not panic in debug builds.
+    off.checked_add(len)
+        .and_then(|end| data.get(off..end))
         .with_context(|| format!("read of {len} bytes at offset {off} is out of bounds"))
 }
 
@@ -404,12 +408,13 @@ pub fn read_range<'a>(
     name: &str,
 ) -> Result<Cow<'a, [u8]>> {
     let start = data_offset as usize;
-    let end = start + data_len as usize;
     // A data range outside the file means the Central Directory disagreed with
     // the archive's real size; bailing here surfaces a corrupt/truncated image
-    // rather than silently searching the wrong bytes.
-    let raw = archive
-        .get(start..end)
+    // rather than silently searching the wrong bytes. checked_add: an
+    // overflowing range is the same lie and must error identically in debug.
+    let raw = start
+        .checked_add(data_len as usize)
+        .and_then(|end| archive.get(start..end))
         .with_context(|| format!("data range of {name} is out of bounds"))?;
 
     match method {
@@ -422,14 +427,28 @@ pub fn read_range<'a>(
     }
 }
 
+/// Cap on the inflate pre-allocation hint. `expected_size` comes from the
+/// untrusted Central Directory: a crafted entry claiming an absurd size must
+/// not abort on allocation before a single byte is inflated. `read_to_end`
+/// grows the buffer as needed, so capping the hint costs only reallocations.
+const INFLATE_HINT_CAP: u64 = 64 * 1024 * 1024;
+
 /// Inflate a raw DEFLATE stream (ZIP method 8 stores no zlib header).
 ///
-/// `expected_size` is only a capacity hint to avoid reallocations; the decoder
-/// reads to the end of the stream regardless.
+/// `expected_size` is the Central Directory's declared uncompressed size. It is
+/// enforced as a ceiling and an exact target: DEFLATE can legally expand ~1000×,
+/// so without the ceiling a small crafted entry could balloon without bound
+/// (zip bomb); a mismatch in either direction means the archive lies about the
+/// entry and the bytes cannot be trusted.
 fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> {
-    let mut decoder = DeflateDecoder::new(compressed);
-    let mut out = Vec::with_capacity(expected_size as usize);
+    let mut decoder = DeflateDecoder::new(compressed).take(expected_size.saturating_add(1));
+    let mut out = Vec::with_capacity(expected_size.min(INFLATE_HINT_CAP) as usize);
     decoder.read_to_end(&mut out)?;
+    ensure!(
+        out.len() as u64 == expected_size,
+        "inflated size {} does not match the declared {expected_size} bytes",
+        out.len()
+    );
     Ok(out)
 }
 

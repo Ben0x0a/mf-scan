@@ -62,7 +62,7 @@ fn resolve(content: &[u8], offset: usize) -> Option<Inspection> {
     };
     let mut path = Vec::new();
     let mut found = None;
-    scanner.value(offset, &mut path, &mut found);
+    scanner.value(offset, &mut path, &mut found, 0);
 
     let path = found?;
     let line = super::line_at(content, offset);
@@ -91,6 +91,13 @@ fn render(path: &[Seg]) -> String {
     }
     s
 }
+
+/// Maximum container nesting the scanner descends into — the same limit
+/// serde_json enforces. The methods below recurse per nesting level, so a
+/// crafted file of 100 000 `[` bytes would otherwise overflow the stack and
+/// crash the whole process; past the cap the scanner abandons the subtree and
+/// inspection degrades to the offset-only fallback.
+const MAX_DEPTH: usize = 128;
 
 struct Scanner<'a> {
     bytes: &'a [u8],
@@ -127,13 +134,22 @@ impl Scanner<'_> {
         }
     }
 
-    /// Parse a value at the cursor, descending into containers.
-    fn value(&mut self, target: usize, path: &mut Vec<Seg>, found: &mut Option<String>) {
+    /// Parse a value at the cursor, descending into containers (to `MAX_DEPTH`).
+    fn value(
+        &mut self,
+        target: usize,
+        path: &mut Vec<Seg>,
+        found: &mut Option<String>,
+        depth: usize,
+    ) {
+        if depth > MAX_DEPTH {
+            return;
+        }
         self.skip_ws();
         let start = self.pos;
         match self.peek() {
-            Some(b'{') => self.object(target, path, found),
-            Some(b'[') => self.array(target, path, found),
+            Some(b'{') => self.object(target, path, found, depth),
+            Some(b'[') => self.array(target, path, found, depth),
             Some(b'"') => {
                 self.scan_string();
                 self.maybe_hit(start, self.pos, target, path, found);
@@ -189,7 +205,13 @@ impl Scanner<'_> {
         (start, self.pos, key)
     }
 
-    fn object(&mut self, target: usize, path: &mut Vec<Seg>, found: &mut Option<String>) {
+    fn object(
+        &mut self,
+        target: usize,
+        path: &mut Vec<Seg>,
+        found: &mut Option<String>,
+        depth: usize,
+    ) {
         self.bump(); // {
         loop {
             self.skip_ws();
@@ -221,7 +243,7 @@ impl Scanner<'_> {
             }
 
             path.push(Seg::Key(key));
-            self.value(target, path, found);
+            self.value(target, path, found, depth + 1);
             path.pop();
 
             self.skip_ws();
@@ -236,7 +258,13 @@ impl Scanner<'_> {
         }
     }
 
-    fn array(&mut self, target: usize, path: &mut Vec<Seg>, found: &mut Option<String>) {
+    fn array(
+        &mut self,
+        target: usize,
+        path: &mut Vec<Seg>,
+        found: &mut Option<String>,
+        depth: usize,
+    ) {
         self.bump(); // [
         let mut index = 0;
         loop {
@@ -251,7 +279,7 @@ impl Scanner<'_> {
             }
 
             path.push(Seg::Index(index));
-            self.value(target, path, found);
+            self.value(target, path, found, depth + 1);
             path.pop();
             index += 1;
 

@@ -77,3 +77,21 @@ fn diff_reports_changed_and_added_plist_keys() {
     assert_eq!(d.detail["counts"]["removed"], 0);
     assert_eq!(d.detail["counts"]["changed"], 1); // $.count
 }
+
+/// Crafted-input DoS guard (review finding S3): a binary-plist trailer claiming
+/// 2^60 objects once made every offset lookup iterate effectively forever.
+/// The trailer counts are now validated against the bytes actually available,
+/// so the inspector must degrade to `None` immediately.
+#[test]
+fn crafted_bplist_trailer_with_bogus_counts_degrades_fast() {
+    let mut content = b"bplist00".to_vec();
+    content.extend_from_slice(&[0u8; 16]); // a token body
+    let mut trailer = [0u8; 32];
+    trailer[6] = 8; // offset_size
+    trailer[7] = 8; // ref_size
+    trailer[8..16].copy_from_slice(&(1u64 << 60).to_be_bytes()); // num_objects: absurd
+    trailer[24..32].copy_from_slice(&8u64.to_be_bytes()); // offset_table
+    content.extend_from_slice(&trailer);
+
+    assert!(inspect("x.plist", &content, 10).is_none());
+}

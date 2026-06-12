@@ -104,3 +104,43 @@ fn errors_on_truncated_archive() {
 
     assert!(parse_entries(truncated).is_err());
 }
+
+/// Crafted-input DoS guards (review finding S1): the Central Directory's
+/// declared uncompressed size is untrusted. A huge claimed size must produce a
+/// clean error (capped allocation hint, size mismatch) — not an allocation
+/// abort — and an entry inflating to MORE than its claim must error rather
+/// than balloon without bound (zip-bomb ceiling).
+#[test]
+fn deflate_entry_lying_about_its_size_errors_cleanly() {
+    use std::io::Write;
+
+    use flate2::{Compression, write::DeflateEncoder};
+    use mf_scan::source::zip::content;
+
+    let plain = b"tiny but honest content";
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(plain).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    // Claims ~4 GiB but inflates to 23 bytes: must error, not abort or accept.
+    // (u32::MAX itself is the ZIP64 saturation sentinel, so stay just under it.)
+    let oversize = build_zip(
+        &[FileSpec::deflate("liar.bin", &compressed, u32::MAX - 1)],
+        false,
+    );
+    let entries = parse_entries(&oversize).unwrap();
+    assert!(content(&oversize, &entries[0]).is_err());
+
+    // Claims 4 bytes but inflates past it: the ceiling must stop and reject it.
+    let bomb = build_zip(&[FileSpec::deflate("bomb.bin", &compressed, 4)], false);
+    let entries = parse_entries(&bomb).unwrap();
+    assert!(content(&bomb, &entries[0]).is_err());
+
+    // The honest declaration still round-trips.
+    let honest = build_zip(
+        &[FileSpec::deflate("ok.bin", &compressed, plain.len() as u32)],
+        false,
+    );
+    let entries = parse_entries(&honest).unwrap();
+    assert_eq!(&*content(&honest, &entries[0]).unwrap(), plain);
+}

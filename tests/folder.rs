@@ -160,3 +160,29 @@ fn unreadable_file_is_counted_and_does_not_abort_the_scan() {
     assert_eq!(findings.stats.unreadable.count, 1);
     assert_eq!(findings.stats.files_scanned, 1);
 }
+
+/// Resource-exhaustion guard (review finding S4): nested-archive expansion has
+/// a cumulative arena budget. Exhausting it must fail loudly — not degrade
+/// silently (coverage cut short) and not OOM (crafted archive-of-archives).
+#[test]
+fn nested_arena_budget_exhaustion_fails_loudly() {
+    let dir = tempdir().unwrap();
+    let inner = build_zip(&[FileSpec::stored("inner.txt", b"hello nested")], false);
+    fs::write(dir.path().join("a.zip"), &inner).unwrap();
+    fs::write(dir.path().join("b.zip"), &inner).unwrap();
+
+    // Room for one archive but not both.
+    let small = inner.len() as u64 + 1;
+    let err = match FolderSource::open_with_arena_budget(dir.path(), 1, small) {
+        Ok(_) => panic!("expected the arena budget to be exceeded"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:#}").contains("nested archives exceed"),
+        "unexpected error: {err:#}"
+    );
+
+    // A sufficient budget expands both.
+    let src = FolderSource::open_with_arena_budget(dir.path(), 1, 10 * inner.len() as u64).unwrap();
+    assert_eq!(names(&src), ["a.zip/inner.txt", "b.zip/inner.txt"]);
+}

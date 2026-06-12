@@ -12,28 +12,71 @@
 //! parsed (or read) is kept as a single opaque file rather than dropped — forensic
 //! archives are frequently partial.
 
+use std::fmt;
+
 use anyhow::Result;
 
 use crate::models::{Entry, Location, Method};
 use crate::source::zip;
 
+/// Cumulative cap on bytes held in the nested-archive arena.
+///
+/// Depth is operator-bounded (`--archive-depth`) but breadth is not: one folder
+/// of many nested archives (or a crafted archive-of-archives) could exceed RAM
+/// at depth 1. Exhausting the budget fails loudly (see [`ArenaBudgetExceeded`])
+/// instead of OOM-killing the process.
+pub(crate) const NESTED_ARENA_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Marker error: opening one more nested archive would exceed the arena budget.
+///
+/// Callers degrade a *parse* failure to an opaque entry, but must propagate
+/// THIS error: degrading would silently cut coverage short, and continuing to
+/// inflate would exhaust memory on crafted input.
+#[derive(Debug)]
+pub(crate) struct ArenaBudgetExceeded {
+    pub(crate) budget: u64,
+}
+
+impl fmt::Display for ArenaBudgetExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "nested archives exceed the {} bytes in-memory budget; \
+             lower --archive-depth or scan the inner archives individually",
+            self.budget
+        )
+    }
+}
+
+impl std::error::Error for ArenaBudgetExceeded {}
+
 /// Expand a nested-archive `blob` into `entries`, prefixing each internal path with
 /// `prefix` (which ends in `/`). `remaining` is how many *further* levels of nested
 /// `.zip` may be opened below this one (0 = treat any inner `.zip` as opaque).
+/// `budget` is the remaining arena allowance, decremented per opened blob.
 ///
-/// Returns `Err` only when `blob` itself is not a parseable ZIP, so the caller can
-/// fall back to treating it as an opaque file; per-entry problems degrade to opaque
-/// entries in place.
+/// Returns `Err` when `blob` itself is not a parseable ZIP — the caller can fall
+/// back to treating it as an opaque file — or when the arena budget is exhausted
+/// (an [`ArenaBudgetExceeded`], which the caller must propagate, not degrade);
+/// other per-entry problems degrade to opaque entries in place.
 pub(crate) fn expand(
     blob: Vec<u8>,
     prefix: &str,
     remaining: u32,
     entries: &mut Vec<Entry>,
     blobs: &mut Vec<Vec<u8>>,
+    budget: &mut u64,
 ) -> Result<()> {
     // Parse before taking an arena slot, so a malformed blob errors without leaving
     // a dangling index behind.
     let zentries = zip::parse_entries(&blob)?;
+    let blob_len = blob.len() as u64;
+    if blob_len > *budget {
+        return Err(anyhow::Error::new(ArenaBudgetExceeded {
+            budget: NESTED_ARENA_BUDGET,
+        }));
+    }
+    *budget -= blob_len;
     let blob_idx = blobs.len();
     blobs.push(blob);
 
@@ -91,17 +134,19 @@ pub(crate) fn expand(
 
     for p in pending {
         // Recurse into the inner archive; if it will not parse, keep it as one opaque
-        // file (its bytes still live as a stored entry in the parent blob).
-        if expand(
+        // file (its bytes still live as a stored entry in the parent blob). A budget
+        // exhaustion is NOT a parse problem and must abort the whole expansion.
+        match expand(
             p.content,
             &format!("{}/", p.name),
             remaining - 1,
             entries,
             blobs,
-        )
-        .is_err()
-        {
-            entries.push(nested_entry(
+            budget,
+        ) {
+            Ok(()) => {}
+            Err(e) if e.is::<ArenaBudgetExceeded>() => return Err(e),
+            Err(_) => entries.push(nested_entry(
                 p.name,
                 p.uncompressed_size,
                 p.mtime,
@@ -109,7 +154,7 @@ pub(crate) fn expand(
                 p.method,
                 p.data_offset,
                 p.data_len,
-            ));
+            )),
         }
     }
     Ok(())
