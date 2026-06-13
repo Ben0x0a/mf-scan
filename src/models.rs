@@ -5,8 +5,9 @@
 //! data) and `MatchRecord` (an archive-level match enriched with every offset,
 //! ready for output).
 //! Used by: `zip` (produces `Entry`), `engine` (consumes `Entry`, produces
-//! `SearchHit`), and `report::output` (renders `MatchRecord`).
-//! Uses: only `std::ops::Range` — these are plain, dependency-free data types,
+//! `SearchHit`), `report::output` (renders `MatchRecord`), and
+//! `ios::containers` (sets `bundle_id` on annotated records).
+//! Uses: only `std::ops::Range` and `serde` — these are plain data types,
 //! kept in their own module so the parser and the search engine can each depend
 //! on the data shape without depending on each other.
 
@@ -266,6 +267,14 @@ pub struct MatchRecord {
     /// The decoded value, set only for base64 matches — it is the literal the
     /// user searched for, shown so the report says what the encoded run contains.
     pub decoded: Option<String>,
+    /// iOS app bundle ID (e.g. `com.apple.weather`) for matches inside a
+    /// container directory — resolved from the container's
+    /// `.com.apple.mobile_container_manager.metadata.plist`. Populated by
+    /// `ios::containers::AppContainerMap` in the post-search annotation pass;
+    /// `None` when the source has no iOS container metadata or the match is
+    /// outside any known container.
+    /// Serialised by `report::output::JsonView` (not directly on this struct).
+    pub bundle_id: Option<String>,
 }
 
 impl MatchRecord {
@@ -312,6 +321,7 @@ impl MatchRecord {
             inspection: None,
             encoding: Encoding::Plain,
             decoded: None,
+            bundle_id: None,
         }
     }
 }

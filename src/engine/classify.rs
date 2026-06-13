@@ -328,6 +328,7 @@ fn match_entry_path(entry: &Entry, re: &Regex) -> (Vec<MatchRecord>, Option<Matc
         inspection: None,
         encoding: Encoding::Plain,
         decoded: None,
+        bundle_id: None,
     };
     let file = MatchedFile {
         entry: entry.clone(),

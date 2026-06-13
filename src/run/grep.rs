@@ -19,6 +19,7 @@ use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::engine::Query;
 use mf_scan::filter::EntryFilter;
 use mf_scan::inspect::{is_known_type, type_names};
+use mf_scan::ios::containers::AppContainerMap;
 use mf_scan::models::RunInfo;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{OutputFormat, write_counts, write_results};
@@ -154,6 +155,20 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                         r.archive = Some(src.label.clone());
                     }
                 }
+
+                // iOS container annotation: build the container map once per source
+                // (reads only the small metadata plists), then set bundle_id on every
+                // record whose path falls inside a known container directory.
+                // WHY post-search, not in the hot parallel path: this is a cheap
+                // sequential pass; container metadata plists are tiny; and the parallel
+                // engine must remain oblivious to iOS-specific enrichment.
+                let container_map = AppContainerMap::build(source);
+                if !container_map.is_empty() {
+                    for r in &mut findings.records {
+                        r.bundle_id = container_map.resolve(&r.path).map(str::to_string);
+                    }
+                }
+
                 if !multi {
                     // --manifest/--export only apply to a single source (guarded above).
                     export_if_requested(&cli.sink, source, findings, &run)?;

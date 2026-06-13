@@ -117,7 +117,7 @@ fn is_false(b: &bool) -> bool {
 
 /// JSON projection: offsets are `0x…` hex strings; `archive` is the source's full
 /// path; `line` appears only for textual matches; `format`/`context` only when
-/// the match was inspected (`--inspect`).
+/// the match was inspected (`--inspect`); `bundle_id` only for iOS container matches.
 #[derive(Serialize)]
 struct JsonView<'a> {
     /// Full filesystem path of the source archive this result came from.
@@ -148,6 +148,10 @@ struct JsonView<'a> {
     context: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<Cow<'a, str>>,
+    /// iOS app bundle ID — present only when the match is inside an iOS container
+    /// whose metadata plist was found in the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_id: Option<&'a str>,
 }
 
 impl<'a> From<&'a MatchRecord> for JsonView<'a> {
@@ -168,6 +172,7 @@ impl<'a> From<&'a MatchRecord> for JsonView<'a> {
             format: r.inspection.as_ref().map(|i| i.format.as_str()),
             context: r.inspection.as_ref().map(|i| &i.detail),
             line: textual_line(r),
+            bundle_id: r.bundle_id.as_deref(),
         }
     }
 }
@@ -304,6 +309,12 @@ fn write_txt(
                 "  [base64 → \"{}\"]",
                 r.decoded.as_deref().unwrap_or("")
             ));
+        }
+        // iOS container annotation: identify the owning app when known, so the
+        // analyst immediately sees which app a hit belongs to without having to
+        // look up the GUID separately.
+        if let Some(id) = &r.bundle_id {
+            out.push_str(&format!("  [app: {id}]"));
         }
         writeln!(w, "{out}").context("failed writing txt output")?;
     }

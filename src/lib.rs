@@ -12,6 +12,8 @@
 //!   • `diff` — compare two sources: which files were added/removed/modified.
 //!   • `report` — result `output`, coverage `stats`, and the `diff` report.
 //!   • `export` / `preset` — file/manifest export and the behaviour-preset schema.
+//!   • `ios` — iOS-specific artefact resolution (container GUID → bundle-ID map,
+//!     etc.).
 //! Used by: `main.rs` (the binary) and everything under `tests/`.
 //! Uses: the modules it declares.
 //!
@@ -24,6 +26,7 @@ pub mod diff;
 pub mod engine;
 pub mod filter;
 pub mod inspect;
+pub mod ios;
 pub mod models;
 pub mod preset;
 pub mod report;

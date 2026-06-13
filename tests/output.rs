@@ -48,6 +48,7 @@ fn binary_record() -> Vec<MatchRecord> {
         inspection: None,
         encoding: Encoding::Plain,
         decoded: None,
+        bundle_id: None,
     }]
 }
 
@@ -67,6 +68,7 @@ fn sample() -> Vec<MatchRecord> {
             inspection: None,
             encoding: Encoding::Plain,
             decoded: None,
+            bundle_id: None,
         },
         MatchRecord {
             archive: None,
@@ -82,6 +84,7 @@ fn sample() -> Vec<MatchRecord> {
             inspection: None,
             encoding: Encoding::Plain,
             decoded: None,
+            bundle_id: None,
         },
     ]
 }
@@ -175,6 +178,7 @@ fn txt_shows_hex_file_offset_for_compressed() {
         inspection: None,
         encoding: Encoding::Plain,
         decoded: None,
+        bundle_id: None,
     }];
 
     let out = render(&records, OutputFormat::Txt, false);
@@ -203,6 +207,7 @@ fn inspected() -> Vec<MatchRecord> {
         }),
         encoding: Encoding::Plain,
         decoded: None,
+        bundle_id: None,
     }]
 }
 
