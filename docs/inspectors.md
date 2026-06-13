@@ -71,6 +71,63 @@ Both encodings resolve to the same dict-key / array-index **path**, e.g.
   object whose byte span contains the offset is located, then a path to it is
   found by walking the object graph from the root.
 
+#### NSKeyedArchiver serialised plists
+
+Binary plists produced by `NSKeyedArchiver` (the standard Cocoa object-graph
+serialiser) store a **flattened `$objects` array** rather than a nested dict tree.
+All cross-references are UIDs — integer scalars (bplist marker high-nibble `0x8`)
+that are indices into `$objects`. Detection is header-first: the root dict must
+contain `$archiver == "NSKeyedArchiver"`.
+
+The resolver (`src/inspect/nskeyed.rs`) walks the UID graph from every `$top`
+entry to the object that contains the matched bytes, reconstructing the logical
+path (e.g. `$.root.prefs.token`). Four hit kinds are handled:
+
+| Hit kind | Description | Example path |
+|---|---|---|
+| Direct value | Object is a plain scalar (string, number, data) in an NSDictionary or NSArray | `$.root.title` |
+| Array element | Object is an element of an `NS.objects`-encoded NSArray | `$.root.items[2]` |
+| Dict key name | The match landed on a dictionary **key** string, not a value | `$.root.NEEDLE_KEY` |
+| Wrapped scalar | Object is the inner scalar of a Foundation wrapper (`NS.string` / `NS.data` / `NS.value` field in an `NSMutableString`, `NSData`, or `NSValue` object) | `$.root.s` |
+
+The **Foundation class name** of the logical object that directly holds the matched
+value is reported in the `detail` JSON as `"class"` (e.g. `"NSMutableString"`,
+`"NSDictionary"`, `"NSArray"`). The field is omitted when the `$class` entry
+cannot be read. For a wrapped scalar the class is the *wrapper's* class; for a
+container hit it is the *container's* class.
+
+```
+detail: {
+  "path":     "$.root.prefs.token",
+  "archiver": "NSKeyedArchiver",
+  "class":    "NSDictionary"        // omitted when unresolvable
+}
+```
+
+#### NSKeyedArchiver `$objects`/UID resolution — flow
+
+```mermaid
+flowchart TD
+    A["match offset\n(file byte)"] --> B["object_at_offset\n→ target_oid (raw bplist oid)"]
+    B --> C{Is archive\nNSKeyedArchiver?}
+    C -- No --> D["ordinary path_to walk\n(plain bplist)"]
+    C -- Yes --> E["build NskeyedCtx\n($objects oids, $top entries)"]
+    E --> F["for each $top entry\nwalk_logical(root_oid, target_oid)"]
+    F --> G{NSDictionary?\nNS.keys + NS.objects}
+    G -- Yes --> H{NS.keys element oid\n== target_oid?}
+    H -- Yes --> I["key-name hit\npath = …key\nclass = container class"]
+    H -- No --> J{NS.objects value oid\n== target_oid?}
+    J -- Yes --> K["value hit\npath = …key\nclass = container class"]
+    J -- No --> L["recurse into value"]
+    G -- No --> M{NSArray?\nNS.objects only}
+    M -- Yes --> N{element oid\n== target_oid?}
+    N -- Yes --> O["array hit\npath = …[i]\nclass = container class"]
+    N -- No --> P["recurse into element"]
+    M -- No --> Q{NS.string/NS.data/\nNS.value in dict pairs?}
+    Q -- Yes, inner_oid\n== target_oid --> R["wrapped-scalar hit\npath = wrapper's path\nclass = wrapper's class"]
+    Q -- No --> S["leaf — no match\non this branch"]
+```
+
 ### SQLite
 Parses the database header (page size), then the b-tree:
 

@@ -157,6 +157,7 @@ app.json:1
 | `csv`    | `{ "row": N, "col": N, "header": "..." }` | `row: N  col: N  header: H` |
 | `plist`  | `{ "path": "$.Account.Servers[1]", "line": N }` | `key: $.Account.Servers[1]  line: N` |
 | `bplist` | `{ "path": "...", "object": N }` | `key: $.Account.Servers[1]` |
+| `bplist` (NSKeyedArchiver) | `{ "path": "$.root.key", "archiver": "NSKeyedArchiver", "class": "NSDictionary" }` (`class` omitted when unresolvable) | `nskeyed key: $.root.key` |
 | `sqlite` (in a row) | `{ "page": N, "table": "...", "rowid": N, "column": "...", "type": "TEXT", "cell": "..." }` | `table: T  column: C [TYPE]  row: R  cell: V` |
 | `sqlite` (BLOB cell, recognised) | the above **plus** `"blob_format": "bplist"` and `"blob_context": { … }` | `… [BLOB]  cell: <blob N bytes>  blob: bplist  key: $.…` |
 | `sqlite` (elsewhere) | `{ "page": N, "page_offset": N }` | `page: N  offset: N  (not in a table cell)` |
@@ -265,6 +266,27 @@ The `stats` object:
 - `offsets` are the `file_offset`s of every match in that file.
 - `export --from-manifest` reuses `output_path` and locates each file by
   `internal_path`; missing entries are reported as skipped.
+
+## iOS app bundle-ID annotation
+
+When searching an iOS acquisition, each match whose file path lies inside an iOS
+app container is annotated with the owning app's **bundle ID** (e.g.
+`com.apple.MobileSMS`, `com.whatsapp.WhatsApp`).
+
+**How it works.** iOS stores a
+`.com.apple.mobile_container_manager.metadata.plist` file in every container
+directory (under `private/var/mobile/Containers/…`). On startup, mf-scan scans
+the source once for these metadata plists, reads the `MCMMetadataIdentifier` key
+from each, and builds a container-directory → bundle-ID map. Each match is then
+resolved against this map by longest-prefix matching on `/`-segment boundaries,
+so a file nested deep inside a container still resolves to the correct app.
+
+The annotation appears as a `bundle_id` field in the json result object and as a
+`[bundle: …]` suffix in the txt line (when the source has iOS containers). It is
+entirely absent for non-iOS sources.
+
+Missing or unreadable metadata plists are silently skipped — one absent annotation
+does not prevent the rest of the scan from completing (degrade-don't-die).
 
 ## Export report (`export-report.json`)
 

@@ -316,15 +316,26 @@ fn inspect_binary_with(bp: &Bplist<'_>, offset: usize) -> Option<Inspection> {
     // Try the NSKeyedArchiver resolver first (header-first detection inside
     // `nskeyed_path`).  On any failure it returns `None` and we fall through to
     // the ordinary walk — degrade, don't die.
-    if let Some(nk_path) = super::nskeyed::nskeyed_path(bp, offset) {
-        let rendered = render(&nk_path);
+    if let Some(hit) = super::nskeyed::nskeyed_path(bp, offset) {
+        let rendered = render(&hit.path);
+        // WHY conditional class field: omitting the key entirely when absent is
+        // cleaner than emitting `"class": null`; consumers check for presence.
+        let detail = if let Some(ref class_name) = hit.class {
+            json!({
+                "path": rendered,
+                "archiver": "NSKeyedArchiver",
+                "class": class_name,
+            })
+        } else {
+            json!({
+                "path": rendered,
+                "archiver": "NSKeyedArchiver",
+            })
+        };
         return Some(Inspection {
             format: "bplist".into(),
             summary: format!("nskeyed key: {rendered}"),
-            detail: json!({
-                "path": rendered,
-                "archiver": "NSKeyedArchiver",
-            }),
+            detail,
         });
     }
 

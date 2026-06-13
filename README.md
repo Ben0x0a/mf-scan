@@ -31,8 +31,12 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   inside* recognised formats (SQLite table row-counts, plist/JSON keys, text lines).
 - **Deep inspection** (`--inspect`): for recognised formats, resolves a match to
   a meaningful location — a SQLite `table/column [TYPE]/rowid` (plus the embedded
-  format when the cell is a BLOB), a JSON/plist key path, an XML element path, a
-  CSV row/column, …
+  format when the cell is a BLOB), a JSON/plist key path (including NSKeyedArchiver
+  logical paths), an XML element path, a CSV row/column, …
+- **iOS app bundle-ID annotation**: matches inside iOS container directories are
+  annotated with the owning app's bundle ID (e.g. `com.apple.MobileSMS`), read from
+  the `.com.apple.mobile_container_manager.metadata.plist` files that iOS places in
+  every container. Missing or unreadable metadata files are silently skipped.
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
 - **Find base64-encoded values** (`--base64`), **find files by path**
@@ -235,6 +239,7 @@ in txt, a nested `context` object in json.
 | XML | element path + line |
 | CSV | row, column, and header name |
 | plist (XML & binary `bplist`) | dict-key / array-index path, e.g. `$.Account.Servers[1]` |
+| plist (NSKeyedArchiver `bplist`) | logical path through the `$objects`/UID graph, e.g. `$.root.prefs.token`; resolves wrapped scalars (NSMutableString, NSData), array indices, and dict key-name hits; reports the Foundation class of the containing object |
 | SQLite | `table`, `column [TYPE]`, `row`, and the decoded cell value; else `page` + offset |
 
 The same inspectors power `diff --inspect`'s intra-file comparison. See
