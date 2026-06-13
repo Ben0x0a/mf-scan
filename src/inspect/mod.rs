@@ -33,6 +33,9 @@ use crate::models::{ContentDiff, Inspection};
 // Structured / database / text inspectors (resolve offsets).
 mod csv;
 mod json;
+// NSKeyedArchiver graph-walk resolver — sibling of `plist`, uses `plist::Bplist`
+// via the `pub(super)` helpers exposed below.
+mod nskeyed;
 mod plist;
 mod sqlite;
 mod txt;

@@ -3,7 +3,8 @@
 //! Defines: `inspect`, which maps a match offset to a key path such as
 //! `$.Account.Servers[1]`.
 //! Used by: `inspect::inspect` (dispatch).
-//! Uses: `quick_xml` (XML plists), `serde_json`, `crate::models::Inspection`.
+//! Uses: `quick_xml` (XML plists), `serde_json`, `crate::models::Inspection`,
+//!   `inspect::nskeyed` (NSKeyedArchiver path resolution).
 //!
 //! Two on-disk encodings share one logical model (nested dicts/arrays), so both
 //! resolve to the same dictionary-key / array-index path:
@@ -11,6 +12,12 @@
 //!  - Binary plists: parsed via the trailer + offset table; the object whose
 //!    byte span contains the offset is located, then a path to it is found by
 //!    walking the object graph from the root.
+//!
+//! Binary plists that are NSKeyedArchiver archives (`$archiver ==
+//! "NSKeyedArchiver"`) get a second treatment: `inspect::nskeyed` decodes the
+//! flattened `$objects` + UID graph back to a logical path like
+//! `$.root.nested.inner`.  Detection is header-first (structure, not filename).
+//! On any failure the code falls back to the ordinary `path_to` walk.
 
 use std::io::Cursor;
 
@@ -262,7 +269,10 @@ fn take_segment(stack: &mut [Frame]) -> Option<String> {
 // --- Binary plist ------------------------------------------------------------
 
 /// Parsed structure of a binary plist sufficient to resolve offsets to paths.
-struct Bplist<'a> {
+///
+/// Widened to `pub(super)` so `inspect::nskeyed` can receive a `&Bplist`
+/// reference — visibility stops at the `inspect` module boundary.
+pub(super) struct Bplist<'a> {
     content: &'a [u8],
     offset_size: usize,
     ref_size: usize,
@@ -289,6 +299,10 @@ fn inspect_binary(content: &[u8], offset: usize) -> Option<Inspection> {
 
 /// [`inspect_binary`] against an already-parsed [`Bplist`] (the batch path
 /// parses once and resolves every offset against it).
+///
+/// For NSKeyedArchiver archives the logical path is derived by
+/// `nskeyed::nskeyed_path`; the summary and detail are labelled accordingly.
+/// For ordinary binary plists the existing `path_to` walk is used unchanged.
 fn inspect_binary_with(bp: &Bplist<'_>, offset: usize) -> Option<Inspection> {
     // A match in the offset table or trailer is structural, not a value.
     if offset >= bp.offset_table {
@@ -296,6 +310,21 @@ fn inspect_binary_with(bp: &Bplist<'_>, offset: usize) -> Option<Inspection> {
             format: "bplist".into(),
             summary: "offset table / trailer".into(),
             detail: json!({ "region": "offset_table_or_trailer", "offset": offset }),
+        });
+    }
+
+    // Try the NSKeyedArchiver resolver first (header-first detection inside
+    // `nskeyed_path`).  On any failure it returns `None` and we fall through to
+    // the ordinary walk — degrade, don't die.
+    if let Some(nk_path) = super::nskeyed::nskeyed_path(bp, offset) {
+        let rendered = render(&nk_path);
+        return Some(Inspection {
+            format: "bplist".into(),
+            summary: format!("nskeyed key: {rendered}"),
+            detail: json!({
+                "path": rendered,
+                "archiver": "NSKeyedArchiver",
+            }),
         });
     }
 
@@ -365,11 +394,59 @@ impl<'a> Bplist<'a> {
 
     /// The object whose data region contains `target` (largest start ≤ target).
     /// Binary search over the sorted offset table built at parse time.
-    fn object_at_offset(&self, target: usize) -> Option<usize> {
+    pub(super) fn object_at_offset(&self, target: usize) -> Option<usize> {
         let idx = self
             .sorted_offsets
             .partition_point(|&(start, _)| start <= target);
         idx.checked_sub(1).map(|i| self.sorted_offsets[i].1)
+    }
+
+    // ── pub(super) accessors for inspect::nskeyed ─────────────────────────────
+
+    /// The root object id — the entry point for the NSKeyedArchiver walk.
+    pub(super) fn top_oid(&self) -> usize {
+        self.top
+    }
+
+    /// Return the `(key_oid, value_oid)` pairs for a dict object, or `None`
+    /// when `oid` is not a dict.
+    ///
+    /// WHY: NSKeyedArchiver's root dict and each encoded NSDictionary are raw
+    /// bplist dicts; callers need the pairs without knowing `Children` internals.
+    pub(super) fn dict_pairs(&self, oid: usize) -> Option<Vec<(usize, usize)>> {
+        match self.children(oid) {
+            Children::Dict(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Return the element oids for an array object, or `None` when `oid` is
+    /// not an array.
+    ///
+    /// WHY: NS.keys and NS.objects in an encoded NSDictionary are raw bplist
+    /// arrays; callers need the element list without exposing `Children`.
+    pub(super) fn array_elements(&self, oid: usize) -> Option<Vec<usize>> {
+        match self.children(oid) {
+            Children::Array(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Decode a bplist UID scalar at `oid` and return its integer value, or
+    /// `None` when `oid` is not a UID.
+    ///
+    /// WHY: A UID (marker high-nibble `0x8`) is how NSKeyedArchiver references
+    /// another `$objects` entry.  The low nibble is `(byte_count - 1)`, giving
+    /// the number of big-endian bytes that follow the marker byte.
+    pub(super) fn uid_value(&self, oid: usize) -> Option<usize> {
+        let off = self.obj_offset(oid)?;
+        let marker = *self.content.get(off)?;
+        let high = marker >> 4;
+        if high != 0x8 {
+            return None;
+        }
+        let low = (marker & 0x0f) as usize; // byte_count - 1
+        Some(read_be(self.content, off + 1, low + 1)? as usize)
     }
 
     /// Decode an object's structural children (dict pairs / array elements).
@@ -432,7 +509,7 @@ impl<'a> Bplist<'a> {
     }
 
     /// Decode a string object (ASCII or UTF-16BE) for use as a key name.
-    fn string_value(&self, oid: usize) -> Option<String> {
+    pub(super) fn string_value(&self, oid: usize) -> Option<String> {
         let off = self.obj_offset(oid)?;
         let marker = *self.content.get(off)?;
         let high = marker >> 4;

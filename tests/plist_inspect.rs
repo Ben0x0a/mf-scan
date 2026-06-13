@@ -1,7 +1,10 @@
 //! Tests for the plist inspector (XML plists and binary plists).
 //!
 //! Defines: tests that a match offset resolves to a dict-key / array-index path
-//! in both encodings, and that detection is header-first.
+//! in both encodings, and that detection is header-first.  Also covers the
+//! NSKeyedArchiver resolver (`inspect::nskeyed`) against the committed fixture
+//! `fixtures/nskeyed.bplist`, which encodes a logical tree of
+//! `{ root: { count: 42, nested: { inner: "DEEP-needle-xyz" }, title: "FINDME-needle" } }`.
 //! Uses: `mf_scan::inspect` and the committed `fixtures/sample.plist`
 //! (XML) and `fixtures/sample.bplist` (binary, produced by `plutil`). Both
 //! encode `{ Account: { Username: "XML_NEEDLE", Servers: ["first",
@@ -11,6 +14,7 @@ use mf_scan::inspect::{diff, inspect};
 
 const XML: &[u8] = include_bytes!("fixtures/sample.plist");
 const BIN: &[u8] = include_bytes!("fixtures/sample.bplist");
+const NK: &[u8] = include_bytes!("fixtures/nskeyed.bplist");
 
 fn at(hay: &[u8], needle: &str) -> usize {
     hay.windows(needle.len())
@@ -94,4 +98,47 @@ fn crafted_bplist_trailer_with_bogus_counts_degrades_fast() {
     content.extend_from_slice(&trailer);
 
     assert!(inspect("x.plist", &content, 10).is_none());
+}
+
+// ── NSKeyedArchiver integration tests ────────────────────────────────────────
+
+/// A deeply nested string (`$objects[8]`, reached via root → nested → inner)
+/// must resolve to the logical path `$.root.nested.inner` and the detail must
+/// carry `archiver == "NSKeyedArchiver"` to confirm the correct resolver ran.
+#[test]
+fn nskeyed_resolves_deep_nested_path() {
+    let insp = inspect("archive.bplist", NK, at(NK, "DEEP-needle-xyz")).unwrap();
+    assert_eq!(insp.format, "bplist");
+    assert_eq!(
+        insp.detail["path"], "$.root.nested.inner",
+        "expected logical NSKeyedArchiver path"
+    );
+    assert_eq!(
+        insp.detail["archiver"], "NSKeyedArchiver",
+        "archiver label must confirm the NSKeyedArchiver resolver ran"
+    );
+}
+
+/// A top-level string (`$objects[10]`, reached via root → title`) must resolve
+/// to `$.root.title`.
+#[test]
+fn nskeyed_resolves_top_level_key() {
+    let insp = inspect("archive.bplist", NK, at(NK, "FINDME-needle")).unwrap();
+    assert_eq!(insp.format, "bplist");
+    assert_eq!(insp.detail["path"], "$.root.title");
+}
+
+/// Regression: a plain binary plist (`sample.bplist`) must still go through the
+/// ordinary `path_to` walk — the NSKeyedArchiver resolver must not intercept it.
+/// We check that the summary does NOT start with `"nskeyed key:"`, i.e. the
+/// archiver path was not triggered by a non-archiver plist.
+#[test]
+fn plain_bplist_does_not_use_nskeyed_resolver() {
+    let insp = inspect("sample.bplist", BIN, at(BIN, "XML_NEEDLE")).unwrap();
+    assert_eq!(insp.format, "bplist");
+    assert!(
+        !insp.summary.starts_with("nskeyed key:"),
+        "plain bplist summary must not start with 'nskeyed key:' — got: {}",
+        insp.summary
+    );
 }
