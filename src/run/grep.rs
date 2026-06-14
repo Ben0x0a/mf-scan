@@ -37,7 +37,8 @@ use crate::support::reporting::{
     write_scan_report_if_enabled,
 };
 use crate::support::sources::{
-    BackupOptions, Operand, ResolvedKind, ResolvedSource, resolve_sources, with_operand_source,
+    BackupOptions, IoMode, Operand, ResolvedKind, ResolvedSource, resolve_sources,
+    with_operand_source,
 };
 
 use std::cell::RefCell;
@@ -425,6 +426,7 @@ fn with_searched_source(
     with_source(
         src,
         ctx.cli.archive_depth,
+        ctx.cli.io_mode.to_io_mode(),
         ctx.backup_opts,
         ctx.backup_record,
         |source, raw| {
@@ -453,6 +455,7 @@ fn with_searched_source(
 fn with_source<R>(
     resolved: &ResolvedSource,
     archive_depth: u32,
+    io_mode: IoMode,
     backup_opts: &BackupOptions,
     backup_record: &RefCell<Option<BackupRecord>>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
@@ -464,7 +467,7 @@ fn with_source<R>(
             archive_depth,
         },
     };
-    with_operand_source(operand, backup_opts, backup_record, f)
+    with_operand_source(operand, backup_opts, io_mode, backup_record, f)
 }
 
 /// Emit the `--verify` attestation for one source: the before/after archive hash

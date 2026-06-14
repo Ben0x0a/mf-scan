@@ -24,6 +24,9 @@ crc32fast = "1.4"
 csv = "1.4.0"
 flate2 = "1.1.9"
 hmac = "0.12"
+# statfs-based detection of remote (SMB/NFS) sources for --io-mode auto. Already
+# in the build as a transitive dependency; declaring it direct adds no compile.
+libc = "0.2"
 memmap2 = "0.9.10"
 pbkdf2 = "0.12"
 plist = "1.9.0"
@@ -37,4 +40,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 [dev-dependencies]
+# Used by integration tests to fabricate DEFLATE streams (a normal dependency
+# too, so this adds no compilation — integration-test crates only see dev-deps).
+flate2 = "1.1.9"
 tempfile = "3.27.0"

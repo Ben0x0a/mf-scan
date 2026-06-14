@@ -20,6 +20,12 @@ use crate::source::Source;
 
 use super::{MatchedFile, Progress, Query};
 
+/// Bytes of an entry's content read for header-first type classification (see the
+/// `content_prefix` branch in [`classify_entry`]). Generous enough to cover any
+/// file-format magic/header — file types are identified from their first bytes —
+/// while staying a tiny read over a network mount.
+const CLASSIFY_PREFIX: usize = 16 * 1024;
+
 /// How one entry was classified during the search pass — the per-entry input to
 /// the [`ScanStats`] fold. Kept private: it exists only to carry a skip reason
 /// (and the bytes/type it represents) out of the parallel map and into the
@@ -133,6 +139,40 @@ pub(super) fn classify_entry(
             },
             decryption: None,
         });
+    }
+
+    // Header-first classification: for a source where fetching a whole file just
+    // to skip it is expensive (a positioned-read remote archive), classify from a
+    // cheap header read and skip media/`--type`-excluded files WITHOUT the full
+    // fetch. Gated to (a) sources that opt in and (b) runs with no per-file
+    // decryption — decryption must classify on the *decrypted* bytes, so it cannot
+    // pre-classify on the encrypted header. A header read failure falls through to
+    // the normal path below, which records it as unreadable.
+    if decrypt.is_none()
+        && source.prefers_prefix_classification()
+        && let Ok(prefix) = source.content_prefix(entry, CLASSIFY_PREFIX)
+    {
+        match filter.accept_type(inspect::detect_type(&entry.name, &prefix)) {
+            TypeDecision::SkipMedia => {
+                progress.inc();
+                return Ok(EntryResult {
+                    records: Vec::new(),
+                    file: None,
+                    class: Class::SkippedMedia { bytes },
+                    decryption: None,
+                });
+            }
+            TypeDecision::SkipType => {
+                progress.inc();
+                return Ok(EntryResult {
+                    records: Vec::new(),
+                    file: None,
+                    class: Class::SkippedType { bytes },
+                    decryption: None,
+                });
+            }
+            TypeDecision::Search => {}
+        }
     }
 
     // A read failure (permission-denied loose file, corrupt compressed entry) is

@@ -25,35 +25,39 @@ use crate::source::{Content, IntegrityCheck, Source};
 // --- ZIP record signatures (little-endian on disk) ---------------------------
 // These are fixed by the ZIP specification (APPNOTE.TXT), not operator-tunable,
 // so they live here as format constants rather than in any config.
-const SIG_EOCD: u32 = 0x0605_4b50; // End Of Central Directory
+pub(crate) const SIG_EOCD: u32 = 0x0605_4b50; // End Of Central Directory
 const SIG_ZIP64_EOCD_LOCATOR: u32 = 0x0706_4b50; // ZIP64 EOCD locator
 const SIG_ZIP64_EOCD: u32 = 0x0606_4b50; // ZIP64 EOCD record
-const SIG_CDFH: u32 = 0x0201_4b50; // Central Directory File Header
-const SIG_LFH: u32 = 0x0403_4b50; // Local File Header
+pub(crate) const SIG_CDFH: u32 = 0x0201_4b50; // Central Directory File Header
+pub(crate) const SIG_LFH: u32 = 0x0403_4b50; // Local File Header
 
 const METHOD_STORED: u16 = 0; // compression method 0 = no compression
 const METHOD_DEFLATE: u16 = 8; // compression method 8 = DEFLATE
 const ZIP64_EXTRA_ID: u16 = 0x0001; // header id of the ZIP64 extended-info field
 
-/// Outcome of decoding one Central Directory header.
+/// One decoded Central Directory record, *before* its on-disk data offset is
+/// resolved from the Local File Header.
 ///
-/// Modelled as an enum (rather than `Option<Entry>`) because "this entry uses a
-/// method we do not search" is an *expected* outcome, not an error: only STORED
-/// and DEFLATE are kept, and a named variant says so at the call site.
-enum CdScan {
-    /// A searchable entry plus the CRC-32 the Central Directory records for its
-    /// uncompressed bytes (used for export integrity attestation).
-    Searchable(Entry, u32),
-    Skipped,
+/// This is the shared product of the central-directory walk: a memory-mapped
+/// [`ZipSource`] turns each into an [`Entry`] by resolving `local_offset` through
+/// [`local_data_offset`], while the positioned-read [`super::ranged::RangedZipSource`]
+/// keeps `local_offset` and resolves it lazily, per file, at read time — so the
+/// directory walk itself is identical for both and lives only here.
+pub(crate) struct CdEntry {
+    pub(crate) name: String,
+    pub(crate) method: Method,
+    /// Compressed (on-disk) data length.
+    pub(crate) comp_size: u64,
+    /// Uncompressed (logical) data length.
+    pub(crate) uncomp_size: u64,
+    pub(crate) mtime: Option<u64>,
+    /// CRC-32 of the uncompressed data, as recorded by the producer.
+    pub(crate) crc32: u32,
+    /// Absolute offset of the entry's Local File Header in the archive.
+    pub(crate) local_offset: u64,
 }
 
 /// Parse the archive and return every searchable (STORED or DEFLATE) entry.
-///
-/// HOW:
-///   1. locate the EOCD at the tail of the file,
-///   2. follow the ZIP64 records if the EOCD fields are saturated,
-///   3. walk the Central Directory, decoding one header per entry,
-///   4. keep the STORED and DEFLATE entries.
 pub fn parse_entries(data: &[u8]) -> Result<Vec<Entry>> {
     Ok(parse_entries_with_crc(data)?
         .into_iter()
@@ -65,95 +69,165 @@ pub fn parse_entries(data: &[u8]) -> Result<Vec<Entry>> {
 /// CRC-32 (over the uncompressed data), parallel to the entries. The
 /// [`ZipSource`] keeps these so it can attest an entry's bytes on export; plain
 /// search callers use [`parse_entries`] and ignore them.
+///
+/// HOW:
+///   1. locate the central directory via the EOCD (and ZIP64 records),
+///   2. walk it into `CdEntry` records (`parse_cd_headers`),
+///   3. resolve each entry's real data offset from its Local File Header.
 pub fn parse_entries_with_crc(data: &[u8]) -> Result<Vec<(Entry, u32)>> {
-    let eocd = find_eocd(data).context("could not locate End Of Central Directory record")?;
+    let loc = find_cd_location(data, 0)?;
+    let cd = slice(data, loc.cd_offset as usize, loc.cd_size as usize)
+        .context("central directory range is out of bounds")?;
+    let records = parse_cd_headers(cd, loc.total_entries)?;
 
-    // Central-directory location/count, possibly upgraded by ZIP64 below.
-    let mut cd_offset = read_u32(data, eocd + 16)? as u64;
-    let mut total_entries = read_u16(data, eocd + 10)? as u64;
+    let mut out = Vec::with_capacity(records.len());
+    for ce in records {
+        let data_offset = local_data_offset(data, ce.local_offset)?;
+        out.push((
+            Entry {
+                name: ce.name,
+                uncompressed_size: ce.uncomp_size,
+                mtime: ce.mtime,
+                location: Location::Zip {
+                    method: ce.method,
+                    data_offset,
+                    data_len: ce.comp_size,
+                },
+            },
+            ce.crc32,
+        ));
+    }
+    Ok(out)
+}
+
+/// Where the central directory lives, resolved from the EOCD (upgraded by the
+/// ZIP64 records when the 32-bit fields are saturated).
+pub(crate) struct CdLocation {
+    pub(crate) cd_offset: u64,
+    pub(crate) cd_size: u64,
+    pub(crate) total_entries: u64,
+}
+
+/// Locate the central directory within `buf`, whose first byte is at absolute
+/// file offset `base`.
+///
+/// `base` is `0` when `buf` is the whole archive (the mmap source) and the
+/// archive size minus the tail length when `buf` is only the tail read by the
+/// positioned-read source — so the absolute offsets the records carry can be
+/// translated back into the buffer. The EOCD (and any ZIP64 EOCD record) sit at
+/// the very end, so a tail that reaches them is enough.
+pub(crate) fn find_cd_location(buf: &[u8], base: u64) -> Result<CdLocation> {
+    let eocd = find_eocd(buf).context("could not locate End Of Central Directory record")?;
+
+    let mut cd_offset = read_u32(buf, eocd + 16)? as u64;
+    let mut cd_size = read_u32(buf, eocd + 12)? as u64;
+    let mut total_entries = read_u16(buf, eocd + 10)? as u64;
 
     // A saturated (all-ones) field means the real value lives in the ZIP64
-    // records; reading the 32-bit field as the truth would point us at the
-    // wrong offset and corrupt the whole parse, so we must redirect.
-    let cd_offset_saturated = read_u32(data, eocd + 16)? == u32::MAX;
-    let entries_saturated = read_u16(data, eocd + 10)? == u16::MAX;
-    if cd_offset_saturated || entries_saturated {
-        let z = read_zip64_eocd(data, eocd)?;
+    // records; reading the 32-bit field as truth would point us at the wrong
+    // offset and corrupt the whole parse, so we must redirect.
+    if cd_offset == u32::MAX as u64
+        || cd_size == u32::MAX as u64
+        || total_entries == u16::MAX as u64
+    {
+        let z = read_zip64_eocd(buf, base, eocd)?;
         cd_offset = z.cd_offset;
+        cd_size = z.cd_size;
         total_entries = z.total_entries;
     }
 
-    let mut entries = Vec::new();
-    let mut pos = cd_offset as usize;
+    Ok(CdLocation {
+        cd_offset,
+        cd_size,
+        total_entries,
+    })
+}
+
+/// Walk `total_entries` Central Directory File Headers from the start of `cd`,
+/// keeping the searchable (STORED / DEFLATE) ones.
+///
+/// `cd` is the central-directory byte range only (its first byte is the first
+/// `CDFH` signature), so positions here are relative to it; the `local_offset`
+/// each record carries stays absolute (it indexes the whole archive).
+pub(crate) fn parse_cd_headers(cd: &[u8], total_entries: u64) -> Result<Vec<CdEntry>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
     for _ in 0..total_entries {
-        let (scan, next) = parse_cd_header(data, pos)?;
-        if let CdScan::Searchable(entry, crc) = scan {
-            entries.push((entry, crc));
+        let (record, next) = decode_cd_header(cd, pos)?;
+        if let Some(ce) = record {
+            out.push(ce);
         }
         pos = next;
     }
-
-    Ok(entries)
+    Ok(out)
 }
 
 /// Resolved ZIP64 central-directory location.
 struct Zip64Eocd {
     cd_offset: u64,
+    cd_size: u64,
     total_entries: u64,
 }
 
 /// Read the ZIP64 EOCD via the locator that sits 20 bytes before the EOCD.
 ///
 /// HOW: the 20-byte locator immediately precedes the EOCD and stores the
-/// absolute offset of the ZIP64 EOCD record, which in turn holds the real
-/// 64-bit central-directory offset and entry count.
-fn read_zip64_eocd(data: &[u8], eocd: usize) -> Result<Zip64Eocd> {
+/// *absolute* offset of the ZIP64 EOCD record, which holds the real 64-bit
+/// central-directory size/offset and entry count. `base` translates that
+/// absolute offset into an index within `buf` (see [`find_cd_location`]).
+fn read_zip64_eocd(buf: &[u8], base: u64, eocd: usize) -> Result<Zip64Eocd> {
     // If the EOCD claimed ZIP64 but no locator fits before it, the archive is
     // malformed and any offset we compute would be garbage — fail loudly.
     let locator = eocd
         .checked_sub(20)
         .context("file too small for a ZIP64 EOCD locator")?;
     ensure!(
-        read_u32(data, locator)? == SIG_ZIP64_EOCD_LOCATOR,
+        read_u32(buf, locator)? == SIG_ZIP64_EOCD_LOCATOR,
         "expected ZIP64 EOCD locator signature before EOCD"
     );
 
-    let z64 = read_u64(data, locator + 8)? as usize; // offset of ZIP64 EOCD record
+    let z64_abs = read_u64(buf, locator + 8)?; // absolute offset of the ZIP64 EOCD record
+    let z64 = z64_abs
+        .checked_sub(base)
+        .context("ZIP64 EOCD record lies before the read window")? as usize;
     ensure!(
-        read_u32(data, z64)? == SIG_ZIP64_EOCD,
+        read_u32(buf, z64)? == SIG_ZIP64_EOCD,
         "expected ZIP64 EOCD record signature"
     );
 
     Ok(Zip64Eocd {
-        total_entries: read_u64(data, z64 + 32)?,
-        cd_offset: read_u64(data, z64 + 48)?,
+        total_entries: read_u64(buf, z64 + 32)?,
+        cd_size: read_u64(buf, z64 + 40)?,
+        cd_offset: read_u64(buf, z64 + 48)?,
     })
 }
 
-/// Parse one Central Directory File Header at `pos`.
+/// Decode one Central Directory File Header at `pos` within the CD buffer.
 ///
-/// Returns the scan outcome plus the offset of the next header, so the caller
-/// can keep walking the directory regardless of whether this entry was kept.
-fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
+/// Returns the decoded record (or `None` for a non-searchable method) plus the
+/// offset of the next header, so the caller can keep walking regardless of
+/// whether this entry was kept. Does NOT resolve the data offset — that needs the
+/// Local File Header, which the two sources reach differently.
+fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
     // A wrong signature here means we have lost sync with the directory; every
     // subsequent field would be misread, so stop rather than emit junk.
     ensure!(
-        read_u32(data, pos)? == SIG_CDFH,
+        read_u32(cd, pos)? == SIG_CDFH,
         "bad central-directory header signature at offset {pos}"
     );
 
-    let method_code = read_u16(data, pos + 10)?;
+    let method_code = read_u16(cd, pos + 10)?;
     // Last-modified DOS time/date (2 bytes each), decoded for `diff`'s mtime compare.
-    let dos_time = read_u16(data, pos + 12)?;
-    let dos_date = read_u16(data, pos + 14)?;
+    let dos_time = read_u16(cd, pos + 12)?;
+    let dos_date = read_u16(cd, pos + 14)?;
     // CRC-32 of the uncompressed data, as recorded by the producer.
-    let crc32 = read_u32(data, pos + 16)?;
-    let mut comp_size = read_u32(data, pos + 20)? as u64;
-    let mut uncomp_size = read_u32(data, pos + 24)? as u64;
-    let name_len = read_u16(data, pos + 28)? as usize;
-    let extra_len = read_u16(data, pos + 30)? as usize;
-    let comment_len = read_u16(data, pos + 32)? as usize;
-    let mut local_offset = read_u32(data, pos + 42)? as u64;
+    let crc32 = read_u32(cd, pos + 16)?;
+    let mut comp_size = read_u32(cd, pos + 20)? as u64;
+    let mut uncomp_size = read_u32(cd, pos + 24)? as u64;
+    let name_len = read_u16(cd, pos + 28)? as usize;
+    let extra_len = read_u16(cd, pos + 30)? as usize;
+    let comment_len = read_u16(cd, pos + 32)? as usize;
+    let mut local_offset = read_u32(cd, pos + 42)? as u64;
 
     // HOW: the variable-length name/extra/comment fields follow the 46-byte
     // fixed header in that order; summing them gives the next header's offset.
@@ -170,7 +244,7 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     let offset_saturated = local_offset == u32::MAX as u64;
     if uncomp_saturated || comp_saturated || offset_saturated {
         let z = read_zip64_extra(
-            data,
+            cd,
             extra_start,
             extra_len,
             uncomp_saturated,
@@ -192,26 +266,21 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     let method = match method_code {
         METHOD_STORED => Method::Stored,
         METHOD_DEFLATE => Method::Deflate,
-        _ => return Ok((CdScan::Skipped, next)),
+        _ => return Ok((None, next)),
     };
 
-    let name = String::from_utf8_lossy(slice(data, name_start, name_len)?).into_owned();
-    let data_offset = local_data_offset(data, local_offset)?;
+    let name = String::from_utf8_lossy(slice(cd, name_start, name_len)?).into_owned();
 
     Ok((
-        CdScan::Searchable(
-            Entry {
-                name,
-                uncompressed_size: uncomp_size,
-                mtime: dos_to_unix(dos_date, dos_time),
-                location: Location::Zip {
-                    method,
-                    data_offset,
-                    data_len: comp_size,
-                },
-            },
+        Some(CdEntry {
+            name,
+            method,
+            comp_size,
+            uncomp_size,
+            mtime: dos_to_unix(dos_date, dos_time),
             crc32,
-        ),
+            local_offset,
+        }),
         next,
     ))
 }
@@ -324,7 +393,7 @@ fn find_eocd(data: &[u8]) -> Result<usize> {
 // Every multi-byte read goes through these so an out-of-bounds offset becomes a
 // clean error instead of a panic — important when parsing untrusted evidence.
 
-fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
+pub(crate) fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
     // checked_add keeps debug and release behaviour identical on absurd
     // offsets: an overflowing `off + len` must error like any other
     // out-of-bounds read, not panic in debug builds.
@@ -333,12 +402,12 @@ fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
         .with_context(|| format!("read of {len} bytes at offset {off} is out of bounds"))
 }
 
-fn read_u16(data: &[u8], off: usize) -> Result<u16> {
+pub(crate) fn read_u16(data: &[u8], off: usize) -> Result<u16> {
     let b = slice(data, off, 2)?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-fn read_u32(data: &[u8], off: usize) -> Result<u32> {
+pub(crate) fn read_u32(data: &[u8], off: usize) -> Result<u32> {
     let b = slice(data, off, 4)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
@@ -457,7 +526,7 @@ const INFLATE_HINT_CAP: u64 = 64 * 1024 * 1024;
 /// so without the ceiling a small crafted entry could balloon without bound
 /// (zip bomb); a mismatch in either direction means the archive lies about the
 /// entry and the bytes cannot be trusted.
-fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> {
+pub(crate) fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> {
     let mut decoder = DeflateDecoder::new(compressed).take(expected_size.saturating_add(1));
     let mut out = Vec::with_capacity(expected_size.min(INFLATE_HINT_CAP) as usize);
     decoder.read_to_end(&mut out)?;

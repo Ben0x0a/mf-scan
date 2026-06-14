@@ -23,6 +23,7 @@ use crate::models::Entry;
 
 pub mod folder;
 mod nested;
+pub mod ranged;
 pub mod zip;
 
 /// One entry's logical bytes, however the source backs them.
@@ -124,5 +125,30 @@ pub trait Source: Sync {
     /// blob against the SHA-1 in `Manifest.db`.
     fn integrity_check(&self, _entry: &Entry) -> IntegrityCheck {
         IntegrityCheck::Unrecorded
+    }
+
+    /// Whether classifying an entry's type from a cheap header *prefix* (rather
+    /// than its full content) is worth it for this source.
+    ///
+    /// `false` by default: for an mmap or folder source [`Source::content`] is
+    /// already lazy (the OS faults only the pages actually touched), so reading a
+    /// prefix first would be pure overhead. The positioned-read
+    /// [`ranged::RangedZipSource`] overrides it to `true` — over a network mount,
+    /// fetching a whole media file only to skip it by `--type`/`--exclude-media`
+    /// is exactly the cost to avoid, so the engine classifies from a small header
+    /// read first (see [`Source::content_prefix`]).
+    fn prefers_prefix_classification(&self) -> bool {
+        false
+    }
+
+    /// Read up to `max` bytes of `entry`'s logical content, for type
+    /// classification before committing to the full read.
+    ///
+    /// The default returns the whole content (correct everywhere — the caller
+    /// only looks at the header); the ranged source overrides it to fetch just a
+    /// small header range over the network. Only consulted when
+    /// [`Source::prefers_prefix_classification`] is `true`.
+    fn content_prefix(&self, entry: &Entry, _max: usize) -> Result<Content<'_>> {
+        self.content(entry)
     }
 }

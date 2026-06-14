@@ -108,6 +108,18 @@ pub enum Location {
         data_offset: u64,
         data_len: u64,
     },
+    /// Inside a ZIP archive read by *positioned reads* rather than a memory map
+    /// (a remote SMB/NFS source — see [`crate::source::ranged`]). Carries the
+    /// Local File Header offset (`header_offset`), not the resolved data offset:
+    /// the data start is resolved lazily, per file, when the entry is read, so
+    /// listing never touches every header. Because the absolute data offset is
+    /// not known at listing time, a match here reports no absolute archive offset
+    /// (like a loose/nested entry) — the in-file offset is still exact.
+    RangedZip {
+        method: Method,
+        header_offset: u64,
+        data_len: u64,
+    },
     /// A loose file on disk, read from its own `path`. It has no archive offsets.
     Loose { path: PathBuf },
     /// Inside a nested archive that a folder scan opened in memory (see
@@ -151,15 +163,19 @@ impl Entry {
     pub fn archive_data_start(&self) -> Option<u64> {
         match &self.location {
             Location::Zip { data_offset, .. } => Some(*data_offset),
-            Location::Loose { .. } | Location::Nested { .. } => None,
+            Location::RangedZip { .. } | Location::Loose { .. } | Location::Nested { .. } => None,
         }
     }
 
-    /// True when the file is stored compressed (a DEFLATE entry, top-level or nested).
+    /// True when the file is stored compressed (a DEFLATE entry, top-level,
+    /// ranged, or nested).
     pub fn is_compressed(&self) -> bool {
         matches!(
             &self.location,
             Location::Zip {
+                method: Method::Deflate,
+                ..
+            } | Location::RangedZip {
                 method: Method::Deflate,
                 ..
             } | Location::Nested {
@@ -306,6 +322,10 @@ impl MatchRecord {
             // offsets are within the extracted file (like a loose file), but the
             // entry can still be DEFLATE-compressed.
             Location::Nested { method, .. } => (0, None, *method == Method::Deflate),
+            // A ranged (positioned-read) ZIP entry: the absolute data offset is
+            // not resolved at listing time, so report no absolute archive byte —
+            // the in-file offset is still exact.
+            Location::RangedZip { method, .. } => (0, None, *method == Method::Deflate),
         };
         Self {
             archive: None,

@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use crate::cli::DiffArgs;
 use crate::support::exporting::run_export_sink;
 use crate::support::reporting::emit;
-use crate::support::sources::{BackupOptions, Operand, with_operand_source};
+use crate::support::sources::{BackupOptions, IoMode, Operand, with_operand_source};
 
 /// Run the `diff` subcommand.
 pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
@@ -146,7 +146,14 @@ fn with_diff_side<R>(
         )
     };
     let record = RefCell::new(None);
-    with_operand_source(operand, backup_opts, &record, |source, _raw| f(source))
+    // diff has no --io-mode flag; auto-detect a remote source per side.
+    with_operand_source(
+        operand,
+        backup_opts,
+        IoMode::Auto,
+        &record,
+        |source, _raw| f(source),
+    )
 }
 
 /// Export the added/modified files from side B and/or write a manifest, reusing the

@@ -23,7 +23,32 @@ use mf_scan::ios::backup::profile;
 use mf_scan::ios::backup::source::BackupSource;
 use mf_scan::source::Source;
 use mf_scan::source::folder::FolderSource;
+use mf_scan::source::ranged::RangedZipSource;
 use mf_scan::source::zip::ZipSource;
+
+/// How an archive's bytes are read: memory-mapped, positioned reads, or chosen
+/// automatically from whether the source is on a network mount.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IoMode {
+    /// Positioned reads for a remote (SMB/NFS) source, memory-map otherwise.
+    Auto,
+    /// Always memory-map (fast for local files).
+    Mmap,
+    /// Always use positioned reads (no whole-file map) — for network shares.
+    Ranged,
+}
+
+impl IoMode {
+    /// Whether to open `path` with the positioned-read [`RangedZipSource`] rather
+    /// than a memory map. `Auto` consults [`is_remote_path`].
+    fn use_ranged(self, path: &Path) -> bool {
+        match self {
+            IoMode::Mmap => false,
+            IoMode::Ranged => true,
+            IoMode::Auto => is_remote_path(path),
+        }
+    }
+}
 
 /// The backup password resolved from the CLI flag or the `MFSCAN_BACKUP_PASSWORD`
 /// environment variable, threaded through the open path so an encrypted backup
@@ -167,10 +192,19 @@ pub(crate) enum Operand<'a> {
 pub(crate) fn with_operand_source<R>(
     operand: Operand<'_>,
     backup: &BackupOptions,
+    io_mode: IoMode,
     record: &RefCell<Option<BackupRecord>>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
     match operand {
+        // A remote (or `--io-mode ranged`) archive is read with positioned reads,
+        // never mapped: a multi-GB archive on a network share would otherwise fault
+        // page-by-page over the network. The ranged source has no single backing
+        // buffer, so `--verify` (which needs the raw bytes) is passed `None`.
+        Operand::Archive(path) if io_mode.use_ranged(path) => {
+            let source = RangedZipSource::open(path)?;
+            with_maybe_backup(&source, backup, record, |s| f(s, None))
+        }
         Operand::Archive(path) => {
             let mmap = open_archive(path)?;
             let source = ZipSource::open(&mmap)?;
@@ -182,6 +216,54 @@ pub(crate) fn with_operand_source<R>(
         } => {
             let source = FolderSource::open(path, archive_depth)?;
             with_maybe_backup(&source, backup, record, |s| f(s, None))
+        }
+    }
+}
+
+/// Whether `path` lives on a remote (network) filesystem — SMB/NFS/WebDAV — where
+/// memory-mapping a large file faults page-by-page over the network.
+///
+/// Best-effort: uses `statfs` on Unix (the macOS `MNT_LOCAL` flag, or the Linux
+/// filesystem-type magic numbers) and returns `false` on any other platform or on
+/// error — so an undetected remote source simply uses the default mmap path (the
+/// operator can still force `--io-mode ranged`).
+#[cfg(target_os = "macos")]
+pub(crate) fn is_remote_path(path: &Path) -> bool {
+    statfs(path)
+        .map(|s| s.f_flags & (libc::MNT_LOCAL as u32) == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn is_remote_path(path: &Path) -> bool {
+    // Filesystem-type magics for the network filesystems we care about.
+    const NFS: i64 = 0x6969;
+    const SMB: i64 = 0x517B;
+    const CIFS: i64 = 0xFF53_4D42;
+    const SMB2: i64 = 0xFE53_4D42;
+    statfs(path)
+        .map(|s| matches!(s.f_type as i64, NFS | SMB | CIFS | SMB2))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn is_remote_path(_path: &Path) -> bool {
+    false
+}
+
+/// Thin `statfs(2)` wrapper used by [`is_remote_path`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn statfs(path: &Path) -> Option<libc::statfs> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated C string and `buf` is a fresh,
+    // correctly-sized `statfs` the call fully initialises on success.
+    unsafe {
+        let mut buf = std::mem::zeroed::<libc::statfs>();
+        if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
+            Some(buf)
+        } else {
+            None
         }
     }
 }

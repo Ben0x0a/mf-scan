@@ -29,6 +29,33 @@ pub(crate) enum PlatformArg {
     Android,
 }
 
+/// How to read an archive's bytes (`--io-mode`).
+///
+/// `auto` (the default) memory-maps a local archive but switches to positioned
+/// reads when the source is on a network mount (SMB/NFS), where mmap-ing a huge
+/// file would fault page-by-page over the network. `mmap`/`ranged` force one mode.
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum IoModeArg {
+    /// Pick automatically: positioned reads for a remote (SMB/NFS) source, mmap
+    /// otherwise.
+    Auto,
+    /// Always memory-map the archive (fast for local files).
+    Mmap,
+    /// Always read with positioned reads (no whole-file map) — for network shares.
+    Ranged,
+}
+
+impl IoModeArg {
+    /// Map to the library/support I/O mode.
+    pub(crate) fn to_io_mode(self) -> crate::support::sources::IoMode {
+        match self {
+            IoModeArg::Auto => crate::support::sources::IoMode::Auto,
+            IoModeArg::Mmap => crate::support::sources::IoMode::Mmap,
+            IoModeArg::Ranged => crate::support::sources::IoMode::Ranged,
+        }
+    }
+}
+
 impl PlatformArg {
     /// Map to the library's platform type.
     pub(crate) fn to_platform(self) -> mf_scan::decrypt::Platform {

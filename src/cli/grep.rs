@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::cli::common::{ColourWhen, DecryptArgs, ExportSink, FilterArgs};
+use crate::cli::common::{ColourWhen, DecryptArgs, ExportSink, FilterArgs, IoModeArg};
 use mf_scan::report::output::OutputFormat;
 
 /// Arguments for `grep`.
@@ -126,6 +126,12 @@ pub(crate) struct GrepArgs {
     /// changed — a slower, court-defensible integrity attestation.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
+
+    /// How to read the archive's bytes: `auto` (default — positioned reads for a
+    /// remote SMB/NFS source, memory-map otherwise), `mmap`, or `ranged`. Ranged
+    /// reads avoid mapping a multi-GB archive over a network share.
+    #[arg(long = "io-mode", value_enum, default_value = "auto")]
+    pub(crate) io_mode: IoModeArg,
 
     /// Write the scan report (run metadata + coverage statistics) to this file.
     /// Defaults to `<output>.report.json` beside `-o`, else `mf-scan-report.json`

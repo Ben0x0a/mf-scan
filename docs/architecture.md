@@ -21,8 +21,11 @@ src/
                 Inspection, ContentDiff, RunInfo
   source/       the container abstraction the engine reads through (see ADR 0002)
     mod.rs        Source trait: entries() + content() + byte_size() + integrity_check()
-    zip.rs        ZIP central-directory parser + ZipSource (mmap, zero-copy STORED;
-                  per-entry CRC-32 for export integrity)
+    zip.rs        ZIP central-directory decoders (shared) + ZipSource (mmap,
+                  zero-copy STORED; per-entry CRC-32 for export integrity)
+    ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
+                  (no whole-file mmap; lazy data-offset resolution; header-first
+                  prefix reads). Reuses zip.rs's central-directory decoders.
     folder.rs     FolderSource: a directory of loose files (+ nested-archive arena)
     nested.rs     --archive-depth expansion of nested .zip files into the arena
   sqlite/       low-level SQLite reader (page/record/schema/table), shared by the

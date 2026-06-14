@@ -148,6 +148,7 @@ With more than one source, each result is tagged with its origin (see
 | `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
 | `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
+| `--io-mode auto\|mmap\|ranged` | How to read an archive: `auto` (default) memory-maps a local archive but uses **positioned reads** for a remote SMB/NFS source; `ranged` forces positioned reads, `mmap` forces mapping. See [Remote / network sources](#remote--network-sources). |
 | `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: beside `-o`, else `mf-scan-report.json`. |
 | `--keyfile FILE` | Decrypt profile-matched databases using keys from this keychain/keystore dump (repeatable). See [Decryption](#decryption). |
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
@@ -339,6 +340,43 @@ offending file.
 
 ---
 
+## Remote / network sources
+
+A full-file-system acquisition on an SMB/NFS share can be ~1 TB. Memory-mapping it
+would turn each search into a storm of single-page faults pulled over the network, so
+mf-scan reads a remote archive with **positioned reads** instead:
+
+- **Listing is cheap** — only the archive tail (the End-Of-Central-Directory record and
+  the central directory) is read; entry data offsets are resolved lazily, per file, so
+  listing never touches every header.
+- **Only what you search is fetched** — each searched entry's byte range is read on
+  demand (in 256 MiB chunks for the rare huge file). Combined with **header-first
+  classification**, a file excluded by `--type`/`--exclude-media`/`--fast` is skipped
+  after a small header read, never fetched whole — so a targeted search over a remote
+  FFS pulls only the files it needs.
+
+```bash
+# Auto-detected: a source on a network mount uses positioned reads automatically.
+mf-scan grep "imessage" /Volumes/share/EXTRACTION_FFS.zip --type sqlite
+
+# Force it either way:
+mf-scan grep "needle" big.zip --io-mode ranged   # positioned reads
+mf-scan grep "needle" big.zip --io-mode mmap      # memory-map
+```
+
+`--io-mode auto` (the default) detects an SMB/NFS/WebDAV mount via `statfs`; pass
+`--io-mode ranged` to force it (e.g. for a mount it can't classify). Scoping with
+`--path` is the cheapest remote filter — non-matching files are skipped before any
+byte is read. Ranged mode reports in-file match offsets but no absolute archive offset
+(the data offset is not resolved at listing time), consistent with the other
+no-single-archive-byte cases; CRC-32 export integrity still applies.
+
+> **Note:** the ranged path is validated locally (parity with the mmap source,
+> including ZIP64) but has **not yet been profiled against a real ~1 TB SMB share** —
+> see the roadmap before relying on its performance at that scale.
+
+---
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — modules, data flow, design decisions.
@@ -353,9 +391,10 @@ offending file.
 
 ## Forensic notes
 
-- The archive is opened **read-only** and memory-mapped; mf-scan never writes to it.
-  Loose files are read read-only. `--verify` adds a SHA-256 attestation (archive
-  sources only); the hash matches the system `shasum -a 256`.
+- The archive is opened **read-only** — memory-mapped locally, or read with positioned
+  reads for a remote source (see [Remote / network sources](#remote--network-sources));
+  mf-scan never writes to it. Loose files are read read-only. `--verify` adds a SHA-256
+  attestation (mmap archive sources only); the hash matches the system `shasum -a 256`.
 - Offsets are **byte-accurate** for STORED entries (verifiable with `dd`/a hex editor).
 - On `--export`, every copied file is **hashed at the source and re-hashed off disk** and
   the two are compared (silent-copy-error check); ZIP entries are additionally checked

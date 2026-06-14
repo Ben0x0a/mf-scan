@@ -120,7 +120,7 @@ impl Source for FolderSource {
                     &entry.name,
                 )
             }
-            Location::Zip { .. } => bail!(
+            Location::Zip { .. } | Location::RangedZip { .. } => bail!(
                 "FolderSource::content called on a top-level ZIP entry: {}",
                 entry.name
             ),
