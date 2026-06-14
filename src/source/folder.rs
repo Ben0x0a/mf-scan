@@ -3,7 +3,7 @@
 //! Defines: [`FolderSource`], a [`Source`] over a directory on disk. Every regular
 //! file under the root (recursively) becomes a [`Entry`]: a loose file read lazily
 //! from its own path, or — when `--archive-depth >= 1` — the expanded contents of a
-//! nested `.zip` (read into an in-memory arena; see [`crate::source::nested`]).
+//! nested `.zip` (read into an in-memory arena; see `crate::source::nested`).
 //! Used by: the binary's `support::sources` (builds it for a `--dir-mode folder`
 //! operand) and, through the [`Source`] trait, the search/diff/export engines.
 //! Uses: `crate::models::{Entry, Location}`, `crate::source::{nested, zip}`, `std::fs`.

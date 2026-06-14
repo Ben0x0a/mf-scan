@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::read::DeflateDecoder;
 
 use crate::models::{Entry, Location, Method};
-use crate::source::{Content, Source};
+use crate::source::{Content, IntegrityCheck, Source};
 
 // --- ZIP record signatures (little-endian on disk) ---------------------------
 // These are fixed by the ZIP specification (APPNOTE.TXT), not operator-tunable,
@@ -41,7 +41,9 @@ const ZIP64_EXTRA_ID: u16 = 0x0001; // header id of the ZIP64 extended-info fiel
 /// method we do not search" is an *expected* outcome, not an error: only STORED
 /// and DEFLATE are kept, and a named variant says so at the call site.
 enum CdScan {
-    Searchable(Entry),
+    /// A searchable entry plus the CRC-32 the Central Directory records for its
+    /// uncompressed bytes (used for export integrity attestation).
+    Searchable(Entry, u32),
     Skipped,
 }
 
@@ -53,6 +55,17 @@ enum CdScan {
 ///   3. walk the Central Directory, decoding one header per entry,
 ///   4. keep the STORED and DEFLATE entries.
 pub fn parse_entries(data: &[u8]) -> Result<Vec<Entry>> {
+    Ok(parse_entries_with_crc(data)?
+        .into_iter()
+        .map(|(entry, _crc)| entry)
+        .collect())
+}
+
+/// Like [`parse_entries`], but also returns each entry's Central-Directory
+/// CRC-32 (over the uncompressed data), parallel to the entries. The
+/// [`ZipSource`] keeps these so it can attest an entry's bytes on export; plain
+/// search callers use [`parse_entries`] and ignore them.
+pub fn parse_entries_with_crc(data: &[u8]) -> Result<Vec<(Entry, u32)>> {
     let eocd = find_eocd(data).context("could not locate End Of Central Directory record")?;
 
     // Central-directory location/count, possibly upgraded by ZIP64 below.
@@ -74,8 +87,8 @@ pub fn parse_entries(data: &[u8]) -> Result<Vec<Entry>> {
     let mut pos = cd_offset as usize;
     for _ in 0..total_entries {
         let (scan, next) = parse_cd_header(data, pos)?;
-        if let CdScan::Searchable(entry) = scan {
-            entries.push(entry);
+        if let CdScan::Searchable(entry, crc) = scan {
+            entries.push((entry, crc));
         }
         pos = next;
     }
@@ -133,6 +146,8 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     // Last-modified DOS time/date (2 bytes each), decoded for `diff`'s mtime compare.
     let dos_time = read_u16(data, pos + 12)?;
     let dos_date = read_u16(data, pos + 14)?;
+    // CRC-32 of the uncompressed data, as recorded by the producer.
+    let crc32 = read_u32(data, pos + 16)?;
     let mut comp_size = read_u32(data, pos + 20)? as u64;
     let mut uncomp_size = read_u32(data, pos + 24)? as u64;
     let name_len = read_u16(data, pos + 28)? as usize;
@@ -184,16 +199,19 @@ fn parse_cd_header(data: &[u8], pos: usize) -> Result<(CdScan, usize)> {
     let data_offset = local_data_offset(data, local_offset)?;
 
     Ok((
-        CdScan::Searchable(Entry {
-            name,
-            uncompressed_size: uncomp_size,
-            mtime: dos_to_unix(dos_date, dos_time),
-            location: Location::Zip {
-                method,
-                data_offset,
-                data_len: comp_size,
+        CdScan::Searchable(
+            Entry {
+                name,
+                uncompressed_size: uncomp_size,
+                mtime: dos_to_unix(dos_date, dos_time),
+                location: Location::Zip {
+                    method,
+                    data_offset,
+                    data_len: comp_size,
+                },
             },
-        }),
+            crc32,
+        ),
         next,
     ))
 }
@@ -459,13 +477,22 @@ fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> {
 pub struct ZipSource<'d> {
     data: &'d [u8],
     entries: Vec<Entry>,
+    /// Central-Directory CRC-32 per entry, parallel to `entries`. Kept so
+    /// [`Source::integrity_check`] can attest an entry's bytes against the value
+    /// the archive producer recorded.
+    crcs: Vec<u32>,
 }
 
 impl<'d> ZipSource<'d> {
     /// Parse `data`'s central directory and build the source.
     pub fn open(data: &'d [u8]) -> Result<Self> {
-        let entries = parse_entries(data)?;
-        Ok(Self { data, entries })
+        let (entries, crcs): (Vec<Entry>, Vec<u32>) =
+            parse_entries_with_crc(data)?.into_iter().unzip();
+        Ok(Self {
+            data,
+            entries,
+            crcs,
+        })
     }
 }
 
@@ -480,6 +507,39 @@ impl Source for ZipSource<'_> {
 
     fn byte_size(&self) -> u64 {
         self.data.len() as u64
+    }
+
+    /// Attest an entry's bytes against the CRC-32 the Central Directory records.
+    ///
+    /// WHY this is a real integrity check, not a tautology: the recorded CRC-32
+    /// was written by the *producer* of the archive (the acquisition tool), so
+    /// recomputing it from the bytes on disk detects a STORED entry whose data
+    /// was truncated or corrupted in storage/transit — independent of anything
+    /// this tool computed. The CRC covers the uncompressed data for both STORED
+    /// and DEFLATE. A CRC of 0 is treated as "not recorded" (some producers leave
+    /// it zero, e.g. streamed entries with a data descriptor we don't resolve),
+    /// degrading to `Unrecorded` rather than a false mismatch.
+    fn integrity_check(&self, entry: &Entry) -> IntegrityCheck {
+        let Some(idx) = self.entries.iter().position(|e| e.name == entry.name) else {
+            return IntegrityCheck::Unrecorded;
+        };
+        let expected = self.crcs[idx];
+        if expected == 0 {
+            return IntegrityCheck::Unrecorded;
+        }
+        let Ok(content) = self.content(entry) else {
+            return IntegrityCheck::Unrecorded;
+        };
+        let actual = crc32fast::hash(&content);
+        if actual == expected {
+            IntegrityCheck::Verified { algorithm: "crc32" }
+        } else {
+            IntegrityCheck::Mismatch {
+                algorithm: "crc32",
+                expected: format!("{expected:08x}"),
+                actual: format!("{actual:08x}"),
+            }
+        }
     }
 }
 

@@ -13,12 +13,40 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use std::cell::RefCell;
+
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 
+use mf_scan::ios::backup::password::BackupRecord;
+use mf_scan::ios::backup::profile;
+use mf_scan::ios::backup::source::BackupSource;
 use mf_scan::source::Source;
 use mf_scan::source::folder::FolderSource;
 use mf_scan::source::zip::ZipSource;
+
+/// The backup password resolved from the CLI flag or the `MFSCAN_BACKUP_PASSWORD`
+/// environment variable, threaded through the open path so an encrypted backup
+/// can be unlocked. `None` ⇒ try the acquisition defaults.
+#[derive(Clone, Default)]
+pub(crate) struct BackupOptions {
+    pub(crate) password: Option<String>,
+}
+
+impl BackupOptions {
+    /// Resolve the option from the flag value, falling back to the env var when
+    /// the flag is absent. WHY env fallback: keeping the password out of the
+    /// shell command line avoids it landing in shell history or `ps` output —
+    /// forensic hygiene.
+    pub(crate) fn resolve(flag: Option<&str>) -> Self {
+        let password = flag.map(str::to_string).or_else(|| {
+            std::env::var("MFSCAN_BACKUP_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        Self { password }
+    }
+}
 
 /// How a resolved operand is opened by `run`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,23 +157,60 @@ pub(crate) enum Operand<'a> {
 /// this one scope ties their lifetimes together correctly and lets callers nest
 /// two of these (diff's two sides) with both backing buffers alive across the
 /// inner body. This is the single open/dispatch point both subcommands share.
+///
+/// Backup decryption is transparent here: if the opened inner source is an
+/// ENCRYPTED iOS backup, it is wrapped in a [`BackupSource`] (unlocked with
+/// `backup.password` or the acquisition defaults) and that decrypted view is
+/// passed to `f`. The unlock provenance is written into `record` for the caller
+/// to emit to stderr and the scan report. A non-encrypted backup or non-backup is
+/// passed through unchanged.
 pub(crate) fn with_operand_source<R>(
     operand: Operand<'_>,
+    backup: &BackupOptions,
+    record: &RefCell<Option<BackupRecord>>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
     match operand {
         Operand::Archive(path) => {
             let mmap = open_archive(path)?;
             let source = ZipSource::open(&mmap)?;
-            f(&source, Some(&mmap))
+            with_maybe_backup(&source, backup, record, |s| f(s, Some(&mmap)))
         }
         Operand::Folder {
             path,
             archive_depth,
         } => {
             let source = FolderSource::open(path, archive_depth)?;
-            f(&source, None)
+            with_maybe_backup(&source, backup, record, |s| f(s, None))
         }
+    }
+}
+
+/// Detect whether `inner` is an iOS backup; if so, wrap it in a [`BackupSource`]
+/// (encrypted or plain, chosen by the profile) and pass the logical view to `f`,
+/// recording provenance — otherwise pass `inner` unchanged.
+///
+/// The `BackupSource` borrows `inner`, so both live in this one scope (the same
+/// outlives-the-mmap discipline as the caller). An encrypted backup that no
+/// candidate password unlocks fails loudly here, naming `--backup-password`.
+fn with_maybe_backup<R>(
+    inner: &dyn Source,
+    backup: &BackupOptions,
+    record: &RefCell<Option<BackupRecord>>,
+    f: impl FnOnce(&dyn Source) -> Result<R>,
+) -> Result<R> {
+    match profile::detect(inner) {
+        Some(p) => {
+            // One constructor picks the encrypted vs plain variant from the
+            // profile; both present files by logical domain/relativePath, so
+            // output and export use the real names and each file is attested
+            // against its Manifest.db digest.
+            let bs = BackupSource::build(inner, &p, backup.password.as_deref())?;
+            *record.borrow_mut() = Some(bs.record(&p));
+            f(&bs)
+        }
+        // Not a backup at all: search the raw files unchanged.
+        None => f(inner),
     }
 }
 

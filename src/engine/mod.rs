@@ -59,7 +59,8 @@ pub struct Findings {
 /// `plain` is matched against the raw bytes as before. When `base64` is set
 /// (`--base64`), it is a second regex — an alternation of the base64 *alignment
 /// fragments* (see [`crate::search::base64`]) — and any hit it produces is tagged
-/// [`Encoding::Base64`] with `decoded` (the literal the user searched for) so the
+/// [`Encoding::Base64`](crate::models::Encoding::Base64) with `decoded` (the
+/// literal the user searched for) so the
 /// report shows what the encoded run contains. Borrows the regexes so the caller
 /// keeps ownership; building both once and reusing them across entries.
 pub struct Query<'a> {

@@ -37,8 +37,12 @@ use crate::support::reporting::{
     write_scan_report_if_enabled,
 };
 use crate::support::sources::{
-    Operand, ResolvedKind, ResolvedSource, resolve_sources, with_operand_source,
+    BackupOptions, Operand, ResolvedKind, ResolvedSource, resolve_sources, with_operand_source,
 };
+
+use std::cell::RefCell;
+
+use mf_scan::ios::backup::password::BackupRecord;
 
 /// Run the `grep` subcommand.
 pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
@@ -96,6 +100,11 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     let archive_paths: Vec<&Path> = sources.iter().map(|s| s.path.as_path()).collect();
     let decrypt_ctx = build_decryption_context(&cli.decrypt, &archive_paths)?;
 
+    // The backup password (flag or env), and a sink the open path fills in when a
+    // source turns out to be an encrypted backup that gets unlocked.
+    let backup_opts = BackupOptions::resolve(cli.decrypt.backup_password.as_deref());
+    let backup_record: RefCell<Option<BackupRecord>> = RefCell::new(None);
+
     // Coverage statistics aggregated across every searched archive, the decryption
     // audit trail, and the wall clock around the search for throughput.
     let mut stats = ScanStats::default();
@@ -115,6 +124,8 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 deep: false,
                 stats: &mut stats,
                 decryptions: &mut decryptions,
+                backup_opts: &backup_opts,
+                backup_record: &backup_record,
             };
             with_searched_source(src, ctx, |findings, _source| {
                 for f in &findings.files {
@@ -144,6 +155,8 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 deep: cli.inspect,
                 stats: &mut stats,
                 decryptions: &mut decryptions,
+                backup_opts: &backup_opts,
+                backup_record: &backup_record,
             };
             with_searched_source(src, ctx, |findings, source| {
                 // Every record carries its source's full path (for JSON); multi-source
@@ -195,7 +208,16 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     stats.elapsed = started.elapsed();
     print_stats_summary(&stats);
     report_decryptions(&decryptions);
-    write_scan_report_if_enabled(&cli, &run, &stats, &decryptions)?;
+
+    // Surface the backup-decryption provenance: a loud stderr line at run time
+    // (so the use of a DEFAULT password is impossible to miss) and the record in
+    // the scan report. WHY here, once: a single backup is unlocked per run; the
+    // open path filled `backup_record` during the search.
+    let backup_record = backup_record.into_inner();
+    if let Some(rec) = &backup_record {
+        eprintln!("{}", rec.stderr_line());
+    }
+    write_scan_report_if_enabled(&cli, &run, &stats, &decryptions, backup_record.as_ref())?;
 
     Ok(())
 }
@@ -385,6 +407,10 @@ struct SearchCtx<'a> {
     deep: bool,
     stats: &'a mut ScanStats,
     decryptions: &'a mut Vec<DecryptionRecord>,
+    /// The resolved backup password (flag/env), and the sink the open path fills
+    /// when a source is an encrypted backup it unlocks.
+    backup_opts: &'a BackupOptions,
+    backup_record: &'a RefCell<Option<BackupRecord>>,
 }
 
 /// Open one source, search it, and hand the findings to `handle`; then fold the
@@ -396,22 +422,28 @@ fn with_searched_source(
     ctx: SearchCtx<'_>,
     handle: impl FnOnce(&mut mf_scan::engine::Findings, &dyn Source) -> Result<()>,
 ) -> Result<()> {
-    with_source(src, ctx.cli.archive_depth, |source, raw| {
-        let verify_before = (ctx.cli.verify).then(|| raw.map(sha256_hex)).flatten();
-        let mut findings = search_with_reporter(
-            source,
-            ctx.query,
-            ctx.deep,
-            ctx.cli.match_path,
-            ctx.filter,
-            ctx.decrypt_ctx,
-        )?;
-        handle(&mut findings, source)?;
-        ctx.decryptions.append(&mut findings.decryptions);
-        ctx.stats.merge(findings.stats);
-        report_verify_for(ctx.cli.verify, verify_before, raw);
-        Ok(())
-    })
+    with_source(
+        src,
+        ctx.cli.archive_depth,
+        ctx.backup_opts,
+        ctx.backup_record,
+        |source, raw| {
+            let verify_before = (ctx.cli.verify).then(|| raw.map(sha256_hex)).flatten();
+            let mut findings = search_with_reporter(
+                source,
+                ctx.query,
+                ctx.deep,
+                ctx.cli.match_path,
+                ctx.filter,
+                ctx.decrypt_ctx,
+            )?;
+            handle(&mut findings, source)?;
+            ctx.decryptions.append(&mut findings.decryptions);
+            ctx.stats.merge(findings.stats);
+            report_verify_for(ctx.cli.verify, verify_before, raw);
+            Ok(())
+        },
+    )
 }
 
 /// Adapt a pre-resolved [`ResolvedSource`] onto the shared [`with_operand_source`]
@@ -421,6 +453,8 @@ fn with_searched_source(
 fn with_source<R>(
     resolved: &ResolvedSource,
     archive_depth: u32,
+    backup_opts: &BackupOptions,
+    backup_record: &RefCell<Option<BackupRecord>>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
     let operand = match resolved.kind {
@@ -430,7 +464,7 @@ fn with_source<R>(
             archive_depth,
         },
     };
-    with_operand_source(operand, f)
+    with_operand_source(operand, backup_opts, backup_record, f)
 }
 
 /// Emit the `--verify` attestation for one source: the before/after archive hash

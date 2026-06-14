@@ -86,6 +86,16 @@ pub(crate) struct DecryptArgs {
     /// are decrypted before being handled.
     #[arg(long = "no-decrypt")]
     pub(crate) no_decrypt: bool,
+
+    /// Password for an encrypted iOS backup. When the source is an encrypted
+    /// iTunes/Finder backup, it is decrypted with this password and searched as
+    /// normal files. If omitted, the env var `MFSCAN_BACKUP_PASSWORD` is used when
+    /// set (forensic hygiene — keeps the password out of shell history / `ps`);
+    /// if neither is given, common acquisition defaults are tried ("1234",
+    /// "123456", "password") and which default unlocked the backup is recorded in
+    /// the scan report.
+    #[arg(long = "backup-password", value_name = "PASSWORD")]
+    pub(crate) backup_password: Option<String>,
 }
 
 /// Manifest/export sink shared by `grep` and `diff`: persist the selected files.

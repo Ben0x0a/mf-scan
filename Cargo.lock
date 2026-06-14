@@ -508,6 +508,7 @@ dependencies = [
  "base64",
  "cbc",
  "clap",
+ "crc32fast",
  "csv",
  "flate2",
  "hmac",

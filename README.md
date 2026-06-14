@@ -145,13 +145,14 @@ With more than one source, each result is tagged with its origin (see
 | `-o`, `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
-| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + each file's SHA-256). |
+| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
 | `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
 | `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: beside `-o`, else `mf-scan-report.json`. |
 | `--keyfile FILE` | Decrypt profile-matched databases using keys from this keychain/keystore dump (repeatable). See [Decryption](#decryption). |
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
+| `--backup-password PASSWORD` | Password to unlock an **encrypted iOS backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
 
 ### `export`
 
@@ -276,6 +277,68 @@ the key's provenance and the SHA-256 of the ciphertext and plaintext.
 
 ---
 
+## iOS backups
+
+An **iTunes/Finder backup** (a folder, or a `.zip` of one, containing `Manifest.plist`
++ `Manifest.db`) is recognised automatically and presented at each file's **logical
+`domain/relativePath`** instead of its opaque `fileID` — so matches read like
+`HomeDomain/Library/SMS/sms.db` and exports keep the real filename. Encrypted and
+unencrypted backups are both handled.
+
+```bash
+# Unencrypted backup — nothing extra needed
+mf-scan grep "icloud" /path/to/00008120-… --dir-mode
+
+# Encrypted backup — supply the password (or set MFSCAN_BACKUP_PASSWORD)
+mf-scan grep "token" /path/to/00008030-… --dir-mode --backup-password 'hunter2'
+export MFSCAN_BACKUP_PASSWORD='hunter2'   # keeps it out of shell history / ps
+mf-scan grep "token" backup.zip
+```
+
+Work is **lazy**: only files that survive the `--path`/`--type`/media filters are ever
+read (and, for an encrypted backup, decrypted), so a targeted search over a backup
+where *every* file is individually encrypted stays fast. The provenance (encrypted vs
+not, how the password resolved, how many files were mapped) is recorded in the scan
+report and printed on stderr.
+
+For an **encrypted** backup the crypto layer recovers the per-class keys from the
+`Manifest.plist` keybag via the backup-password KDF (single or iOS 10.2+ double
+PBKDF2), unwraps each file's key (RFC 3394), and AES-256-CBC-decrypts it. Both flavours
+are **validated end-to-end against real backups**: every file's on-disk blob is checked
+against the SHA-1 `Digest` in `Manifest.db` on export — the SHA-1 of the *ciphertext*
+for an encrypted backup, of the *file content* for an unencrypted one (see
+[Export integrity](#export-integrity)).
+
+---
+
+## Export integrity
+
+`--export` writes `DIR/export-report.json` with an `integrity` summary and, per file,
+**two independent SHA-256 hashes** plus any source-recorded digest check:
+
+| Field | Meaning |
+|---|---|
+| `source_sha256` | SHA-256 of the bytes read **out of the source**. |
+| `sha256` | SHA-256 of the bytes **read back from the written file** on disk. |
+| `copy_verified` | `true` when the two match — catches a **silent copy error** (a bad/truncated write). |
+| `stored_integrity` | The source's own digest check, when it records one (see below): `verified`, `mismatch`, or `unrecorded`. |
+
+The `stored_integrity` check attests the **original evidence** independently of anything
+mf-scan computed:
+
+- **ZIP entry** → the **CRC-32** the archive's central directory records for the
+  (uncompressed) data, recomputed from the bytes on disk — STORED and DEFLATE alike.
+- **iOS backup** → the **SHA-1** recorded in `Manifest.db`, recomputed from the on-disk
+  blob: the ciphertext for an encrypted backup (attesting it was read intact *before*
+  decryption), the file content for an unencrypted one. Files with no recorded `Digest`
+  report `unrecorded`.
+
+Any failure (a copy mismatch, or a stored-digest mismatch indicating corrupt original
+evidence) is written to the report **and** printed loudly on stderr, one line per
+offending file.
+
+---
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — modules, data flow, design decisions.
@@ -294,6 +357,10 @@ the key's provenance and the SHA-256 of the ciphertext and plaintext.
   Loose files are read read-only. `--verify` adds a SHA-256 attestation (archive
   sources only); the hash matches the system `shasum -a 256`.
 - Offsets are **byte-accurate** for STORED entries (verifiable with `dd`/a hex editor).
+- On `--export`, every copied file is **hashed at the source and re-hashed off disk** and
+  the two are compared (silent-copy-error check); ZIP entries are additionally checked
+  against their central-directory CRC-32 and encrypted-backup files against their
+  `Manifest.db` SHA-1. See [Export integrity](#export-integrity).
 - Search is case-sensitive unless `-i`; `--path`/`--not-path` matching is case-sensitive.
 - **All files are searched by default**, including media — completeness is the forensic
   default, so nothing is silently skipped. `--exclude-media` (or `--fast`) skips

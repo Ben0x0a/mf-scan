@@ -24,10 +24,12 @@ use mf_scan::models::{Entry, RunInfo};
 use mf_scan::report::diff::write_diff;
 use mf_scan::source::Source;
 
+use std::cell::RefCell;
+
 use crate::cli::DiffArgs;
 use crate::support::exporting::run_export_sink;
 use crate::support::reporting::emit;
-use crate::support::sources::{Operand, with_operand_source};
+use crate::support::sources::{BackupOptions, Operand, with_operand_source};
 
 /// Run the `diff` subcommand.
 pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
@@ -54,26 +56,44 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
 
     // Open both sides — nested so both backing buffers stay alive across the diff —
     // then render, and export side B's changes through the shared export pipeline.
-    with_diff_side(&args.a, args.dir_mode, args.archive_depth, |a_src| {
-        with_diff_side(&args.b, args.dir_mode, args.archive_depth, |b_src| {
-            let report = diff_sources(a_src, b_src, mode, &filter, args.inspect)?;
+    // Resolve the backup password once (flag or env); both sides share it. An
+    // encrypted backup on either side is decrypted transparently by the shared
+    // open path. (Backup provenance is not reported by diff yet; the per-side
+    // record sink is local and discarded.)
+    let backup_opts = BackupOptions::resolve(args.decrypt.backup_password.as_deref());
 
-            emit(args.output.as_deref(), |w| {
-                write_diff(&report, args.format, w)
-            })?;
+    with_diff_side(
+        &args.a,
+        args.dir_mode,
+        args.archive_depth,
+        &backup_opts,
+        |a_src| {
+            with_diff_side(
+                &args.b,
+                args.dir_mode,
+                args.archive_depth,
+                &backup_opts,
+                |b_src| {
+                    let report = diff_sources(a_src, b_src, mode, &filter, args.inspect)?;
 
-            // Summary to stderr so it never pollutes a piped/redirected report.
-            let (added, removed, modified, unchanged) = report.counts();
-            eprintln!(
-                "diff: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
-            );
+                    emit(args.output.as_deref(), |w| {
+                        write_diff(&report, args.format, w)
+                    })?;
 
-            if want_export {
-                export_changes(&args, &report, b_src)?;
-            }
-            Ok(())
-        })
-    })
+                    // Summary to stderr so it never pollutes a piped/redirected report.
+                    let (added, removed, modified, unchanged) = report.counts();
+                    eprintln!(
+                        "diff: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
+                    );
+
+                    if want_export {
+                        export_changes(&args, &report, b_src)?;
+                    }
+                    Ok(())
+                },
+            )
+        },
+    )
 }
 
 /// Reject the flags whose `diff` behaviour is not implemented yet, so they fail
@@ -109,6 +129,7 @@ fn with_diff_side<R>(
     path: &Path,
     dir_mode: bool,
     archive_depth: u32,
+    backup_opts: &BackupOptions,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
     let operand = if !path.is_dir() {
@@ -124,7 +145,8 @@ fn with_diff_side<R>(
             path.display()
         )
     };
-    with_operand_source(operand, |source, _raw| f(source))
+    let record = RefCell::new(None);
+    with_operand_source(operand, backup_opts, &record, |source, _raw| f(source))
 }
 
 /// Export the added/modified files from side B and/or write a manifest, reusing the

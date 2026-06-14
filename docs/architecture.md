@@ -20,10 +20,23 @@ src/
   models.rs     data containers: Method, Entry+Location, SearchHit, MatchRecord,
                 Inspection, ContentDiff, RunInfo
   source/       the container abstraction the engine reads through (see ADR 0002)
-    mod.rs        Source trait: entries() + content() -> Cow + byte_size()
-    zip.rs        ZIP central-directory parser + ZipSource (mmap, zero-copy STORED)
+    mod.rs        Source trait: entries() + content() + byte_size() + integrity_check()
+    zip.rs        ZIP central-directory parser + ZipSource (mmap, zero-copy STORED;
+                  per-entry CRC-32 for export integrity)
     folder.rs     FolderSource: a directory of loose files (+ nested-archive arena)
     nested.rs     --archive-depth expansion of nested .zip files into the arena
+  sqlite/       low-level SQLite reader (page/record/schema/table), shared by the
+                inspector and the backup Manifest.db reader
+  ios/          iOS-specific layers
+    containers.rs GUID→bundle-id container annotation
+    backup/       iTunes/Finder backup → logical domain/relativePath view:
+                  profile (recognise), manifest (MBFile decode), password
+                  (provenance), common (shared Files-table walk, blob locating,
+                  missing-file count, SHA-1 digest check), keybag + keys
+                  (KDF/unwrap/CBC, encrypted only)
+      source/     BackupSource enum (build/record + Source dispatch) over its two
+                  variants: encrypted::EncryptedBackupSource (decrypts lazily),
+                  plain::PlainBackupSource (unencrypted, no crypto)
   search/       per-entry byte search: scan.rs (regex + line preview)
   engine/       orchestration: search_source over a Source -> Findings
     mod.rs        drivers + Findings/Query/Progress; classify.rs is the per-entry body
@@ -35,7 +48,8 @@ src/
     txt.rs json.rs xml.rs csv.rs plist.rs sqlite.rs   (resolve offsets; some diff)
     value_diff.rs  shared JSON-tree diff used by json + plist
     media/        the `media` category (classification only)
-  report/       output.rs (matches txt/json/csv) · stats.rs · export.rs · diff.rs
+  report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
+                stored-digest integrity) · diff.rs
 ```
 
 ## Module dependencies

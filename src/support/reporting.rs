@@ -161,6 +161,7 @@ pub(crate) fn write_scan_report_if_enabled(
     run: &RunInfo,
     stats: &ScanStats,
     decryptions: &[DecryptionRecord],
+    backup: Option<&mf_scan::ios::backup::password::BackupRecord>,
 ) -> Result<()> {
     if cli.no_report {
         return Ok(());
@@ -169,7 +170,7 @@ pub(crate) fn write_scan_report_if_enabled(
     let file = File::create(&path)
         .with_context(|| format!("cannot create scan report {}", path.display()))?;
     let mut w = BufWriter::new(file);
-    write_scan_report(run, stats, decryptions, &mut w)?;
+    write_scan_report(run, stats, decryptions, backup, &mut w)?;
     w.flush().context("failed flushing scan report")?;
     eprintln!("scan report -> {}", path.display());
     Ok(())

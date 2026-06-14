@@ -183,6 +183,89 @@ fn export_includes_sqlite_sidecars() {
 }
 
 #[test]
+fn export_report_attests_copy_and_zip_crc() {
+    // A STORED archive records a real CRC-32; the export must verify both the
+    // source-vs-copy hash and the central-directory CRC for every file.
+    let (zip, findings) = findings_two_infoplists();
+    let plan = export::plan(&findings.files);
+    let dir = tempfile::tempdir().unwrap();
+
+    let outcome = export::export_files(
+        &plan,
+        &ZipSource::open(&zip).unwrap(),
+        &findings.files,
+        dir.path(),
+        None,
+    )
+    .unwrap();
+    let report = match outcome {
+        ExportOutcome::Exported { report, .. } => report,
+        ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
+    };
+
+    assert_eq!(report.len(), 2);
+    for f in &report {
+        // Source bytes and written bytes match (no silent copy error).
+        assert!(f.copy_verified, "{} not copy-verified", f.internal_path);
+        assert_eq!(f.sha256, f.source_sha256);
+        // The STORED entry's CRC-32 was verified against the central directory.
+        assert_eq!(
+            f.stored_integrity,
+            export::StoredIntegrity::Verified {
+                algorithm: "crc32".into()
+            },
+            "{} CRC not verified",
+            f.internal_path
+        );
+        assert!(f.is_intact());
+    }
+
+    let summary = export::IntegritySummary::of(&report);
+    assert_eq!(summary.intact, 2);
+    assert_eq!(summary.stored_digest_verified, 2);
+    assert!(!summary.has_failures());
+}
+
+#[test]
+fn zip_integrity_check_detects_corruption() {
+    use mf_scan::source::{IntegrityCheck, Source};
+
+    // Build a STORED archive, then flip a byte inside the first entry's payload.
+    let payload = b"hello forensic world";
+    let files = [
+        FileSpec::stored("a.txt", payload),
+        FileSpec::stored("b.txt", b"intact file"),
+    ];
+    let mut zip = build_zip(&files, false);
+
+    // The payload sits right after the first local header + name. Locate it and
+    // corrupt one byte so the recomputed CRC-32 diverges from the recorded one.
+    let at = zip
+        .windows(payload.len())
+        .position(|w| w == payload)
+        .expect("payload present in archive");
+    zip[at + 1] ^= 0xFF;
+
+    let src = ZipSource::open(&zip).unwrap();
+    let entries = src.entries().to_vec();
+    let a = entries.iter().find(|e| e.name == "a.txt").unwrap();
+    let b = entries.iter().find(|e| e.name == "b.txt").unwrap();
+
+    // The corrupted entry is reported as a mismatch; the intact one verifies.
+    assert!(matches!(
+        src.integrity_check(a),
+        IntegrityCheck::Mismatch {
+            algorithm: "crc32",
+            ..
+        }
+    ));
+    assert!(matches!(
+        src.integrity_check(b),
+        IntegrityCheck::Verified { algorithm: "crc32" }
+    ));
+}
+
+#[test]
 fn export_refuses_when_over_max_size() {
     let (zip, findings) = findings_two_infoplists();
     let plan = export::plan(&findings.files);

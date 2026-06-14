@@ -188,28 +188,37 @@ struct JsonReport<'a> {
 }
 
 /// The scan report written to the sidecar file: run metadata, coverage
-/// statistics, and the decryption audit trail, with no result records (those go to
+/// statistics, the decryption audit trail, and — when the source was an encrypted
+/// iOS backup — the backup-decryption record, with no result records (those go to
 /// the main output). Always written so a run leaves a record of what it did and did
 /// not look at — including which encrypted databases it decrypted (with key
-/// provenance and ciphertext/plaintext hashes) or failed to.
+/// provenance and ciphertext/plaintext hashes) or failed to, and whether a whole
+/// backup was unlocked (and with a default password, which one).
 #[derive(Serialize)]
 struct ScanReport<'a> {
     run: &'a RunInfo,
     stats: &'a ScanStats,
     decryptions: &'a [DecryptionRecord],
+    /// Backup-level decryption provenance; omitted when the source was not an
+    /// encrypted backup, so existing reports are byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<&'a crate::ios::backup::password::BackupRecord>,
 }
 
-/// Write the sidecar scan report (`{ run, stats, decryptions }`) as pretty JSON.
+/// Write the sidecar scan report (`{ run, stats, decryptions[, backup] }`) as
+/// pretty JSON. `backup` is the encrypted-backup unlock record, or `None`.
 pub fn write_scan_report(
     run: &RunInfo,
     stats: &ScanStats,
     decryptions: &[DecryptionRecord],
+    backup: Option<&crate::ios::backup::password::BackupRecord>,
     w: &mut dyn Write,
 ) -> Result<()> {
     let report = ScanReport {
         run,
         stats,
         decryptions,
+        backup,
     };
     serde_json::to_writer_pretty(&mut *w, &report).context("failed writing scan report")?;
     writeln!(w).context("failed writing scan report")?;

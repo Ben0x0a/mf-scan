@@ -56,7 +56,7 @@ impl Platform {
 /// matching entry, or one exact internal path. Modelled as an enum (not always a
 /// glob) so a profile can pin a single known file when that is the intent.
 ///
-/// Deserialised via [`DbBindingRaw`] (a `glob`/`path` map) rather than as a serde
+/// Deserialised via `DbBindingRaw` (a `glob`/`path` map) rather than as a serde
 /// enum: serde_yaml renders externally-tagged enums with `!Variant` YAML tags,
 /// which would force an unfriendly `db: !glob "..."`. The intermediate keeps the
 /// natural `db: { glob: "..." }` form and validates that exactly one is set.

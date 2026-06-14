@@ -6,6 +6,7 @@
 //! here.
 //! Used by: `run::grep` (builds an `AppContainerMap` per source and annotates
 //! `MatchRecord::bundle_id` in the post-search pass).
-//! Uses: `containers`.
+//! Uses: `containers`, `backup`.
 
+pub mod backup;
 pub mod containers;

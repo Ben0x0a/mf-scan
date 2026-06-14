@@ -19,6 +19,21 @@
 pub const METHOD_STORED: u16 = 0;
 pub const METHOD_DEFLATE: u16 = 8;
 
+/// The CRC-32 a fabricated entry should record in its headers.
+///
+/// For a STORED entry the on-disk bytes ARE the uncompressed data, so we record
+/// their real CRC-32 (matching what a real producer writes) — this exercises the
+/// `ZipSource` integrity attestation. For a DEFLATE entry the builder only holds
+/// the already-compressed stream, not the original, so it records 0 ("not
+/// recorded"), which the parser/integrity check treats as un-attestable.
+fn entry_crc32(f: &FileSpec) -> u32 {
+    if f.method == METHOD_STORED {
+        crc32fast::hash(f.data)
+    } else {
+        0
+    }
+}
+
 /// One file to place into a fabricated archive.
 pub struct FileSpec<'a> {
     pub name: &'a str,
@@ -82,7 +97,7 @@ pub fn build_zip(files: &[FileSpec], zip64: bool) -> Vec<u8> {
         push_u16(&mut buf, f.method);
         push_u16(&mut buf, 0); // mod time
         push_u16(&mut buf, 0); // mod date
-        push_u32(&mut buf, 0); // crc32 (parser ignores it)
+        push_u32(&mut buf, entry_crc32(f)); // crc32 of the uncompressed data
         push_u32(&mut buf, f.data.len() as u32); // compressed size
         push_u32(&mut buf, f.uncompressed_size); // uncompressed size
         push_u16(&mut buf, f.name.len() as u16);
@@ -101,7 +116,7 @@ pub fn build_zip(files: &[FileSpec], zip64: bool) -> Vec<u8> {
         push_u16(&mut buf, f.method);
         push_u16(&mut buf, 0); // mod time
         push_u16(&mut buf, 0); // mod date
-        push_u32(&mut buf, 0); // crc32
+        push_u32(&mut buf, entry_crc32(f)); // crc32 of the uncompressed data
         push_u32(&mut buf, f.data.len() as u32); // compressed size
         push_u32(&mut buf, f.uncompressed_size); // uncompressed size
         push_u16(&mut buf, f.name.len() as u16);

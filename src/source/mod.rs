@@ -70,6 +70,29 @@ impl Content<'_> {
     }
 }
 
+/// Outcome of checking an entry's *stored* bytes against a digest the source
+/// itself records — independent provenance metadata, not a hash this tool
+/// computed. The only source that carries one today is an encrypted iOS backup,
+/// whose `Manifest.db` records the SHA-1 of each file's encrypted on-disk blob.
+///
+/// Used by the export path to attest that the original evidence (the stored
+/// ciphertext) was read intact, *before* any decryption — a stronger guarantee
+/// than hashing only the bytes we wrote out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrityCheck {
+    /// The source records a digest for this entry and the stored bytes matched.
+    Verified { algorithm: &'static str },
+    /// The source records a digest and the stored bytes did NOT match it —
+    /// the original evidence is corrupt or was read wrong. Surfaced loudly.
+    Mismatch {
+        algorithm: &'static str,
+        expected: String,
+        actual: String,
+    },
+    /// The source records no digest for this entry (the common case).
+    Unrecorded,
+}
+
 /// A container of located files: enumerate them, and read any one's bytes.
 ///
 /// `Sync` because the engine searches entries in parallel (rayon) and calls
@@ -92,5 +115,14 @@ pub trait Source: Sync {
     /// with its true on-disk size.
     fn byte_size(&self) -> u64 {
         self.entries().iter().map(|e| e.uncompressed_size).sum()
+    }
+
+    /// Check `entry`'s stored bytes against a digest the source records about
+    /// them, if any. The default — for sources with no independent integrity
+    /// metadata (folders, plain ZIPs) — is [`IntegrityCheck::Unrecorded`]. The
+    /// encrypted-backup source overrides this to verify each file's encrypted
+    /// blob against the SHA-1 in `Manifest.db`.
+    fn integrity_check(&self, _entry: &Entry) -> IntegrityCheck {
+        IntegrityCheck::Unrecorded
     }
 }

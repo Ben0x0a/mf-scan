@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BackupKeyBag</key>
+	<data>
+	VkVSUwAAAAQAAAAEVFlQRQAAAAQAAAABVVVJRAAAABAAAAAAAAAAAAAAAAAAAAAASE1D
+	SwAAACgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAV1JBUAAA
+	AAQAAAAAU0FMVAAAABQAAQIDBAUGBwgJCgsMDQ4PEBESE0lURVIAAAAEAAAD6ERQU0wA
+	AAAgAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9EUElDAAAABAAAA+hDTEFT
+	AAAABAAAAANXUkFQAAAABAAAAANXUEtZAAAAKLSAm3pUtrWJQCKbOHAiciTXGWENaNy7
+	5hCMJCT30A1Xd8u5SkhOsSY=
+	</data>
+	<key>IsEncrypted</key>
+	<true/>
+	<key>Lockdown</key>
+	<dict>
+		<key>ProductVersion</key>
+		<string>17.0</string>
+	</dict>
+	<key>ManifestKey</key>
+	<data>
+	AwAAAPG4aD0CFu7mp7on+VxKDXwOgPdkzlAvqpQIswBYbzy5VX71TW2ai3Y=
+	</data>
+	<key>Version</key>
+	<string>10.0</string>
+</dict>
+</plist>

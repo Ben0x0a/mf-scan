@@ -60,7 +60,13 @@ pub struct ExportPlan {
     pub total_size: u64,
 }
 
-/// One exported file recorded with its integrity hash, for the export report.
+/// One exported file recorded with its integrity hashes, for the export report.
+///
+/// Two independent SHA-256 hashes are recorded so a silent copy error (a bad
+/// disk write, a truncated copy) is caught: `source_sha256` is the bytes read
+/// out of the source, `sha256` is the bytes read back from the written file. The
+/// export attests `copy_verified` (they match) — and, for an encrypted backup,
+/// `stored_integrity` (the encrypted blob matched the SHA-1 in `Manifest.db`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedFile {
     /// Path inside the source archive.
@@ -68,8 +74,63 @@ pub struct ExportedFile {
     /// Path written, relative to the export destination directory.
     pub output_path: String,
     pub size: u64,
-    /// SHA-256 of the written bytes, lowercase hex.
+    /// SHA-256 of the written bytes (read back from disk), lowercase hex.
     pub sha256: String,
+    /// SHA-256 of the source bytes (as read out of the source), lowercase hex.
+    pub source_sha256: String,
+    /// Whether `source_sha256 == sha256` — the source-vs-copy attestation. A
+    /// `false` here means the bytes on disk differ from what was read (a silent
+    /// copy error) and is surfaced loudly.
+    pub copy_verified: bool,
+    /// Source-recorded stored-bytes integrity, when the source carries one (an
+    /// encrypted backup's per-file SHA-1). `Unrecorded` for plain sources.
+    pub stored_integrity: StoredIntegrity,
+}
+
+/// The serialisable form of [`crate::source::IntegrityCheck`] for the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum StoredIntegrity {
+    /// The source records no digest for this file.
+    Unrecorded,
+    /// The source's recorded digest matched the stored bytes.
+    Verified { algorithm: String },
+    /// The source's recorded digest did NOT match — corrupt original evidence.
+    Mismatch {
+        algorithm: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl From<crate::source::IntegrityCheck> for StoredIntegrity {
+    fn from(check: crate::source::IntegrityCheck) -> Self {
+        use crate::source::IntegrityCheck as I;
+        match check {
+            I::Unrecorded => StoredIntegrity::Unrecorded,
+            I::Verified { algorithm } => StoredIntegrity::Verified {
+                algorithm: algorithm.to_string(),
+            },
+            I::Mismatch {
+                algorithm,
+                expected,
+                actual,
+            } => StoredIntegrity::Mismatch {
+                algorithm: algorithm.to_string(),
+                expected,
+                actual,
+            },
+        }
+    }
+}
+
+impl ExportedFile {
+    /// Whether this file's export is fully attested: the on-disk copy matches the
+    /// source bytes AND any source-recorded stored digest matched. A `false` is
+    /// reported loudly to the operator.
+    pub fn is_intact(&self) -> bool {
+        self.copy_verified && !matches!(self.stored_integrity, StoredIntegrity::Mismatch { .. })
+    }
 }
 
 /// The result of an export attempt.
@@ -88,19 +149,67 @@ pub enum ExportOutcome {
     },
 }
 
-/// The export report: the run metadata plus every written file and its hash.
+/// The export report: run metadata, an integrity summary, then every written
+/// file with its hashes.
 #[derive(Serialize)]
 struct ExportReport<'a> {
     run: &'a RunInfo,
     file_count: usize,
+    integrity: IntegritySummary,
     files: &'a [ExportedFile],
 }
 
-/// Write the export report (run metadata + per-file SHA-256) as JSON.
+/// Aggregate integrity outcome over all exported files, surfaced at the head of
+/// the report so an operator sees at a glance whether every copy is attested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegritySummary {
+    /// Files whose on-disk copy matched the source bytes AND any stored digest.
+    pub intact: usize,
+    /// Files whose written copy did NOT match the source bytes read.
+    pub copy_mismatches: usize,
+    /// Files whose source-recorded stored digest did NOT match (corrupt original).
+    pub stored_digest_mismatches: usize,
+    /// Files carrying a source-recorded stored digest that was verified.
+    pub stored_digest_verified: usize,
+}
+
+impl IntegritySummary {
+    /// Tally the per-file outcomes into the aggregate.
+    pub fn of(files: &[ExportedFile]) -> Self {
+        let mut s = IntegritySummary {
+            intact: 0,
+            copy_mismatches: 0,
+            stored_digest_mismatches: 0,
+            stored_digest_verified: 0,
+        };
+        for f in files {
+            if f.is_intact() {
+                s.intact += 1;
+            }
+            if !f.copy_verified {
+                s.copy_mismatches += 1;
+            }
+            match f.stored_integrity {
+                StoredIntegrity::Verified { .. } => s.stored_digest_verified += 1,
+                StoredIntegrity::Mismatch { .. } => s.stored_digest_mismatches += 1,
+                StoredIntegrity::Unrecorded => {}
+            }
+        }
+        s
+    }
+
+    /// Whether any file failed either integrity check.
+    pub fn has_failures(&self) -> bool {
+        self.copy_mismatches > 0 || self.stored_digest_mismatches > 0
+    }
+}
+
+/// Write the export report (run metadata + integrity summary + per-file hashes).
 pub fn write_export_report(run: &RunInfo, files: &[ExportedFile], w: &mut dyn Write) -> Result<()> {
     let report = ExportReport {
         run,
         file_count: files.len(),
+        integrity: IntegritySummary::of(files),
         files,
     };
     serde_json::to_writer_pretty(&mut *w, &report).context("failed writing export report")?;
@@ -204,7 +313,14 @@ pub fn export_files(
         }
         fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
         bytes += content.len() as u64;
-        report.push(exported_file(&file.entry.name, &dest, dir, &content));
+        let integrity = source.integrity_check(&file.entry).into();
+        report.push(exported_file(
+            &file.entry.name,
+            &dest,
+            dir,
+            &content,
+            integrity,
+        )?);
 
         // Sidecars to export come from the file's inspector (e.g. SQLite's -wal).
         let suffixes = crate::inspect::sidecars_for(&file.entry.name, &content);
@@ -267,7 +383,14 @@ pub fn export_from_manifest(
         }
         fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
         bytes += content.len() as u64;
-        report.push(exported_file(&entry.internal_path, &dest, dir, &content));
+        let integrity = source.integrity_check(found).into();
+        report.push(exported_file(
+            &entry.internal_path,
+            &dest,
+            dir,
+            &content,
+            integrity,
+        )?);
 
         let suffixes = crate::inspect::sidecars_for(&entry.internal_path, &content);
         let mut sidecars =
@@ -315,25 +438,51 @@ fn export_sidecars(
         let mut dest = main_dest.to_path_buf();
         dest.set_file_name(format!("{main_name}{suffix}"));
         fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
-        written.push(exported_file(&sidecar_path, &dest, dir, &content));
+        let integrity = source.integrity_check(entry).into();
+        written.push(exported_file(
+            &sidecar_path,
+            &dest,
+            dir,
+            &content,
+            integrity,
+        )?);
     }
     Ok(written)
 }
 
-/// Build an [`ExportedFile`] record: the destination path relative to the export
-/// directory, the size, and the SHA-256 of the written bytes.
-fn exported_file(internal_path: &str, dest: &Path, dir: &Path, content: &[u8]) -> ExportedFile {
+/// Build an [`ExportedFile`] record with full integrity attestation.
+///
+/// Hashes the source bytes (`content`), reads the just-written file back from
+/// disk and hashes that, and records both plus whether they match — catching a
+/// silent copy error. `stored_integrity` carries any source-recorded digest
+/// check (an encrypted backup's per-file SHA-1).
+fn exported_file(
+    internal_path: &str,
+    dest: &Path,
+    dir: &Path,
+    content: &[u8],
+    stored_integrity: StoredIntegrity,
+) -> Result<ExportedFile> {
     let output_path = dest
         .strip_prefix(dir)
         .unwrap_or(dest)
         .to_string_lossy()
         .replace('\\', "/");
-    ExportedFile {
+    let source_sha256 = sha256_hex(content);
+    // Read the bytes back from disk so the recorded hash is of what actually
+    // landed, not just of what we intended to write — this is the copy check.
+    let written = fs::read(dest).with_context(|| format!("cannot read back {}", dest.display()))?;
+    let sha256 = sha256_hex(&written);
+    let copy_verified = sha256 == source_sha256;
+    Ok(ExportedFile {
         internal_path: internal_path.to_string(),
         output_path,
         size: content.len() as u64,
-        sha256: sha256_hex(content),
-    }
+        sha256,
+        source_sha256,
+        copy_verified,
+        stored_integrity,
+    })
 }
 
 /// Join a manifest `output_path` under `dir`, dropping any `..`/empty/absolute
