@@ -386,6 +386,8 @@ no-single-archive-byte cases; CRC-32 export integrity still applies.
 - [docs/inspectors.md](docs/inspectors.md) — supported formats, detection, adding one.
 - [docs/decryption.md](docs/decryption.md) — decrypting databases: architecture, formats, profiles, caveats.
 - [docs/adr/](docs/adr/) — architecture decision records (decryption; the source/container abstraction).
+- [benchmark/README.md](benchmark/README.md) — I/O-mode benchmark (`mmap` vs `ranged`) and performance findings.
+- Contributing: see [Local checks](docs/architecture.md#local-checks-run-before-pushing-a-tag) and [Releasing](docs/architecture.md#releasing) in the architecture doc — run `./scripts/check.sh` before pushing a tag.
 
 ---
 

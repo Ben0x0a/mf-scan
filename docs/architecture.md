@@ -172,5 +172,54 @@ them. ZIP fixtures are **hand-built byte by byte** (`tests/common`) so they are
 deterministic and need no external `zip` tool; binary-format inspectors and the SQLite diff
 are tested against committed real fixtures (`tests/fixtures/`).
 
-`cargo test` runs the full suite (lib unit + integration, ~110 tests);
+`cargo test` runs the full suite (lib unit + integration);
 `cargo clippy --all-targets` and `cargo fmt --all -- --check` are clean.
+
+## Local checks (run before pushing a tag)
+
+The release gate (`.github/workflows/release.yml`, `check` job) runs `cargo fmt --check`,
+`cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --all --locked`, then
+builds four targets. **Mirror it locally with `./scripts/check.sh`** — don't just run plain
+`cargo clippy`.
+
+Why the script and not bare `cargo clippy`: CI runs clippy on a **Linux** runner, so it
+compiles the `#[cfg(target_os = "linux")]` paths (e.g. `is_remote_path`'s `statfs` magic in
+`support/sources.rs`). On a macOS dev box `cargo clippy` compiles the **macOS** branch
+instead, so a Linux-only lint or build error passes locally and only fails in CI. The script
+runs clippy for every release target (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+plus the host), so `cfg`-gated code is linted before the tag goes up. Clippy/check don't
+link, so cross-target runs need only the target's std — install once:
+
+```
+rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc
+```
+
+Missing targets are reported (with the `rustup` command) and skipped, so the script still
+runs what it can. **When touching `#[cfg(...)]` code, the cross-target run is the one that
+matters** — that is the class of bug bare local clippy cannot see.
+
+## Releasing
+
+Releases are **tag-driven** — there is no manual changelog or upload step. To cut `vX.Y.Z`:
+
+1. `./scripts/check.sh` — green across all targets (above).
+2. Bump `version` in `Cargo.toml`, then refresh the lockfile: `cargo update -p mf-scan --precise X.Y.Z`. Commit both (`--locked` CI builds require `Cargo.lock` to match).
+3. `git push origin main`, then tag and push: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
+
+Pushing the tag re-runs the gate, builds linux/windows/macOS (x86_64 + aarch64) archives
+(binary + README + LICENSE + `presets/`), computes `SHA256SUMS`, and publishes a GitHub
+Release with notes auto-generated from the commits since the previous tag.
+
+**Tags are immutable — never force-move a pushed tag.** If a tagged build fails CI (so no
+release was published), fix forward with the next patch version (e.g. `v0.3.0` failed →
+ship `v0.3.1`) rather than re-pointing the tag; an already-fetched tag must never change
+its target. A dead tag with no release is harmless, but can be removed with
+`git push origin :refs/tags/vX.Y.Z`.
+
+## Benchmarking
+
+`benchmark/io_bench.py` compares the `mmap` and `ranged` I/O modes on one archive or folder
+(wall time, the user/sys CPU split, RSS, page faults, and the `--verify` capability), and is
+the tool to re-run when changing anything in the read path. See [benchmark/README.md](../benchmark/README.md)
+for scenarios and the current findings (why `mmap` is the default and when to reach for
+`--io-mode ranged`).
