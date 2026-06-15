@@ -80,7 +80,8 @@ impl Source for FolderSource {
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
         match &entry.location {
             Location::Loose { path } => {
-                let file = fs::File::open(path)
+                use std::io::Read;
+                let mut file = fs::File::open(path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
                 let len = file
                     .metadata()
@@ -94,8 +95,14 @@ impl Source for FolderSource {
                         .with_context(|| format!("cannot map {}", path.display()))?;
                     return Ok(Content::Mapped(map));
                 }
-                let bytes =
-                    fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+                // Read from the handle already opened above rather than re-opening
+                // the path with `fs::read` — one `open()` syscall per small file, not
+                // two, which adds up over a backup of hundreds of thousands of files.
+                // The size hint is exact (we just stat'd it), so the buffer is sized
+                // once with no growth reallocations.
+                let mut bytes = Vec::with_capacity(len as usize);
+                file.read_to_end(&mut bytes)
+                    .with_context(|| format!("cannot read {}", path.display()))?;
                 Ok(Content::Owned(bytes))
             }
             // A file inside an opened nested archive: read its range from the blob.

@@ -18,6 +18,7 @@ use std::io::Read;
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::DeflateDecoder;
+use rayon::prelude::*;
 
 use crate::models::{Entry, Location, Method};
 use crate::source::{Content, IntegrityCheck, Source};
@@ -80,24 +81,36 @@ pub fn parse_entries_with_crc(data: &[u8]) -> Result<Vec<(Entry, u32)>> {
         .context("central directory range is out of bounds")?;
     let records = parse_cd_headers(cd, loc.total_entries)?;
 
-    let mut out = Vec::with_capacity(records.len());
-    for ce in records {
-        let data_offset = local_data_offset(data, ce.local_offset)?;
-        out.push((
-            Entry {
-                name: ce.name,
-                uncompressed_size: ce.uncomp_size,
-                mtime: ce.mtime,
-                location: Location::Zip {
-                    method: ce.method,
-                    data_offset,
-                    data_len: ce.comp_size,
+    // Resolve each entry's real data offset from its Local File Header. WHY in
+    // parallel: the LFHs are scattered across the whole archive (each sits just
+    // before its file's data), so on a multi-hundred-thousand-entry FFS this is
+    // hundreds of thousands of random reads spanning the map — cold, the dominant
+    // cost of merely *opening* the archive. The reads are independent and `data`
+    // is read-only, so spreading them across the rayon pool lets the OS service
+    // the faults concurrently. Order is preserved (`collect` keeps input order),
+    // so the entries stay deterministic. The offset stays resolved here (not
+    // deferred), so every downstream forensic field — the exact archive offset of
+    // a STORED match, the export manifest's `file_start`, `--match-path` — is
+    // unchanged from the sequential version.
+    records
+        .into_par_iter()
+        .map(|ce| {
+            let data_offset = local_data_offset(data, ce.local_offset)?;
+            Ok((
+                Entry {
+                    name: ce.name,
+                    uncompressed_size: ce.uncomp_size,
+                    mtime: ce.mtime,
+                    location: Location::Zip {
+                        method: ce.method,
+                        data_offset,
+                        data_len: ce.comp_size,
+                    },
                 },
-            },
-            ce.crc32,
-        ));
-    }
-    Ok(out)
+                ce.crc32,
+            ))
+        })
+        .collect()
 }
 
 /// Where the central directory lives, resolved from the EOCD (upgraded by the

@@ -92,6 +92,17 @@ impl EntryFilter {
         &self.exclude
     }
 
+    /// Whether a content-based type decision could ever *skip* a file (a `--type`
+    /// allowlist or `--exclude-media` is in effect).
+    ///
+    /// When this is `false`, [`accept_type`](Self::accept_type) always returns
+    /// `Search`, so reading a file's header to classify it can only waste a read —
+    /// the engine uses this to decide whether header-first classification (over a
+    /// remote source) is worth doing at all.
+    pub fn may_skip_by_type(&self) -> bool {
+        !self.types.is_empty() || self.skip_media
+    }
+
     /// Classify `path` against the path-only filters (include/exclude globs).
     ///
     /// This runs before any content is read; the type/media decision is made

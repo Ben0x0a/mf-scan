@@ -24,6 +24,7 @@
 //!     for the rare huge file), and [`Source::content_prefix`] reads only a header
 //!     slice, so a media file excluded by `--type`/`--fast` is never fetched whole.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 #[cfg(unix)]
@@ -46,25 +47,17 @@ const CHUNK: usize = 256 * 1024 * 1024;
 /// Local File Header fixed size, before the variable name/extra fields.
 const LFH_FIXED: u64 = 30;
 
-/// Per-entry data needed to read a file's bytes, parallel to the public entries.
-struct RangedEntry {
-    method: Method,
-    /// Absolute offset of the entry's Local File Header.
-    header_offset: u64,
-    /// On-disk (compressed) data length.
-    data_len: u64,
-    /// Uncompressed length (the inflate target / STORED length).
-    uncomp_size: u64,
-    /// CRC-32 of the uncompressed data, from the central directory.
-    crc32: u32,
-}
-
 /// A [`Source`] over a ZIP archive backed by positioned reads.
 pub struct RangedZipSource {
     file: File,
+    /// Public entries. Each [`Location::RangedZip`] carries everything a read
+    /// needs (method, LFH offset, compressed length), so [`Source::content`] reads
+    /// straight from the entry — no per-call lookup, no O(N) scan over a parallel
+    /// table — which matters for an archive with hundreds of thousands of entries.
     entries: Vec<Entry>,
-    /// Per-entry read metadata, indexed parallel to `entries`.
-    meta: Vec<RangedEntry>,
+    /// Name → CRC-32, consulted only by [`Source::integrity_check`] on export (not
+    /// the search hot path), so a lookup here is rare.
+    crc_by_name: HashMap<String, u32>,
 }
 
 impl RangedZipSource {
@@ -91,8 +84,9 @@ impl RangedZipSource {
         let records = zip::parse_cd_headers(&cd, loc.total_entries)?;
 
         let mut entries = Vec::with_capacity(records.len());
-        let mut meta = Vec::with_capacity(records.len());
+        let mut crc_by_name = HashMap::with_capacity(records.len());
         for ce in records {
+            crc_by_name.insert(ce.name.clone(), ce.crc32);
             entries.push(Entry {
                 name: ce.name,
                 uncompressed_size: ce.uncomp_size,
@@ -103,29 +97,12 @@ impl RangedZipSource {
                     data_len: ce.comp_size,
                 },
             });
-            meta.push(RangedEntry {
-                method: ce.method,
-                header_offset: ce.local_offset,
-                data_len: ce.comp_size,
-                uncomp_size: ce.uncomp_size,
-                crc32: ce.crc32,
-            });
         }
         Ok(Self {
             file,
             entries,
-            meta,
+            crc_by_name,
         })
-    }
-
-    /// The metadata index for `entry` (entries/meta are built together, in order).
-    fn meta_for(&self, entry: &Entry) -> Result<&RangedEntry> {
-        let idx = self
-            .entries
-            .iter()
-            .position(|e| e.name == entry.name)
-            .with_context(|| format!("unknown ranged entry {}", entry.name))?;
-        Ok(&self.meta[idx])
     }
 
     /// Resolve an entry's real data start by reading its Local File Header.
@@ -134,22 +111,30 @@ impl RangedZipSource {
     /// own name/extra lengths, which may differ from the central directory's —
     /// assuming they are equal is a classic ZIP-parsing bug. This is one small
     /// positioned read, done only when the entry is actually read.
-    fn data_start(&self, meta: &RangedEntry) -> Result<u64> {
-        let header = read_at(&self.file, meta.header_offset, LFH_FIXED as usize)?;
+    fn data_start(&self, header_offset: u64) -> Result<u64> {
+        let header = read_at(&self.file, header_offset, LFH_FIXED as usize)?;
         ensure!(
             zip::read_u32(&header, 0)? == SIG_LFH,
-            "bad local file header signature at offset {}",
-            meta.header_offset
+            "bad local file header signature at offset {header_offset}"
         );
         let name_len = zip::read_u16(&header, 26)? as u64;
         let extra_len = zip::read_u16(&header, 28)? as u64;
-        Ok(meta.header_offset + LFH_FIXED + name_len + extra_len)
+        Ok(header_offset + LFH_FIXED + name_len + extra_len)
     }
+}
 
-    /// Read an entry's raw on-disk (compressed) bytes, in chunks for huge files.
-    fn read_raw(&self, meta: &RangedEntry) -> Result<Vec<u8>> {
-        let start = self.data_start(meta)?;
-        read_range_chunked(&self.file, start, meta.data_len)
+/// Read the `Location::RangedZip` fields of an entry, or error if it is not one.
+fn ranged_loc(entry: &Entry) -> Result<(Method, u64, u64)> {
+    match entry.location {
+        Location::RangedZip {
+            method,
+            header_offset,
+            data_len,
+        } => Ok((method, header_offset, data_len)),
+        _ => anyhow::bail!(
+            "RangedZipSource called on a non-ranged entry: {}",
+            entry.name
+        ),
     }
 }
 
@@ -159,12 +144,13 @@ impl Source for RangedZipSource {
     }
 
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
-        let meta = self.meta_for(entry)?;
-        let raw = self.read_raw(meta)?;
-        match meta.method {
+        let (method, header_offset, data_len) = ranged_loc(entry)?;
+        let start = self.data_start(header_offset)?;
+        let raw = read_range_chunked(&self.file, start, data_len)?;
+        match method {
             Method::Stored => Ok(Content::Owned(raw)),
             Method::Deflate => {
-                let inflated = zip::inflate(&raw, meta.uncomp_size)
+                let inflated = zip::inflate(&raw, entry.uncompressed_size)
                     .with_context(|| format!("failed to inflate {}", entry.name))?;
                 Ok(Content::Owned(inflated))
             }
@@ -176,6 +162,15 @@ impl Source for RangedZipSource {
         self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 
+    /// Resolve the entry's data start by reading its Local File Header — the same
+    /// lazy resolution [`Source::content`] does, exposed so a match can report its
+    /// exact archive offset. Returns `None` if the entry is not a ranged ZIP entry
+    /// or its header cannot be read (degrade to "no absolute offset", never abort).
+    fn archive_data_start(&self, entry: &Entry) -> Option<u64> {
+        let (_method, header_offset, _data_len) = ranged_loc(entry).ok()?;
+        self.data_start(header_offset).ok()
+    }
+
     fn prefers_prefix_classification(&self) -> bool {
         true
     }
@@ -185,15 +180,15 @@ impl Source for RangedZipSource {
     /// STORED entry that is a single small positioned read; a DEFLATE entry reads
     /// its (compressed) range and inflates just the prefix.
     fn content_prefix(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
-        let meta = self.meta_for(entry)?;
-        let start = self.data_start(meta)?;
-        match meta.method {
+        let (method, header_offset, data_len) = ranged_loc(entry)?;
+        let start = self.data_start(header_offset)?;
+        match method {
             Method::Stored => {
-                let want = (meta.data_len as usize).min(max);
+                let want = (data_len as usize).min(max);
                 Ok(Content::Owned(read_at(&self.file, start, want)?))
             }
             Method::Deflate => {
-                let raw = read_range_chunked(&self.file, start, meta.data_len)?;
+                let raw = read_range_chunked(&self.file, start, data_len)?;
                 let mut out = Vec::new();
                 flate2::read::DeflateDecoder::new(&raw[..])
                     .take(max as u64)
@@ -208,22 +203,22 @@ impl Source for RangedZipSource {
     /// exactly as [`ZipSource`](super::zip::ZipSource) does (STORED and DEFLATE
     /// alike). A recorded CRC of 0 is treated as "not recorded".
     fn integrity_check(&self, entry: &Entry) -> IntegrityCheck {
-        let Ok(meta) = self.meta_for(entry) else {
+        let Some(&expected) = self.crc_by_name.get(&entry.name) else {
             return IntegrityCheck::Unrecorded;
         };
-        if meta.crc32 == 0 {
+        if expected == 0 {
             return IntegrityCheck::Unrecorded;
         }
         let Ok(content) = self.content(entry) else {
             return IntegrityCheck::Unrecorded;
         };
         let actual = crc32fast::hash(&content);
-        if actual == meta.crc32 {
+        if actual == expected {
             IntegrityCheck::Verified { algorithm: "crc32" }
         } else {
             IntegrityCheck::Mismatch {
                 algorithm: "crc32",
-                expected: format!("{:08x}", meta.crc32),
+                expected: format!("{expected:08x}"),
                 actual: format!("{actual:08x}"),
             }
         }

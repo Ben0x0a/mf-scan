@@ -294,38 +294,33 @@ pub struct MatchRecord {
 }
 
 impl MatchRecord {
-    /// Assemble an archive-level record from an entry and one of its hits.
+    /// Assemble an archive-level record from an entry, one of its hits, and the
+    /// entry's resolved data start (`archive_data_start`) — the absolute archive
+    /// byte where its data begins, or `None` when the source cannot place it (a
+    /// loose/nested file, or a ranged header that failed to resolve).
     ///
     /// Centralised here (rather than in `main`) so the STORED-vs-DEFLATE offset
-    /// rule has a single, unit-tested home.
-    pub fn new(entry: &Entry, hit: SearchHit) -> Self {
-        // Derive the offset model from where the file lives. STORED: exact archive
-        // byte (`data_offset + hit.offset`). DEFLATE: no exact byte exists, so point
-        // at the compressed blob's start and let `compressed` flag the caveat. Loose:
-        // no archive at all, so `file_start` is 0 and `archive_offset` is `None`.
-        let (file_start, archive_offset, compressed) = match &entry.location {
-            Location::Zip {
-                method,
-                data_offset,
-                ..
-            } => {
-                let compressed = *method == Method::Deflate;
-                let archive_offset = if compressed {
-                    *data_offset
-                } else {
-                    *data_offset + hit.offset
-                };
-                (*data_offset, Some(archive_offset), compressed)
+    /// rule has a single, unit-tested home. Taking the data start as a parameter
+    /// (rather than reading it off `Location`) lets the *positioned-read* source
+    /// report the same exact offsets as the memory-mapped one: both resolve the
+    /// data start through [`crate::source::Source::archive_data_start`] and feed it
+    /// here, so the offset model no longer depends on which I/O path read the file.
+    pub fn new(entry: &Entry, hit: SearchHit, archive_data_start: Option<u64>) -> Self {
+        // Derive the offset model from the compression method and the resolved data
+        // start. STORED with a known start: exact archive byte (`start + offset`).
+        // DEFLATE: no exact byte exists, so point at the compressed blob's start and
+        // let `compressed` flag the caveat. No resolved start (loose/nested, or an
+        // unresolvable ranged header): no archive byte, `file_start` 0.
+        let compressed = entry.is_compressed();
+        let (file_start, archive_offset) = match (&entry.location, archive_data_start) {
+            // A top-level ZIP entry (mmap or ranged) with its data start resolved.
+            (Location::Zip { .. } | Location::RangedZip { .. }, Some(start)) => {
+                let offset = if compressed { start } else { start + hit.offset };
+                (start, Some(offset))
             }
-            Location::Loose { .. } => (0, None, false),
-            // Inside a nested archive: no single top-level archive byte, so the
-            // offsets are within the extracted file (like a loose file), but the
-            // entry can still be DEFLATE-compressed.
-            Location::Nested { method, .. } => (0, None, *method == Method::Deflate),
-            // A ranged (positioned-read) ZIP entry: the absolute data offset is
-            // not resolved at listing time, so report no absolute archive byte —
-            // the in-file offset is still exact.
-            Location::RangedZip { method, .. } => (0, None, *method == Method::Deflate),
+            // Loose, nested, or a ranged entry whose header could not be read: the
+            // match is still exact *within the file*, but there is no archive byte.
+            _ => (0, None),
         };
         Self {
             archive: None,
@@ -374,7 +369,7 @@ mod tests {
     #[test]
     fn stored_archive_offset_is_exact() {
         let entry = zip_entry(Method::Stored, 100, 50);
-        let rec = MatchRecord::new(&entry, hit());
+        let rec = MatchRecord::new(&entry, hit(), entry.archive_data_start());
         assert_eq!(rec.archive_offset, Some(117));
         assert_eq!(rec.file_start, 100);
         assert!(!rec.compressed);
@@ -383,10 +378,38 @@ mod tests {
     #[test]
     fn deflate_archive_offset_falls_back_to_file_start() {
         let entry = zip_entry(Method::Deflate, 100, 20);
-        let rec = MatchRecord::new(&entry, hit());
+        let rec = MatchRecord::new(&entry, hit(), entry.archive_data_start());
         assert_eq!(rec.archive_offset, Some(100)); // blob start, not 117
         assert_eq!(rec.file_offset, 17); // still the decompressed position
         assert!(rec.compressed);
+    }
+
+    /// A ranged (positioned-read) STORED entry reports the SAME exact archive
+    /// offset as the mmap path, once the source resolves its data start and feeds
+    /// it in — the unification that lets `ranged` be the default without losing the
+    /// carve coordinate. (`None` would be reported only if the header is unresolvable.)
+    #[test]
+    fn ranged_stored_archive_offset_is_exact_when_resolved() {
+        let entry = Entry {
+            name: "a".into(),
+            uncompressed_size: 50,
+            mtime: None,
+            location: Location::RangedZip {
+                method: Method::Stored,
+                header_offset: 40,
+                data_len: 50,
+            },
+        };
+        // The source resolved the data start to byte 100 (header + name/extra).
+        let rec = MatchRecord::new(&entry, hit(), Some(100));
+        assert_eq!(rec.archive_offset, Some(117));
+        assert_eq!(rec.file_start, 100);
+        assert!(!rec.compressed);
+
+        // Unresolvable header ⇒ no archive byte, but the in-file offset is intact.
+        let rec_none = MatchRecord::new(&entry, hit(), None);
+        assert_eq!(rec_none.archive_offset, None);
+        assert_eq!(rec_none.file_offset, 17);
     }
 
     #[test]
@@ -399,7 +422,7 @@ mod tests {
                 path: "/tmp/a".into(),
             },
         };
-        let rec = MatchRecord::new(&entry, hit());
+        let rec = MatchRecord::new(&entry, hit(), entry.archive_data_start());
         assert_eq!(rec.archive_offset, None); // no enclosing archive
         assert_eq!(rec.file_start, 0); // the file is its own data from byte 0
         assert_eq!(rec.file_offset, 17);

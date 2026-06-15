@@ -21,10 +21,11 @@ use crate::source::Source;
 use super::{MatchedFile, Progress, Query};
 
 /// Bytes of an entry's content read for header-first type classification (see the
-/// `content_prefix` branch in [`classify_entry`]). Generous enough to cover any
-/// file-format magic/header — file types are identified from their first bytes —
-/// while staying a tiny read over a network mount.
-const CLASSIFY_PREFIX: usize = 16 * 1024;
+/// `content_prefix` branch in [`classify_entry`]). File types are identified from
+/// a short magic at the very start, so a small page-sized read is plenty — and
+/// over a network mount, keeping it small is the point (one media file skipped is
+/// a few KB fetched instead of megabytes).
+const CLASSIFY_PREFIX: usize = 4 * 1024;
 
 /// How one entry was classified during the search pass — the per-entry input to
 /// the [`ScanStats`] fold. Kept private: it exists only to carry a skip reason
@@ -149,6 +150,7 @@ pub(super) fn classify_entry(
     // pre-classify on the encrypted header. A header read failure falls through to
     // the normal path below, which records it as unreadable.
     if decrypt.is_none()
+        && filter.may_skip_by_type()
         && source.prefers_prefix_classification()
         && let Ok(prefix) = source.content_prefix(entry, CLASSIFY_PREFIX)
     {
@@ -285,6 +287,11 @@ pub(super) fn classify_entry(
         (Vec::new(), None)
     } else {
         let offsets: Vec<u64> = hits.iter().map(|(hit, _)| hit.offset).collect();
+        // Resolve the entry's absolute data start ONCE for all of this file's
+        // matches (the mmap source reads it off the entry; the ranged source reads
+        // one Local File Header). Threaded into every record so STORED matches
+        // report their exact archive byte regardless of the I/O path.
+        let data_start = source.archive_data_start(entry);
         // One batch inspection call per entry: format detection and any per-file
         // inspector state (e.g. SQLite's schema map) are derived once for all of
         // this entry's matches instead of once per match.
@@ -297,7 +304,7 @@ pub(super) fn classify_entry(
         let records = hits
             .into_iter()
             .map(|(hit, encoding)| {
-                let mut record = MatchRecord::new(entry, hit);
+                let mut record = MatchRecord::new(entry, hit, data_start);
                 record.encoding = encoding;
                 if encoding == Encoding::Base64 {
                     record.decoded = query.decoded.map(str::to_string);
@@ -307,7 +314,7 @@ pub(super) fn classify_entry(
                     // byte is the entry's data start (None for a loose file), not an
                     // exact match position.
                     record.decrypted = true;
-                    record.archive_offset = entry.archive_data_start();
+                    record.archive_offset = data_start;
                 }
                 if deep {
                     // Positional: inspect_many returns one result per offset, in

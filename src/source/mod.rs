@@ -110,6 +110,23 @@ pub trait Source: Sync {
     /// small loose file), or a fresh memory map (a large loose file).
     fn content(&self, entry: &Entry) -> Result<Content<'_>>;
 
+    /// The absolute archive byte where `entry`'s data begins, if this source can
+    /// resolve it — so a match can report the exact offset of its bytes in the
+    /// underlying image (the carve coordinate an examiner needs).
+    ///
+    /// The default delegates to [`Entry::archive_data_start`], correct for a
+    /// memory-mapped [`zip::ZipSource`] (whose [`crate::models::Location::Zip`]
+    /// already carries the resolved data offset) and for sources with no enclosing
+    /// archive (folders, nested), which return `None`. The positioned-read
+    /// [`ranged::RangedZipSource`] overrides it to resolve the Local File Header
+    /// lazily — so a ranged scan reports the *same* exact offsets as the mmap path
+    /// without resolving every header at open. Resolved once per matched file (not
+    /// per match), and only for files that actually matched, so the cost is
+    /// negligible next to the search itself.
+    fn archive_data_start(&self, entry: &Entry) -> Option<u64> {
+        entry.archive_data_start()
+    }
+
     /// The source's physical size in bytes — the archive file size for a ZIP, the
     /// summed file sizes for a folder. Used only for the coverage report; the
     /// default sums the entries' logical sizes, which a backing store can override
