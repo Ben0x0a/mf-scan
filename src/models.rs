@@ -315,7 +315,11 @@ impl MatchRecord {
         let (file_start, archive_offset) = match (&entry.location, archive_data_start) {
             // A top-level ZIP entry (mmap or ranged) with its data start resolved.
             (Location::Zip { .. } | Location::RangedZip { .. }, Some(start)) => {
-                let offset = if compressed { start } else { start + hit.offset };
+                let offset = if compressed {
+                    start
+                } else {
+                    start + hit.offset
+                };
                 (start, Some(offset))
             }
             // Loose, nested, or a ranged entry whose header could not be read: the
