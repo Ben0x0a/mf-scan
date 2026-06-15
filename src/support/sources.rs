@@ -241,6 +241,12 @@ pub(crate) fn is_remote_path(path: &Path) -> bool {
     const SMB: i64 = 0x517B;
     const CIFS: i64 = 0xFF53_4D42;
     const SMB2: i64 = 0xFE53_4D42;
+    // `f_type` is `i64` on the glibc x86_64 target CI builds (where this cast is a
+    // no-op clippy flags), but its width varies by libc/arch (e.g. 32-bit, musl) —
+    // the cast normalises it so the `matches!` against the `i64` magics compiles
+    // everywhere. Keep it and silence the target-specific lint rather than break
+    // the other Linux targets.
+    #[allow(clippy::unnecessary_cast)]
     statfs(path)
         .map(|s| matches!(s.f_type as i64, NFS | SMB | CIFS | SMB2))
         .unwrap_or(false)
