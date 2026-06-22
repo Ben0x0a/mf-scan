@@ -36,6 +36,33 @@ use crate::util::sha256_hex;
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
 const HASH_HEX_LEN: usize = 10;
 
+/// Default cap on a written file's full destination path length, in characters.
+///
+/// WHY 260: classic Windows `MAX_PATH` is 260; an export that exceeds it cannot be
+/// opened by many Windows tools even though the bytes copied fine. Exported
+/// artefacts are evidence that routinely move between machines (often to Windows
+/// for analysis), so the guard is applied cross-platform to keep output portable —
+/// `--max-path-len 0` disables it. macOS/Linux additionally enforce a 255-character
+/// per-component limit, which is checked whenever the guard is active.
+pub const DEFAULT_MAX_PATH_LEN: usize = 260;
+
+/// The per-path-component (file/dir name) length limit enforced when the guard is
+/// active. 255 is the `NAME_MAX` of the common Unix filesystems and of NTFS.
+const MAX_COMPONENT_LEN: usize = 255;
+
+/// A file that was NOT written because its destination path would exceed the
+/// length guard — recorded (rather than silently dropped or truncated) so the
+/// analyst can re-export to a shorter root or raise `--max-path-len`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFile {
+    /// Path inside the source that was skipped.
+    pub internal_path: String,
+    /// The destination path that would have been written, relative to the dir.
+    pub output_path: String,
+    /// Why it was skipped (which limit it hit), for the operator and the report.
+    pub reason: String,
+}
+
 /// One file to export, with its assigned output location.
 pub struct ExportItem {
     pub internal_path: String,
@@ -142,6 +169,14 @@ pub enum ExportOutcome {
         skipped: usize,
         /// Each written file with its SHA-256 (main files and sidecars).
         report: Vec<ExportedFile>,
+        /// Files NOT written because the destination path cannot exist on THIS
+        /// platform (a single component over 255, or — on Windows — the absolute
+        /// path over the limit). Recorded, never silently dropped.
+        skipped_too_long: Vec<SkippedFile>,
+        /// Files that WERE written but whose relative output path exceeds the limit,
+        /// so they will not be extractable if the export is later moved to Windows
+        /// (raised only on non-Windows hosts, where the local write succeeds).
+        portability_warnings: Vec<SkippedFile>,
     },
     Refused {
         total_size: u64,
@@ -149,14 +184,84 @@ pub enum ExportOutcome {
     },
 }
 
-/// The export report: run metadata, an integrity summary, then every written
-/// file with its hashes.
+/// The verdict of the path-length guard for one file.
+enum PathCheck {
+    /// Safe to write, and portable.
+    Ok,
+    /// Cannot be written on the current platform — skip it (an error).
+    Skip(String),
+    /// Written here, but the relative path is too long for Windows — warn.
+    NotPortable(String),
+}
+
+/// Decide how the length guard treats one file, given the output directory, the
+/// file's relative `output_path`, and the limit (`0` disables the guard).
+///
+/// The rule (see the approved design):
+/// - any single path component over [`MAX_COMPONENT_LEN`] cannot exist on any
+///   common filesystem ⇒ `Skip` everywhere;
+/// - on **Windows**, the OS enforces the absolute-path limit, so an over-limit
+///   absolute path genuinely cannot be created ⇒ `Skip`;
+/// - on **other platforms**, the local write succeeds (PATH_MAX is far larger), so
+///   the file is exported, but if its RELATIVE path already exceeds the limit it
+///   could never be re-extracted under any Windows directory ⇒ `NotPortable`
+///   (a warning). WHY measure the relative path off-Windows: the absolute length
+///   depends on the operator's chosen output directory and the eventual Windows
+///   root, neither fixed; the relative path is the portable, machine-independent
+///   part — if it alone exceeds the limit, no Windows host can hold it.
+fn check_export_path(dir: &Path, output_path: &str, max_path_len: usize) -> PathCheck {
+    if max_path_len == 0 {
+        return PathCheck::Ok;
+    }
+    // A component longer than the filesystem's NAME_MAX is unwritable everywhere.
+    for component in output_path.split('/') {
+        let len = component.chars().count();
+        if len > MAX_COMPONENT_LEN {
+            return PathCheck::Skip(format!(
+                "path component length {len} exceeds the {MAX_COMPONENT_LEN}-char filesystem limit"
+            ));
+        }
+    }
+
+    if cfg!(target_os = "windows") {
+        let abs_len = dir
+            .join(output_path)
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .count();
+        if abs_len > max_path_len {
+            return PathCheck::Skip(format!(
+                "absolute path length {abs_len} exceeds the Windows MAX_PATH limit {max_path_len}"
+            ));
+        }
+        PathCheck::Ok
+    } else {
+        let rel_len = output_path.chars().count();
+        if rel_len > max_path_len {
+            return PathCheck::NotPortable(format!(
+                "export path length {rel_len} exceeds {max_path_len} — this file will not be extractable on Windows"
+            ));
+        }
+        PathCheck::Ok
+    }
+}
+
+/// The export report: run metadata, an integrity summary, every written file with
+/// its hashes, and any files skipped for an over-length destination path.
 #[derive(Serialize)]
 struct ExportReport<'a> {
     run: &'a RunInfo,
     file_count: usize,
     integrity: IntegritySummary,
     files: &'a [ExportedFile],
+    /// Files not written because their path could not exist on this platform.
+    /// Omitted from the JSON when empty so a clean export's report is unchanged.
+    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
+    skipped_too_long: &'a [SkippedFile],
+    /// Files written but whose path is too long to move to Windows. Omitted when empty.
+    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
+    portability_warnings: &'a [SkippedFile],
 }
 
 /// Aggregate integrity outcome over all exported files, surfaced at the head of
@@ -204,13 +309,22 @@ impl IntegritySummary {
     }
 }
 
-/// Write the export report (run metadata + integrity summary + per-file hashes).
-pub fn write_export_report(run: &RunInfo, files: &[ExportedFile], w: &mut dyn Write) -> Result<()> {
+/// Write the export report (run metadata + integrity summary + per-file hashes,
+/// plus any files skipped for an over-length path).
+pub fn write_export_report(
+    run: &RunInfo,
+    files: &[ExportedFile],
+    skipped_too_long: &[SkippedFile],
+    portability_warnings: &[SkippedFile],
+    w: &mut dyn Write,
+) -> Result<()> {
     let report = ExportReport {
         run,
         file_count: files.len(),
         integrity: IntegritySummary::of(files),
         files,
+        skipped_too_long,
+        portability_warnings,
     };
     serde_json::to_writer_pretty(&mut *w, &report).context("failed writing export report")?;
     writeln!(w).context("failed writing export report")?;
@@ -256,6 +370,97 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
     ExportPlan { items, total_size }
 }
 
+/// Build an export plan that PRESERVES each file's directory tree under a
+/// per-container label — the layout the `app export` path wants (one output
+/// subfolder per app container, real names retained).
+///
+/// `roots` is a list of `(prefix, label)` pairs: `prefix` is a resolved source
+/// path prefix (an app's data container, an extension/widget container, an App
+/// Group, or a backup domain) and `label` is the output subfolder it maps to
+/// (e.g. `"com.app/AppData_5A92C2C1"`). Each file is attributed to the LONGEST
+/// matching prefix, that prefix is stripped, and the remaining relative path is
+/// rebuilt under `label` with every segment host-sanitised so the on-device tree
+/// is mirrored safely under the destination.
+///
+/// WHY longest-prefix wins: containers can nest (an extension container may sit
+/// inside another registered directory), so the most specific owner must claim the
+/// file — the same rule [`crate::ios::containers::AppContainerMap::resolve`] uses.
+/// WHY per-segment sanitisation (not a single `safe_join` at write time): the tree
+/// is reconstructed here, so each component must be made host-safe as it is built;
+/// re-ingestion still passes through [`safe_join`], which rejects any `..`.
+pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPlan {
+    let mut total_size = 0u64;
+    let items = files
+        .iter()
+        .map(|file| {
+            total_size += file.entry.uncompressed_size;
+            let path = file.entry.name.as_str();
+            // The longest `prefix` that contains this file, with the file's path
+            // relative to that prefix.
+            let best = roots
+                .iter()
+                .filter_map(|(prefix, label)| {
+                    relative_under(prefix, path).map(|rel| (prefix.len(), label, rel))
+                })
+                .max_by_key(|(prefix_len, _, _)| *prefix_len);
+
+            let (folder, name) = match best {
+                Some((_, label, rel)) => {
+                    let (dirs, base) = split_dir_base(rel);
+                    let mut folder = label.clone();
+                    for seg in dirs {
+                        folder.push('/');
+                        folder.push_str(&sanitise_segment(seg));
+                    }
+                    (folder, sanitise_segment(base))
+                }
+                // Defensive: a file under no root keeps the flat hashed layout
+                // rather than being lost (should not happen — callers pass only
+                // files gathered from these prefixes).
+                None => {
+                    let name = sanitise_basename(path);
+                    (format!("{name}_{}", path_hash(path)), name)
+                }
+            };
+
+            ExportItem {
+                internal_path: file.entry.name.clone(),
+                file_start: file.entry.archive_data_start().unwrap_or(0),
+                folder,
+                name,
+                size: file.entry.uncompressed_size,
+                compressed: file.entry.is_compressed(),
+                offsets: file.offsets.clone(),
+            }
+        })
+        .collect();
+
+    ExportPlan { items, total_size }
+}
+
+/// The portion of `path` inside container `prefix`: `Some("")` when `path` IS the
+/// prefix, `Some(rest)` when `path` is `prefix/rest`, `None` when `path` is not
+/// under `prefix`. Mirrors the segment-boundary rule in `AppContainerMap`.
+fn relative_under<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+}
+
+/// Split a `/`-separated relative path into its directory segments and basename,
+/// dropping empty segments. `"Library/Caches/x.db"` → `(["Library","Caches"], "x.db")`.
+fn split_dir_base(rel: &str) -> (Vec<&str>, &str) {
+    match rel.rfind('/') {
+        Some(pos) => (
+            rel[..pos].split('/').filter(|s| !s.is_empty()).collect(),
+            &rel[pos + 1..],
+        ),
+        None => (Vec::new(), rel),
+    }
+}
+
 /// Write the plan as a re-ingestable JSON manifest.
 ///
 /// `run` records the query and filters (and the source archive paths) at the
@@ -284,6 +489,7 @@ pub fn export_files(
     files: &[MatchedFile],
     dir: &Path,
     max_size: Option<u64>,
+    max_path_len: usize,
 ) -> Result<ExportOutcome> {
     if let Some(cap) = max_size
         && plan.total_size > cap
@@ -302,11 +508,33 @@ pub fn export_files(
         .collect();
 
     let mut report: Vec<ExportedFile> = Vec::new();
+    let mut skipped_too_long: Vec<SkippedFile> = Vec::new();
+    let mut portability_warnings: Vec<SkippedFile> = Vec::new();
     let mut bytes = 0u64;
     for (item, file) in plan.items.iter().zip(files) {
+        let output_path = item.output_path();
+        let dest = dir.join(&item.folder).join(&item.name);
+        // Length guard BEFORE reading content: an unwritable destination means we
+        // never read its bytes, recording it instead. A non-portable (but locally
+        // writable) path is still exported, with a warning recorded.
+        match check_export_path(dir, &output_path, max_path_len) {
+            PathCheck::Skip(reason) => {
+                skipped_too_long.push(SkippedFile {
+                    internal_path: file.entry.name.clone(),
+                    output_path,
+                    reason,
+                });
+                continue;
+            }
+            PathCheck::NotPortable(reason) => portability_warnings.push(SkippedFile {
+                internal_path: file.entry.name.clone(),
+                output_path,
+                reason,
+            }),
+            PathCheck::Ok => {}
+        }
         // Content is read (and decompressed/read-from-disk) once, here.
         let content = source.content(&file.entry)?;
-        let dest = dir.join(&item.folder).join(&item.name);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -335,6 +563,8 @@ pub fn export_files(
         bytes,
         skipped: 0,
         report,
+        skipped_too_long,
+        portability_warnings,
     })
 }
 
@@ -354,6 +584,7 @@ pub fn export_from_manifest(
     source: &dyn Source,
     dir: &Path,
     max_size: Option<u64>,
+    max_path_len: usize,
 ) -> Result<ExportOutcome> {
     if let Some(cap) = max_size
         && manifest.total_size > cap
@@ -368,6 +599,8 @@ pub fn export_from_manifest(
     let by_path: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
     let mut report: Vec<ExportedFile> = Vec::new();
+    let mut skipped_too_long: Vec<SkippedFile> = Vec::new();
+    let mut portability_warnings: Vec<SkippedFile> = Vec::new();
     let mut bytes = 0u64;
     let mut skipped = 0usize;
     for entry in &manifest.files {
@@ -375,8 +608,25 @@ pub fn export_from_manifest(
             skipped += 1; // listed file is absent from this archive
             continue;
         };
-        let content = source.content(found)?;
         let dest = safe_join(dir, &entry.output_path);
+        // Same length guard as a fresh export.
+        match check_export_path(dir, &entry.output_path, max_path_len) {
+            PathCheck::Skip(reason) => {
+                skipped_too_long.push(SkippedFile {
+                    internal_path: entry.internal_path.clone(),
+                    output_path: entry.output_path.clone(),
+                    reason,
+                });
+                continue;
+            }
+            PathCheck::NotPortable(reason) => portability_warnings.push(SkippedFile {
+                internal_path: entry.internal_path.clone(),
+                output_path: entry.output_path.clone(),
+                reason,
+            }),
+            PathCheck::Ok => {}
+        }
+        let content = source.content(found)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -404,6 +654,8 @@ pub fn export_from_manifest(
         bytes,
         skipped,
         report,
+        skipped_too_long,
+        portability_warnings,
     })
 }
 
@@ -533,12 +785,22 @@ fn path_hash(path: &str) -> String {
 
 /// Reduce an internal path to a host-safe basename.
 ///
-/// Strips the directory part, replaces characters illegal on Windows/Unix with
-/// `_`, trims trailing dots/spaces (which Windows rejects), and falls back to a
-/// placeholder for an empty result (e.g. a directory entry).
+/// Strips the directory part, then sanitises the last segment via
+/// [`sanitise_segment`].
 fn sanitise_basename(path: &str) -> String {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    let mut name: String = base
+    sanitise_segment(path.rsplit('/').next().unwrap_or(path))
+}
+
+/// Make one path component host-safe.
+///
+/// Replaces characters illegal on Windows/Unix with `_`, trims trailing dots and
+/// spaces (which Windows rejects), and falls back to a placeholder for an empty
+/// result (e.g. a directory placeholder entry). WHY a per-segment helper:
+/// [`plan_tree`] rebuilds a whole relative tree and must sanitise every segment,
+/// not just the basename — both callers share this one rule so the two layouts
+/// can never sanitise differently.
+fn sanitise_segment(segment: &str) -> String {
+    let mut name: String = segment
         .chars()
         .map(|c| {
             if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
@@ -594,7 +856,88 @@ impl From<&ExportItem> for ManifestEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::MatchedFile;
+    use crate::models::{Entry, Location};
     use std::path::PathBuf;
+
+    /// A loose-file [`MatchedFile`] at `name` of `size` bytes, for the planner tests.
+    fn loose(name: &str, size: u64) -> MatchedFile {
+        MatchedFile {
+            entry: Entry {
+                name: name.to_string(),
+                uncompressed_size: size,
+                mtime: None,
+                location: Location::Loose { path: name.into() },
+            },
+            offsets: Vec::new(),
+        }
+    }
+
+    /// `plan_tree` preserves the directory tree under a per-container label, and
+    /// routes each file to the LONGEST matching root prefix.
+    #[test]
+    fn plan_tree_preserves_tree_under_longest_root() {
+        let files = [
+            loose("/c/Data/App/GUID/Library/Preferences/x.plist", 10),
+            loose("/c/Data/App/GUID/Extra/GUID2/y.db", 20),
+        ];
+        let roots = [
+            (
+                "/c/Data/App/GUID".to_string(),
+                "id/AppData_GUID".to_string(),
+            ),
+            // A deeper, more specific root that must win for the second file.
+            (
+                "/c/Data/App/GUID/Extra/GUID2".to_string(),
+                "id/Extension_GUID2".to_string(),
+            ),
+        ];
+        let plan = plan_tree(&files, &roots);
+
+        assert_eq!(plan.total_size, 30);
+        assert_eq!(plan.items[0].folder, "id/AppData_GUID/Library/Preferences");
+        assert_eq!(plan.items[0].name, "x.plist");
+        // The second file is under both roots; the longest (the extension) wins.
+        assert_eq!(plan.items[1].folder, "id/Extension_GUID2");
+        assert_eq!(plan.items[1].name, "y.db");
+    }
+
+    /// The path-length guard: a safe path passes, `0` disables it, a >255-char
+    /// component is unwritable everywhere (`Skip`), and a long relative path is a
+    /// portability warning on non-Windows (the host these tests run on).
+    #[test]
+    fn path_length_guard_classifies_paths() {
+        let dir = Path::new("/out");
+        assert!(matches!(
+            check_export_path(dir, "app/file.db", 260),
+            PathCheck::Ok
+        ));
+        // Disabled guard never flags anything.
+        assert!(matches!(
+            check_export_path(dir, &"a".repeat(300), 0),
+            PathCheck::Ok
+        ));
+        // A single component over 255 cannot exist on any filesystem.
+        let long_component = format!("{}/f", "b".repeat(300));
+        assert!(matches!(
+            check_export_path(dir, &long_component, 100_000),
+            PathCheck::Skip(_)
+        ));
+    }
+
+    /// On a non-Windows host, an over-limit RELATIVE path is exported but flagged
+    /// as not Windows-portable (rather than skipped).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn long_relative_path_is_a_portability_warning_off_windows() {
+        let dir = Path::new("/out");
+        // 300 single-char segments: no component exceeds 255, but the whole path does.
+        let rel = vec!["a"; 300].join("/");
+        assert!(matches!(
+            check_export_path(dir, &rel, 260),
+            PathCheck::NotPortable(_)
+        ));
+    }
 
     /// `safe_join` must not let a backslash-encoded traversal escape the destination.
     ///

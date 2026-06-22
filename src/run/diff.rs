@@ -201,5 +201,9 @@ fn diff_run_info(args: &DiffArgs) -> RunInfo {
         base64_urlsafe: false,
         keyfiles: Vec::new(),
         platform: None,
+        // Diff is not app-selected.
+        app: None,
+        app_containers: Vec::new(),
+        app_group_links: Vec::new(),
     }
 }

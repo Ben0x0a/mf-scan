@@ -91,6 +91,19 @@ impl AppContainerMap {
         self.map.is_empty()
     }
 
+    /// Iterate every `(container_dir, bundle_id)` pair the scan registered.
+    ///
+    /// WHY this complements [`AppContainerMap::resolve`]: `resolve` answers the
+    /// forward question "which app owns this path?" (used by the search-result
+    /// annotation), whereas the `app` subcommand needs the *inverse* — "which
+    /// container directories belong to this app?" — built by inverting these pairs.
+    /// Exposing the raw pairs (rather than a second internal index) keeps this
+    /// struct the single source of truth for the container→identifier mapping; the
+    /// caller groups them however it needs.
+    pub fn containers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.map.iter().map(|(dir, id)| (dir.as_str(), id.as_str()))
+    }
+
     /// Return the bundle ID for the innermost container whose directory path is
     /// a prefix of `path`, comparing on `/`-segment boundaries.
     ///

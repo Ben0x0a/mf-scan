@@ -9,11 +9,15 @@
 //! Uses: `clap` (derive) and the submodules below. Shared value types and the
 //! flatten argument groups live in `common`; no search/IO logic lives here.
 
+mod app;
 mod common;
 mod diff;
 mod export;
 mod grep;
 
+pub(crate) use app::{
+    AppArgs, AppCommand, AppExportArgs, AppGrepArgs, AppPathsArgs, AppSourceArgs,
+};
 pub(crate) use common::{ColourWhen, DecryptArgs, ExportSink};
 pub(crate) use diff::DiffArgs;
 pub(crate) use export::ExportArgs;
@@ -43,6 +47,8 @@ pub(crate) enum Command {
     Export(ExportArgs),
     /// Diff two sources (archives or folders): which files were added/removed/modified.
     Diff(DiffArgs),
+    /// Locate and export an application's data (iOS FFS / iOS backup / Android).
+    App(AppArgs),
 }
 
 #[cfg(test)]

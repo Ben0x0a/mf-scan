@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use mf_scan::engine::{Findings, MatchedFile};
 use mf_scan::models::RunInfo;
 use mf_scan::report::export::{
-    self, ExportOutcome, ExportedFile, IntegritySummary, StoredIntegrity,
+    self, ExportOutcome, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
 };
 use mf_scan::source::Source;
 
@@ -69,19 +69,36 @@ pub(crate) fn run_export_sink(
     }
 
     if let Some(dir) = &sink.export {
-        match export::export_files(&plan, source, files, dir, Some(sink.max_size))? {
+        match export::export_files(
+            &plan,
+            source,
+            files,
+            dir,
+            Some(sink.max_size),
+            sink.max_path_len,
+        )? {
             ExportOutcome::Exported {
                 files: n,
                 bytes,
                 report,
+                skipped_too_long,
+                portability_warnings,
                 ..
             } => {
-                write_export_report_file(dir, run, &report)?;
+                write_export_report_file(
+                    dir,
+                    run,
+                    &report,
+                    &skipped_too_long,
+                    &portability_warnings,
+                )?;
                 eprintln!(
                     "exported {n} {what} file(s) ({bytes} bytes) to {}",
                     dir.display()
                 );
                 report_integrity(&report);
+                report_skipped_too_long(&skipped_too_long);
+                report_portability_warnings(&portability_warnings);
             }
             ExportOutcome::Refused { total_size, cap } => {
                 eprintln!(
@@ -101,7 +118,7 @@ pub(crate) fn run_export_sink(
 /// single reassuring line. Any failure — a written copy that differs from the
 /// source bytes, or an encrypted blob that didn't match its `Manifest.db` SHA-1
 /// — is printed loudly, one line per offending file, so it can't be missed.
-fn report_integrity(report: &[ExportedFile]) {
+pub(crate) fn report_integrity(report: &[ExportedFile]) {
     let summary = IntegritySummary::of(report);
     if summary.stored_digest_verified > 0 {
         // Name the algorithm(s) that attested the stored bytes (a backup's SHA-1
@@ -142,6 +159,40 @@ fn report_integrity(report: &[ExportedFile]) {
     }
 }
 
+/// Announce, loudly, any files that were not written because their destination
+/// path exceeded the length guard — one line per file, so a portability problem
+/// (typically Windows `MAX_PATH`) cannot pass unnoticed. The files are also listed
+/// in `export-report.json`.
+pub(crate) fn report_skipped_too_long(skipped: &[SkippedFile]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "⚠ {} file(s) NOT exported — destination path too long (raise --max-path-len, or export to a shorter directory):",
+        skipped.len()
+    );
+    for f in skipped {
+        eprintln!("  ⚠ skipped: {} ({})", f.internal_path, f.reason);
+    }
+}
+
+/// Announce files that were exported but whose path is too long to survive a move
+/// to Windows — a warning (the files ARE on disk here), so an analyst who will hand
+/// the export to a Windows examiner knows which files would be unreachable there.
+pub(crate) fn report_portability_warnings(warnings: &[SkippedFile]) {
+    if warnings.is_empty() {
+        return;
+    }
+    eprintln!(
+        "⚠ {} file(s) exported but NOT Windows-portable (path too long for MAX_PATH); \
+         they are present here but would be unreachable on Windows:",
+        warnings.len()
+    );
+    for f in warnings {
+        eprintln!("  ⚠ not portable: {} ({})", f.internal_path, f.reason);
+    }
+}
+
 /// The distinct stored-digest algorithm names seen among verified files, joined
 /// for the integrity summary line (e.g. `"sha1"`, `"crc32"`, or `"sha1, crc32"`
 /// if a run mixed sources).
@@ -164,11 +215,13 @@ pub(crate) fn write_export_report_file(
     dir: &Path,
     run: &RunInfo,
     report: &[export::ExportedFile],
+    skipped_too_long: &[SkippedFile],
+    portability_warnings: &[SkippedFile],
 ) -> Result<()> {
     let path = dir.join("export-report.json");
     let file = File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
     let mut w = BufWriter::new(file);
-    export::write_export_report(run, report, &mut w)?;
+    export::write_export_report(run, report, skipped_too_long, portability_warnings, &mut w)?;
     w.flush().context("failed flushing export report")?;
     eprintln!(
         "export report: {} files -> {}",

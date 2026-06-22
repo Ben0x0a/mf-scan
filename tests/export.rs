@@ -36,6 +36,9 @@ fn run_info() -> RunInfo {
         base64_urlsafe: false,
         keyfiles: vec![],
         platform: None,
+        app: None,
+        app_containers: vec![],
+        app_group_links: vec![],
     }
 }
 
@@ -123,6 +126,7 @@ fn export_writes_files_under_their_folders() {
         &findings.files,
         dir.path(),
         None,
+        0,
     )
     .unwrap();
     match outcome {
@@ -168,6 +172,7 @@ fn export_includes_sqlite_sidecars() {
         &findings.files,
         dir.path(),
         None,
+        0,
     )
     .unwrap();
     match outcome {
@@ -196,6 +201,7 @@ fn export_report_attests_copy_and_zip_crc() {
         &findings.files,
         dir.path(),
         None,
+        0,
     )
     .unwrap();
     let report = match outcome {
@@ -278,6 +284,7 @@ fn export_refuses_when_over_max_size() {
         &findings.files,
         dir.path(),
         Some(10),
+        0,
     )
     .unwrap();
     match outcome {
@@ -302,9 +309,14 @@ fn export_from_manifest_round_trips() {
     let manifest = export::read_manifest(&buf[..]).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let outcome =
-        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), dir.path(), None)
-            .unwrap();
+    let outcome = export::export_from_manifest(
+        &manifest,
+        &ZipSource::open(&zip).unwrap(),
+        dir.path(),
+        None,
+        0,
+    )
+    .unwrap();
     match outcome {
         ExportOutcome::Exported { files, skipped, .. } => {
             assert_eq!(files, 2);
@@ -340,9 +352,14 @@ fn export_from_manifest_skips_missing_entries() {
     };
     let dir = tempfile::tempdir().unwrap();
 
-    let outcome =
-        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), dir.path(), None)
-            .unwrap();
+    let outcome = export::export_from_manifest(
+        &manifest,
+        &ZipSource::open(&zip).unwrap(),
+        dir.path(),
+        None,
+        0,
+    )
+    .unwrap();
     match outcome {
         ExportOutcome::Exported { files, skipped, .. } => {
             assert_eq!(files, 0);

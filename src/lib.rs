@@ -14,6 +14,8 @@
 //!   • `export` / `preset` — file/manifest export and the behaviour-preset schema.
 //!   • `ios` — iOS-specific artefact resolution (container GUID → bundle-ID map,
 //!     etc.).
+//!   • `apps` — locate and select an application's data across acquisition types
+//!     (iOS FFS / iOS backup / Android), powering the `app` subcommand.
 //! Used by: `main.rs` (the binary) and everything under `tests/`.
 //! Uses: the modules it declares.
 //!
@@ -21,6 +23,7 @@
 //! in `main.rs`) lets `tests/` link against it directly, which is the standard
 //! Rust layout for a tool that wants both a CLI and a tested core.
 
+pub mod apps;
 pub mod decrypt;
 pub mod diff;
 pub mod engine;

@@ -394,6 +394,10 @@ fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bo
             .decrypt
             .platform
             .map(|p| p.to_platform().as_str().to_string()),
+        // Search runs are not app-selected; the `app export` path fills these.
+        app: None,
+        app_containers: Vec::new(),
+        app_group_links: Vec::new(),
     }
 }
 

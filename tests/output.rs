@@ -29,6 +29,9 @@ fn run_info() -> RunInfo {
         base64_urlsafe: false,
         keyfiles: vec![],
         platform: None,
+        app: None,
+        app_containers: vec![],
+        app_group_links: vec![],
     }
 }
 

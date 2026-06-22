@@ -7,13 +7,14 @@ argument parsing, source resolution, and I/O.
 ```
 src/
   lib.rs        library root (declares the modules below)
-  main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff
+  main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff | App
   cli/          BINARY: clap argument structs, split per subcommand
     mod.rs        Cli + Command enum
-    grep.rs export.rs diff.rs   per-subcommand args
+    grep.rs export.rs diff.rs app.rs   per-subcommand args (app.rs: grep/paths/export)
     common.rs     shared value types + size parser + the flatten arg-groups
                   (FilterArgs / DecryptArgs / ExportSink) reused by grep & diff
-  run/          BINARY: one orchestrator per command (grep.rs / export.rs / diff.rs)
+  run/          BINARY: one orchestrator per command (grep.rs / export.rs / diff.rs /
+                app.rs)
   support/      BINARY: machinery the commands share — sources (resolve operands),
                 presets, decryption setup, progress reporter, reporting, exporting
 
@@ -40,6 +41,17 @@ src/
       source/     BackupSource enum (build/record + Source dispatch) over its two
                   variants: encrypted::EncryptedBackupSource (decrypts lazily),
                   plain::PlainBackupSource (unencrypted, no crypto)
+  apps/         locate & export an app's data across acquisition types (the `app`
+                subcommand). Layered ON TOP of a Source — search stays app-agnostic.
+    mod.rs        thin dispatcher: re-exports the surface below
+    types.rs      Platform, ContainerKind, GroupLink, AppContainer, AppSummary
+    catalog.rs    AppCatalog (build/inventory/containers_for) + detect + tally
+    ios_ffs.rs    iOS-FFS containers (reuses ios::containers) + entitlement groups
+    ios_backup.rs iOS-backup domains (over ios::backup's domain/relativePath view)
+    android.rs    Android package-under-storage-root resolution
+    entitlements.rs  Mach-O code-signature reader: app's authoritative App Groups
+                  (NOTE: overlaps ios/ — a future restructure groups both under
+                  platform/; see tasks/structure-refactor.md)
   search/       per-entry byte search: scan.rs (regex + line preview)
   engine/       orchestration: search_source over a Source -> Findings
     mod.rs        drivers + Findings/Query/Progress; classify.rs is the per-entry body
@@ -52,7 +64,8 @@ src/
     value_diff.rs  shared JSON-tree diff used by json + plist
     media/        the `media` category (classification only)
   report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
-                stored-digest integrity) · diff.rs
+                stored-digest integrity; flat `plan` for search hits + tree-preserving
+                `plan_tree` for `app export`; the --max-path-len guard) · diff.rs
 ```
 
 ## Module dependencies

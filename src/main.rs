@@ -32,5 +32,6 @@ fn main() -> Result<()> {
         Command::Grep(args) => run::run_grep(args),
         Command::Export(args) => run::run_export(args),
         Command::Diff(args) => run::run_diff(args),
+        Command::App(args) => run::run_app(args),
     }
 }

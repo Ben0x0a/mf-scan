@@ -37,6 +37,13 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   annotated with the owning app's bundle ID (e.g. `com.apple.MobileSMS`), read from
   the `.com.apple.mobile_container_manager.metadata.plist` files that iOS places in
   every container. Missing or unreadable metadata files are silently skipped.
+- **Locate & export an app's data** (`mf-scan app`): given a bundle id / package,
+  find **every** place an app's data lives — its own container, its
+  extension/**widget** containers, and its shared **App Groups** — and export the
+  lot, one tidy subfolder per container. Works on iOS full-file-system, iOS backups,
+  and Android. App Groups are attributed **authoritatively** from the app binary's
+  code-signature entitlements (with a vendor-token heuristic fallback). See
+  [`app`](#app).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
 - **Find base64-encoded values** (`--base64`), **find files by path**
@@ -87,19 +94,29 @@ mf-scan export case.zip --from-manifest hits.json --to ./exported --max-size 500
 
 # Diff two acquisitions: which files changed, and what changed inside them
 mf-scan diff before.zip after.zip --exact --inspect
+
+# List the installed apps in an acquisition (filter by name/id)
+mf-scan app grep case.zip whatsapp
+
+# Show every place one app's data lives (own data + widgets/extensions + groups)
+mf-scan app paths case.zip com.whatsapp.WhatsApp
+
+# Export all of an app's data out, one subfolder per container
+mf-scan app export case.zip com.whatsapp.WhatsApp --to ./whatsapp_data
 ```
 
 ---
 
 ## Commands
 
-mf-scan has three subcommands:
+mf-scan has four subcommands:
 
 | Command | Purpose |
 |---|---|
 | `grep PATTERN SOURCE...` | Search one or more sources (archives and/or directories); print/record matches; optionally export files. |
 | `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep` or `diff`) and copy the listed files out (no search). |
 | `diff A B` | Compare two sources (archives or folders): report added / removed / modified files, optionally what changed inside them, and optionally export the changed files. |
+| `app {grep\|paths\|export}` | Locate and export an application's data (iOS FFS / iOS backup / Android) — by bundle id / package, including widgets/extensions and App Groups. |
 
 ### Sources, `--dir-mode`, and `-r`
 
@@ -147,6 +164,7 @@ With more than one source, each result is tagged with its origin (see
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
 | `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
 | `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
+| `--max-path-len N` | Path-length guard for the export (default `260`, Windows `MAX_PATH`). On Windows an over-limit path is skipped+recorded; elsewhere it is exported but flagged non-portable. `0` disables. See [`app`](#app). |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
 | `--io-mode auto\|mmap\|ranged` | How to read an archive: `auto` (default) memory-maps a local archive but uses **positioned reads** for a remote SMB/NFS source; `ranged` forces positioned reads, `mmap` forces mapping. See [Remote / network sources](#remote--network-sources). |
 | `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: beside `-o`, else `mf-scan-report.json`. |
@@ -158,11 +176,12 @@ With more than one source, each result is tagged with its origin (see
 ### `export`
 
 ```
-mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE]
+mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE] [--max-path-len N]
 ```
 
 Re-ingests a manifest written by `grep --manifest` (or `diff --manifest`) and copies
-the listed files out of the archive — **without searching again**. Honours `--max-size`.
+the listed files out of the archive — **without searching again**. Honours
+`--max-size` and the `--max-path-len` guard (see [`app`](#app)).
 
 > **Vocabulary:** *export* = copy files out; *extract* is reserved for extracting
 > *meaning* (the `--inspect` analysis).
@@ -189,6 +208,51 @@ may be an archive or a `--dir-mode` directory.
 By default `diff` uses **mtime + size** (fast); add `--exact` when a content-preserving
 timestamp could hide a change. See [docs/diff.md](docs/diff.md) for the full report
 schema and the comparison rules.
+
+### `app`
+
+Locate and export an application's data, by bundle id (iOS) or package name
+(Android). mf-scan auto-detects the acquisition layout — iOS full-file-system, iOS
+backup, or Android — and resolves an app to **all** of its containers: its own data,
+its extension/**widget** containers, and its shared **App Groups**.
+
+```
+mf-scan app grep   SOURCE [PATTERN] [options]     # search the installed-app inventory
+mf-scan app paths  SOURCE BUNDLE_ID [options]     # list every data location of one app
+mf-scan app export SOURCE BUNDLE_ID --to DIR [options]   # copy one app's data out
+```
+
+> The **SOURCE comes first** in every `app` verb (the optional `PATTERN` on `grep`
+> forces it). Open a directory source with `--dir-mode`; unlock an encrypted iOS
+> backup with `--backup-password` (or `MFSCAN_BACKUP_PASSWORD`).
+
+| Verb | What it does |
+|---|---|
+| `grep` | Lists one line per installed app: bundle id, display name, container count, total size. An optional `PATTERN` filters by a substring of the id/name. |
+| `paths` | Lists every container the app or its dependencies can write to, tagged by kind (`AppData` / `Extension` / `AppGroup` / `Bundle`, or the Android storage root) and — for groups — by how it was attributed (`Entitlement` vs `VendorHeuristic`). |
+| `export` | Copies all of the app's data out, **one subfolder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain), and writes `export-report.json` with per-file integrity. Excludes the `.app` bundle (binary, not data). |
+
+Common `app` flags: `--dir-mode`, `--archive-depth N`, `--io-mode`,
+`--backup-password`, `-f/--format txt|json`, `-o/--output FILE`; for `paths`/`export`
+also `--no-groups`; for `export` also `--to DIR`, `--max-size SIZE`,
+`--max-path-len N`, `--verify`.
+
+**App Group attribution.** An app's App Groups are read **authoritatively** from the
+app binary's code-signature entitlements (`com.apple.security.application-groups`) —
+so a cross-brand shared group (e.g. `group.com.facebook.family` used by Instagram) is
+found even though its name shares no token with the app. When the binary can't be
+read (always for a backup, which ships no executable), mf-scan falls back to a
+reverse-DNS **vendor-token heuristic** and tags every such inclusion
+`VendorHeuristic` in the output and report so it can be audited. Use `--no-groups` to
+exclude shared containers entirely.
+
+**Path-length guard (`--max-path-len`, default 260).** Deep on-device trees can
+produce paths longer than Windows' `MAX_PATH`. On Windows an over-limit path cannot
+be written, so the file is **skipped and recorded** (`skipped_too_long` in the
+report). On macOS/Linux the file **is** exported, but if its path is too long to
+survive a move to Windows it is flagged as a **portability warning**
+(`portability_warnings`). `--max-path-len 0` disables the guard. The same flag
+applies to `grep`/`diff` `--export` and to the `export` subcommand.
 
 ---
 

@@ -140,6 +140,12 @@ pub(crate) struct ExportSink {
     /// Defaults to 1G as an accident guard; raise it to export more.
     #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
     pub(crate) max_size: u64,
+
+    /// Skip (and record) any file whose destination path would exceed this many
+    /// characters. Defaults to 260 (Windows MAX_PATH) so exported evidence stays
+    /// portable to Windows; 0 disables the guard.
+    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN)]
+    pub(crate) max_path_len: usize,
 }
 
 /// Parse a human size like `1024`, `200KB`, `50M`, `2G` into bytes (1024-based).

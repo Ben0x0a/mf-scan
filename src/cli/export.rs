@@ -32,6 +32,11 @@ pub(crate) struct ExportArgs {
     #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
     pub(crate) max_size: u64,
 
+    /// Skip (and record) any file whose destination path would exceed this many
+    /// characters. Defaults to 260 (Windows MAX_PATH); 0 disables the guard.
+    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN)]
+    pub(crate) max_path_len: usize,
+
     /// Hash the archive (SHA-256) before and after the run and report whether it
     /// changed — a slower, court-defensible integrity attestation.
     #[arg(long = "verify")]

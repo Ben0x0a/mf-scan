@@ -56,6 +56,26 @@ pub struct RunInfo {
     pub keyfiles: Vec<String>,
     /// Platform scope for decryption profiles (`--platform`), if set.
     pub platform: Option<String>,
+    /// The application identifier an `app export` was selected by (e.g.
+    /// `com.whatsapp.WhatsApp`). `None` for a search/diff-driven run.
+    ///
+    /// WHY `#[serde(default)]` on this and the two fields below: they were added
+    /// after the manifest/report format was already in use, so an older manifest
+    /// (written without them) must still deserialise — `default` supplies the empty
+    /// value rather than failing the parse. A search/diff run leaves them empty, so
+    /// existing output is byte-identical apart from the new keys.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// The source path prefixes the app's data was resolved to (one per container:
+    /// the app's own data, its extension/widget containers, and any App Groups).
+    #[serde(default)]
+    pub app_containers: Vec<String>,
+    /// How each included App Group was attributed, as `"<group-id> -> <link>"`
+    /// where `<link>` is `Entitlement` (authoritative, from the app binary's
+    /// code-signature) or `VendorHeuristic` (reverse-DNS vendor-token fallback) —
+    /// recorded so an analyst can audit which group inclusions are authoritative.
+    #[serde(default)]
+    pub app_group_links: Vec<String>,
 }
 
 /// How a match's bytes were encoded in the file.

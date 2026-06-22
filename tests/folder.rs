@@ -117,7 +117,7 @@ fn search_and_export_run_over_a_folder_source() {
     // Export the matched loose file out of the folder source.
     let out = tempdir().unwrap();
     let plan = export::plan(&findings.files);
-    match export::export_files(&plan, &src, &findings.files, out.path(), None).unwrap() {
+    match export::export_files(&plan, &src, &findings.files, out.path(), None, 0).unwrap() {
         ExportOutcome::Exported { files, .. } => assert_eq!(files, 1),
         ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
     }
