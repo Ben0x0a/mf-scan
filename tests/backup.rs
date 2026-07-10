@@ -8,11 +8,11 @@
 
 use std::path::PathBuf;
 
-use mf_scan::ios::backup::profile;
-use mf_scan::ios::backup::source::BackupSource;
-use mf_scan::models::Entry;
-use mf_scan::source::folder::FolderSource;
-use mf_scan::source::{IntegrityCheck, Source};
+use mf_scan::core::models::Entry;
+use mf_scan::core::source::folder::FolderSource;
+use mf_scan::core::source::{IntegrityCheck, Source};
+use mf_scan::platform::ios::backup::profile;
+use mf_scan::platform::ios::backup::source::BackupSource;
 
 /// Path to a fixture backup directory.
 fn fixture(name: &str) -> PathBuf {

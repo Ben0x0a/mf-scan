@@ -11,9 +11,9 @@ mod common;
 use std::io::Write;
 
 use common::{FileSpec, build_zip};
-use mf_scan::source::ranged::RangedZipSource;
-use mf_scan::source::zip::ZipSource;
-use mf_scan::source::{IntegrityCheck, Source};
+use mf_scan::core::source::ranged::RangedZipSource;
+use mf_scan::core::source::zip::ZipSource;
+use mf_scan::core::source::{IntegrityCheck, Source};
 
 /// Write archive bytes to a temp file and open a ranged source over it.
 fn ranged(bytes: &[u8]) -> (tempfile::NamedTempFile, RangedZipSource) {

@@ -58,7 +58,7 @@ Each layer is independent, so the framework is *scheme-agnostic*:
 3. **Ciphers** (`src/decrypt/cipher/`) implement the `DbDecryptor` trait, one per
    scheme. Today: **SQLCipher** and **WhatsApp crypt12/14**.
 
-The **engine shim** (`src/engine/classify.rs`) consults the `DecryptionContext`
+The **engine shim** (`src/ops/search/classify.rs`) consults the `DecryptionContext`
 once per entry: if a profile matches the entry's path, it tries each candidate key
 until one decrypts, then hands the plaintext to the normal search/inspect pipeline.
 

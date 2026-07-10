@@ -3,11 +3,11 @@
 //! Defines: tests that a match offset resolves to table/rowid/column for live
 //! table-leaf cells, falls back to page+offset elsewhere, and that header-first
 //! detection works on a misnamed file.
-//! Uses: `mf_scan::inspect` and the committed `fixtures/messages.sqlite`
+//! Uses: `mf_scan::formats::inspect` and the committed `fixtures/messages.sqlite`
 //! (built with sqlite3: tables `messages(id,sender,body)` and
 //! `notes(note_id,content)`).
 
-use mf_scan::inspect::{diff, inspect};
+use mf_scan::formats::inspect::{diff, inspect};
 
 const DB: &[u8] = include_bytes!("fixtures/messages.sqlite");
 /// A database whose `items.payload` BLOB holds an Apple binary plist.
@@ -129,7 +129,7 @@ fn diff_of_identical_databases_reports_no_changes() {
 /// fallback for a non-cell byte.
 #[test]
 fn inspect_many_matches_per_offset_inspect() {
-    use mf_scan::inspect::inspect_many;
+    use mf_scan::formats::inspect::inspect_many;
 
     let offsets = [
         at("UNIQUE_NEEDLE_42"),

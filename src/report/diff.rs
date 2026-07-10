@@ -3,7 +3,7 @@
 //! Defines: [`write_diff`], which renders a [`DiffReport`] to any `Write` sink in
 //! the chosen [`OutputFormat`].
 //! Used by: the binary's `run::diff`.
-//! Uses: `crate::diff::{Change, DiffReport}`, `crate::report::output::OutputFormat`,
+//! Uses: `crate::ops::diff::{Change, DiffReport}`, `crate::report::output::OutputFormat`,
 //! `serde`/`serde_json` (JSON), `csv` (CSV).
 //!
 //! txt is change-only (unchanged files are summarised, not listed) so a human sees
@@ -14,7 +14,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::diff::{Change, DiffReport, FileDiff};
+use crate::ops::diff::{Change, DiffReport, FileDiff};
 use crate::report::output::OutputFormat;
 
 /// Write `report` to `w` in `format`.
@@ -159,7 +159,7 @@ fn write_csv(report: &DiffReport, w: &mut dyn Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ContentDiff;
+    use crate::core::models::ContentDiff;
     use serde_json::{Value, json};
 
     fn sample_report() -> DiffReport {

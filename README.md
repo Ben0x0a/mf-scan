@@ -19,9 +19,10 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 
 - **~40–100× faster than `zipgrep`** on STORED archives (memory-mapped, no
   per-file process spawn, SIMD search).
-- **Archives *and* folders** — point at a `.zip` or a directory; with
-  `--archive-depth` mf-scan opens nested `.zip` files found inside a folder and
-  searches the files within them.
+- **Archives *and* folders** — point at a `.zip`, a `.tar`/`.tar.gz`/`.tgz`, or a
+  directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
+  folder and searches the files within them. (A plain `.tar` is memory-mapped and
+  reports true archive offsets; a `.tar.gz` is decompressed in memory.)
 - **Tells you *where*, always** — every match reports the file path plus byte
   offsets (see [Offsets](#offsets)).
 - **STORED + DEFLATE**: uncompressed entries are searched in place; DEFLATE

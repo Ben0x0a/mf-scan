@@ -100,7 +100,7 @@ impl DbBinding {
     pub fn matches(&self, path: &str) -> bool {
         match self {
             DbBinding::Glob(glob) => {
-                crate::filter::wildcard_match(glob.as_bytes(), path.as_bytes())
+                crate::core::filter::wildcard_match(glob.as_bytes(), path.as_bytes())
             }
             DbBinding::Path(exact) => exact == path,
         }

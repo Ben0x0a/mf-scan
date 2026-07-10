@@ -19,7 +19,7 @@
 //! Why the `plist` crate (vs. hand-rolling): keychain dumps from forensic tools
 //! are frequently *binary* plists, and decoding the binary object table correctly
 //! over untrusted evidence is exactly where a battle-tested pure-Rust parser is
-//! the responsible choice. The XML-offset inspector in `crate::inspect::plist`
+//! the responsible choice. The XML-offset inspector in `crate::formats::inspect::plist`
 //! stays hand-rolled because it resolves byte offsets to key paths — something the
 //! value-oriented `plist` crate does not expose; the two serve different needs.
 //!
@@ -62,13 +62,14 @@ impl KeyfileProvider for KeychainPlist {
     /// from an arbitrary plist without parsing the whole file, and stops the
     /// provider claiming (then emptily "loading") an unrelated plist.
     fn detect(&self, content: &[u8]) -> bool {
-        let mentions_value_data = crate::inspect::contains(content, VALUE_DATA_KEY.as_bytes());
+        let mentions_value_data =
+            crate::formats::inspect::contains(content, VALUE_DATA_KEY.as_bytes());
         if content.starts_with(b"bplist00") {
             return mentions_value_data;
         }
-        if crate::inspect::looks_like_xml(content) {
+        if crate::formats::inspect::looks_like_xml(content) {
             let head = &content[..content.len().min(512)];
-            return crate::inspect::contains(head, b"<plist") && mentions_value_data;
+            return crate::formats::inspect::contains(head, b"<plist") && mentions_value_data;
         }
         false
     }

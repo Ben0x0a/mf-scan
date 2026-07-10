@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{FileSpec, build_zip};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
-use mf_scan::engine::{Findings, NoProgress, Progress, Query, search_with_query};
-use mf_scan::filter::EntryFilter;
+use mf_scan::core::filter::EntryFilter;
+use mf_scan::engine::{NoProgress, Progress};
+use mf_scan::ops::search::{Findings, Query, search_with_query};
 use regex::bytes::Regex;
 
 /// A filter that searches everything.

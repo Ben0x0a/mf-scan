@@ -18,20 +18,18 @@
 //! within the file, absolute position in the archive) — locating evidence is
 //! the goal, so the "where" is always present, never gated behind a flag.
 
-mod cli;
-mod run;
-mod support;
+mod cmd;
 
 use anyhow::Result;
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cmd::cli::{Cli, Command};
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Grep(args) => run::run_grep(args),
-        Command::Export(args) => run::run_export(args),
-        Command::Diff(args) => run::run_diff(args),
-        Command::App(args) => run::run_app(args),
+        Command::Grep(args) => cmd::run::run_grep(args),
+        Command::Export(args) => cmd::run::run_export(args),
+        Command::Diff(args) => cmd::run::run_diff(args),
+        Command::App(args) => cmd::run::run_app(args),
     }
 }

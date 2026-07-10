@@ -9,12 +9,12 @@
 mod common;
 
 use common::{FileSpec, build_zip};
-use mf_scan::diff::{Change, CompareMode, diff_sources};
-use mf_scan::filter::EntryFilter;
-use mf_scan::source::zip::ZipSource;
+use mf_scan::core::filter::EntryFilter;
+use mf_scan::core::source::zip::ZipSource;
+use mf_scan::ops::diff::{Change, CompareMode, diff_sources};
 
 /// The change recorded for `path` in the report (panics if absent).
-fn change_of(report: &mf_scan::diff::DiffReport, path: &str) -> Change {
+fn change_of(report: &mf_scan::ops::diff::DiffReport, path: &str) -> Change {
     report
         .files
         .iter()
@@ -73,7 +73,7 @@ fn exact_catches_same_size_content_change() {
 fn size_only_ignores_mismatched_clock_mtimes() {
     use std::fs;
 
-    use mf_scan::source::folder::FolderSource;
+    use mf_scan::core::source::folder::FolderSource;
 
     // Zip-vs-folder: the zip entry carries no mtime, the loose file a real one,
     // so the Meta compare flags the file as modified on timestamp alone. The

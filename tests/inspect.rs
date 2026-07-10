@@ -2,9 +2,9 @@
 //!
 //! Defines: tests for TXT line/column, JSON key-path, XML element-path, and
 //! format detection (extension + header-first magic).
-//! Uses: `mf_scan::inspect`.
+//! Uses: `mf_scan::formats::inspect`.
 
-use mf_scan::inspect::inspect;
+use mf_scan::formats::inspect::inspect;
 
 /// Byte offset of the first occurrence of `needle` in `hay`.
 fn at(hay: &[u8], needle: &str) -> usize {

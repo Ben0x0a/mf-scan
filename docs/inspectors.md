@@ -79,7 +79,7 @@ All cross-references are UIDs — integer scalars (bplist marker high-nibble `0x
 that are indices into `$objects`. Detection is header-first: the root dict must
 contain `$archiver == "NSKeyedArchiver"`.
 
-The resolver (`src/inspect/nskeyed.rs`) walks the UID graph from every `$top`
+The resolver (`src/formats/inspect/nskeyed.rs`) walks the UID graph from every `$top`
 entry to the object that contains the matched bytes, reconstructing the logical
 path (e.g. `$.root.prefs.token`). Four hit kinds are handled:
 
@@ -150,7 +150,7 @@ a byte isn't part of a current row (e.g. a deleted record in free space).
 
 ## The inspector API
 
-Every format is an `Inspector` (the trait in `src/inspect/mod.rs`):
+Every format is an `Inspector` (the trait in `src/formats/inspect/mod.rs`):
 
 ```rust
 pub trait Inspector: Sync {
@@ -175,11 +175,11 @@ inspectors reuse rather than duplicate them.
 ### Adding one
 
 1. Copy [`inspector-template.rs`](inspector-template.rs) to
-   `src/inspect/<format>.rs` and `mod <format>;` it in `src/inspect/mod.rs`.
+   `src/formats/inspect/<format>.rs` and `mod <format>;` it in `src/formats/inspect/mod.rs`.
 2. Fill in `name` / `category` / `extensions` / `detect` / `inspect` (and
    `sidecars` if any). A *classification-only* media format needs no `inspect`
-   body — use the `media_inspector!` macro (see `src/inspect/media/jpeg.rs`).
-3. Register it: add `&<format>::Foo` to `INSPECTORS` in `src/inspect/mod.rs` —
+   body — use the `media_inspector!` macro (see `src/formats/inspect/media/jpeg.rs`).
+3. Register it: add `&<format>::Foo` to `INSPECTORS` in `src/formats/inspect/mod.rs` —
    **list more specific formats first**, because `detect` (header) checks run in
    order (e.g. plist before generic XML).
 4. Reuse shared helpers; add new ones to `mod.rs` with a doc comment.

@@ -14,12 +14,12 @@
 //! - `fixtures/nskeyed_dictkey.bplist` — dict key-name hit:
 //!   `{ root: { NEEDLEKEY: "some-value-xyz", other: "other-value" } }`
 //!
-//! Uses: `mf_scan::inspect` and the committed `fixtures/sample.plist`
+//! Uses: `mf_scan::formats::inspect` and the committed `fixtures/sample.plist`
 //! (XML) and `fixtures/sample.bplist` (binary, produced by `plutil`). Both
 //! encode `{ Account: { Username: "XML_NEEDLE", Servers: ["first",
 //! "ARRAY_NEEDLE"] } }`.
 
-use mf_scan::inspect::{diff, inspect};
+use mf_scan::formats::inspect::{diff, inspect};
 
 const XML: &[u8] = include_bytes!("fixtures/sample.plist");
 const BIN: &[u8] = include_bytes!("fixtures/sample.bplist");

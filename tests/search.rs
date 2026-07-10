@@ -13,9 +13,9 @@ use std::io::Write;
 use common::{FileSpec, build_zip};
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
-use mf_scan::models::SearchHit;
-use mf_scan::search::search_entry;
-use mf_scan::source::zip::parse_entries;
+use mf_scan::core::models::SearchHit;
+use mf_scan::core::source::zip::parse_entries;
+use mf_scan::ops::search::search_entry;
 use regex::bytes::{Regex, RegexBuilder};
 
 fn compile(pattern: &str, ignore_case: bool) -> Regex {

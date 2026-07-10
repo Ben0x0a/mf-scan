@@ -26,10 +26,10 @@
 
 use serde::Serialize;
 
+use crate::core::util::sha256_hex;
 use crate::decrypt::cipher;
 use crate::decrypt::keyfile::SecretStore;
 use crate::decrypt::profile::{Platform, Profile, ProfileRegistry};
-use crate::util::sha256_hex;
 
 /// Everything the engine needs to decrypt entries: the profile registry, the
 /// secrets, and an optional platform scope.
@@ -243,7 +243,7 @@ mod tests {
         CipherSpec, DbBinding, HashAlgorithm, KeyEncoding, KeySpec, KeychainMatch, Profile,
         SqlCipherParams,
     };
-    use crate::search::search_bytes;
+    use crate::ops::search::search_bytes;
     use regex::bytes::Regex;
 
     const PAGE_SIZE: usize = 1024;

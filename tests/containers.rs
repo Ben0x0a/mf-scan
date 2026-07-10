@@ -14,11 +14,12 @@
 
 use std::fs;
 
-use mf_scan::engine::{NoProgress, Query, search_source};
-use mf_scan::filter::EntryFilter;
-use mf_scan::ios::containers::AppContainerMap;
-use mf_scan::source::Source;
-use mf_scan::source::folder::FolderSource;
+use mf_scan::core::filter::EntryFilter;
+use mf_scan::core::source::Source;
+use mf_scan::core::source::folder::FolderSource;
+use mf_scan::engine::NoProgress;
+use mf_scan::ops::search::{Query, search_source};
+use mf_scan::platform::ios::containers::AppContainerMap;
 use regex::bytes::Regex;
 use tempfile::tempdir;
 

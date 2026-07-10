@@ -8,8 +8,8 @@
 mod common;
 
 use common::{FileSpec, build_zip};
-use mf_scan::models::{Entry, Location, Method};
-use mf_scan::source::zip::parse_entries;
+use mf_scan::core::models::{Entry, Location, Method};
+use mf_scan::core::source::zip::parse_entries;
 
 /// The bytes the parser points at must be exactly the file's stored data.
 fn entry_bytes<'a>(archive: &'a [u8], e: &Entry) -> &'a [u8] {
@@ -115,7 +115,7 @@ fn deflate_entry_lying_about_its_size_errors_cleanly() {
     use std::io::Write;
 
     use flate2::{Compression, write::DeflateEncoder};
-    use mf_scan::source::zip::content;
+    use mf_scan::core::source::zip::content;
 
     let plain = b"tiny but honest content";
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());

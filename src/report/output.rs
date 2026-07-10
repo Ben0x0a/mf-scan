@@ -10,7 +10,7 @@
 //! `is_textual`); offsets in txt are hex (`0x…`). Richer per-format context is
 //! opt-in via `--inspect` and appears as a labelled tag (txt) or `context`
 //! (json/csv).
-//! Uses: `crate::models::MatchRecord`, `serde`/`serde_json` (JSON), `csv` (CSV),
+//! Uses: `crate::core::models::MatchRecord`, `serde`/`serde_json` (JSON), `csv` (CSV),
 //! `anyhow` (errors).
 //!
 //! Why the format enum lives here and parses via `FromStr` (not clap's
@@ -25,8 +25,8 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::core::models::{Encoding, MatchRecord, RunInfo};
 use crate::decrypt::DecryptionRecord;
-use crate::models::{Encoding, MatchRecord, RunInfo};
 use crate::report::stats::ScanStats;
 
 // ANSI escapes for match highlighting: bold red on, all attributes off. Bytes
@@ -202,7 +202,7 @@ struct ScanReport<'a> {
     /// Backup-level decryption provenance; omitted when the source was not an
     /// encrypted backup, so existing reports are byte-for-byte unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
-    backup: Option<&'a crate::ios::backup::password::BackupRecord>,
+    backup: Option<&'a crate::platform::ios::backup::password::BackupRecord>,
 }
 
 /// Write the sidecar scan report (`{ run, stats, decryptions[, backup] }`) as
@@ -211,7 +211,7 @@ pub fn write_scan_report(
     run: &RunInfo,
     stats: &ScanStats,
     decryptions: &[DecryptionRecord],
-    backup: Option<&crate::ios::backup::password::BackupRecord>,
+    backup: Option<&crate::platform::ios::backup::password::BackupRecord>,
     w: &mut dyn Write,
 ) -> Result<()> {
     let report = ScanReport {

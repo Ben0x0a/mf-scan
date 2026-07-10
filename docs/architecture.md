@@ -4,112 +4,139 @@ mf-scan is a Rust **library crate** (`mf_scan`) with a thin **binary** on top. A
 logic lives in the library so it is unit-testable without the CLI; the binary is only
 argument parsing, source resolution, and I/O.
 
+The tree is grouped so the layering is visible: the binary (`cmd/`) sits on top of the
+library; within the library, `core/` is the foundation and the feature modules build up
+from it. `mf_scan::<module>` is the library path each folder maps to.
+
 ```
 src/
-  lib.rs        library root (declares the modules below)
+  lib.rs        library root (declares the library modules below)
   main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff | App
-  cli/          BINARY: clap argument structs, split per subcommand
-    mod.rs        Cli + Command enum
-    grep.rs export.rs diff.rs app.rs   per-subcommand args (app.rs: grep/paths/export)
-    common.rs     shared value types + size parser + the flatten arg-groups
-                  (FilterArgs / DecryptArgs / ExportSink) reused by grep & diff
-  run/          BINARY: one orchestrator per command (grep.rs / export.rs / diff.rs /
-                app.rs)
-  support/      BINARY: machinery the commands share — sources (resolve operands),
-                presets, decryption setup, progress reporter, reporting, exporting
 
-  models.rs     data containers: Method, Entry+Location, SearchHit, MatchRecord,
-                Inspection, ContentDiff, RunInfo
-  source/       the container abstraction the engine reads through (see ADR 0002)
-    mod.rs        Source trait: entries() + content() + byte_size() + integrity_check()
-    zip.rs        ZIP central-directory decoders (shared) + ZipSource (mmap,
-                  zero-copy STORED; per-entry CRC-32 for export integrity)
-    ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
-                  (no whole-file mmap; lazy data-offset resolution; header-first
-                  prefix reads). Reuses zip.rs's central-directory decoders.
-    folder.rs     FolderSource: a directory of loose files (+ nested-archive arena)
-    nested.rs     --archive-depth expansion of nested .zip files into the arena
-  sqlite/       low-level SQLite reader (page/record/schema/table), shared by the
-                inspector and the backup Manifest.db reader
-  ios/          iOS-specific layers
-    containers.rs GUID→bundle-id container annotation
-    backup/       iTunes/Finder backup → logical domain/relativePath view:
-                  profile (recognise), manifest (MBFile decode), password
-                  (provenance), common (shared Files-table walk, blob locating,
-                  missing-file count, SHA-1 digest check), keybag + keys
-                  (KDF/unwrap/CBC, encrypted only)
-      source/     BackupSource enum (build/record + Source dispatch) over its two
-                  variants: encrypted::EncryptedBackupSource (decrypts lazily),
-                  plain::PlainBackupSource (unencrypted, no crypto)
-  apps/         locate & export an app's data across acquisition types (the `app`
-                subcommand). Layered ON TOP of a Source — search stays app-agnostic.
-    mod.rs        thin dispatcher: re-exports the surface below
-    types.rs      Platform, ContainerKind, GroupLink, AppContainer, AppSummary
-    catalog.rs    AppCatalog (build/inventory/containers_for) + detect + tally
-    ios_ffs.rs    iOS-FFS containers (reuses ios::containers) + entitlement groups
-    ios_backup.rs iOS-backup domains (over ios::backup's domain/relativePath view)
-    android.rs    Android package-under-storage-root resolution
-    entitlements.rs  Mach-O code-signature reader: app's authoritative App Groups
-                  (NOTE: overlaps ios/ — a future restructure groups both under
-                  platform/; see tasks/structure-refactor.md)
-  search/       per-entry byte search: scan.rs (regex + line preview)
-  engine/       orchestration: search_source over a Source -> Findings
-    mod.rs        drivers + Findings/Query/Progress; classify.rs is the per-entry body
-  filter.rs     EntryFilter: path globs (--path/--not-path) + --type / media skip
-  diff/         compare two Sources -> DiffReport (mod.rs) using compare.rs (meta|hash)
-  preset/       behaviour presets behind one flag; fast.rs is the --fast exclude list
-  inspect/      "what does this match mean" inspectors + file-type detection + diff
-    mod.rs        Inspector trait (detect/inspect/diff) + registry + detect_type
-    txt.rs json.rs xml.rs csv.rs plist.rs sqlite.rs   (resolve offsets; some diff)
-    value_diff.rs  shared JSON-tree diff used by json + plist
-    media/        the `media` category (classification only)
+  cmd/          BINARY ONLY — the CLI front end (declared in main.rs, not lib.rs)
+    cli/          clap argument structs, split per subcommand
+      mod.rs        Cli + Command enum
+      grep.rs export.rs diff.rs app.rs   per-subcommand args (app.rs: grep/paths/export)
+      common.rs     shared value types + size parser + the flatten arg-groups
+                    (FilterArgs / DecryptArgs / ExportSink) reused by grep & diff
+    run/          one orchestrator per command (grep.rs / export.rs / diff.rs / app.rs)
+    support/      machinery the commands share — sources (resolve operands), presets,
+                  decryption setup, progress reporter, reporting, exporting
+
+  core/         FOUNDATION — shared primitives every layer depends on (a leaf itself)
+    models.rs     data containers: Method, Entry+Location, SearchHit, MatchRecord,
+                  Inspection, ContentDiff, RunInfo
+    filter.rs     EntryFilter: path globs (--path/--not-path) + --type / media skip
+    util.rs       tiny crate-wide helpers (sha256_hex)
+    source/       the container abstraction the engine reads through (see ADR 0002)
+      mod.rs        Source trait: entries() + content() + byte_size() + integrity_check()
+      zip.rs        ZIP central-directory decoders (shared) + ZipSource (mmap,
+                    zero-copy STORED; per-entry CRC-32 for export integrity)
+      ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
+                    (no whole-file mmap; lazy data-offset resolution; header-first
+                    prefix reads). Reuses zip.rs's central-directory decoders.
+      folder.rs     FolderSource: a directory of loose files (+ nested-archive arena)
+      nested.rs     --archive-depth expansion of nested .zip files into the arena
+  formats/      file-CONTENT understanding (what is in this file?)
+    inspect/      "what does this match mean" inspectors + file-type detection + diff
+      mod.rs        Inspector trait (detect/inspect/diff) + registry + detect_type
+      txt.rs json.rs xml.rs csv.rs plist.rs sqlite.rs   (resolve offsets; some diff)
+      value_diff.rs  shared JSON-tree diff used by json + plist
+      media/        the `media` category (classification only)
+    sqlite/       low-level SQLite reader (page/record/schema/table), shared by the
+                  inspector and the backup Manifest.db reader
+  decrypt/      database decryption — profiles, keyfile providers, ciphers (see ADR 0001)
+  platform/     per-OS artefact parsing (low-level; consumed by apps/)
+    ios/          iOS-specific layers
+      containers.rs GUID→bundle-id container annotation
+      backup/       iTunes/Finder backup → logical domain/relativePath view:
+                    profile (recognise), manifest (MBFile decode), password
+                    (provenance), common (shared Files-table walk, blob locating,
+                    missing-file count, SHA-1 digest check), keybag + keys
+                    (KDF/unwrap/CBC, encrypted only)
+        source/     BackupSource enum (build/record + Source dispatch) over its two
+                    variants: encrypted::EncryptedBackupSource (decrypts lazily),
+                    plain::PlainBackupSource (unencrypted, no crypto)
+  engine/       SHARED drive logic over a Source: is_selected (the one entry-selection
+                rule) + the Progress contract; reused by ops::search and ops::diff
+  ops/          OPERATIONS over a Source — peer modules, one per subcommand
+    search/       scan a Source -> Findings (the `grep` subcommand)
+      mod.rs        search_source/search_with_query + Findings/Query/MatchedFile;
+                    re-exports the byte search (scan.rs regex+preview, base64.rs)
+      scan.rs base64.rs   per-entry byte search + base64 alignment fragments
+      classify.rs   the per-entry body of the parallel map (filter→decrypt→search)
+    diff/         compare two Sources -> DiffReport (mod.rs) using compare.rs (meta|hash)
+    apps/         locate & export an app's data across acquisition types (the `app`
+                  subcommand). Layered ON TOP of a Source — search stays app-agnostic.
+      mod.rs        thin dispatcher: re-exports the surface below
+      types.rs      Platform, ContainerKind, GroupLink, AppContainer, AppSummary
+      catalog.rs    AppCatalog (build/inventory/containers_for) + detect + tally
+      ios_ffs.rs    iOS-FFS containers (reuses platform::ios::containers) + entitlement groups
+      ios_backup.rs iOS-backup domains (over platform::ios::backup's domain/relativePath view)
+      android.rs    Android package-under-storage-root resolution
+      entitlements.rs  Mach-O code-signature reader: app's authoritative App Groups
   report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
                 stored-digest integrity; flat `plan` for search hits + tree-preserving
                 `plan_tree` for `app export`; the --max-path-len guard) · diff.rs
+  preset/       behaviour presets behind one flag; fast.rs is the --fast exclude list
 ```
 
 ## Module dependencies
 
-The binary layer (`main`/`cli`/`run`/`support`) depends on the library; within the
-library, `engine` and `diff` read through the `source` abstraction, and every data type
-bottoms out in `models`.
+The binary layer (`main` + `cmd/`) depends on the library; within the library the
+`ops` operations are driven over the `core::source` abstraction via the shared `engine`
+(entry selection + progress), the feature modules build up from `core`, and every data
+type bottoms out in `core` (`models`).
 
 ```mermaid
 flowchart TD
-    subgraph binary
+    subgraph binary["binary — cmd/"]
         main[main.rs] --> cli
         main --> run
         run --> support
     end
     subgraph library["library — mf_scan"]
-        engine
-        diff
-        source
-        search
-        filter
-        inspect
+        engine["engine (shared drive)"]
+        subgraph ops["ops"]
+            search["search"]
+            diff["diff"]
+            apps["apps"]
+        end
+        formats
         report
         preset
-        models
+        decrypt
+        platform
+        core
     end
-    run --> engine
+    run --> search
     run --> diff
+    run --> apps
     run --> report
-    run --> source
-    support --> source
+    run --> core
+    support --> search
+    support --> engine
+    support --> core
     support --> report
-    engine --> source
-    engine --> search
-    engine --> filter
-    engine --> inspect
-    diff --> source
-    diff --> filter
-    diff --> inspect
-    report --> source
-    report --> inspect
-    source --> models
-    inspect --> models
-    engine --> models
+    support --> decrypt
+    engine --> core
+    search --> engine
+    search --> core
+    search --> formats
+    search --> decrypt
+    diff --> engine
+    diff --> core
+    diff --> formats
+    apps --> core
+    apps --> platform
+    apps --> formats
+    report --> core
+    report --> formats
+    report --> platform
+    platform --> core
+    platform --> formats
+    formats --> core
+    decrypt --> core
 ```
 
 ## Data flow (grep)
@@ -127,15 +154,15 @@ flowchart TD
     E -->|excluded| Z["skip entry"]
     E -->|kept| F["search::search_bytes — hits"]
     F -->|"--inspect"| G["inspect::inspect — Inspection"]
-    F --> H["engine::Findings<br/>records + files + stats"]
+    F --> H["ops::search::Findings<br/>records + files + stats"]
     G --> H
     H --> I["report::output::write_results"]
     H --> J["report::export::plan / export_files"]
 ```
 
-`engine::search_source` produces **both** `records` (one `MatchRecord` per match) and
+`ops::search::search_source` produces **both** `records` (one `MatchRecord` per match) and
 `files` (one `MatchedFile` per matched file, de-duplicated for export) in a single pass,
-so printing and exporting never re-scan. `diff::diff_sources` runs the analogous flow
+so printing and exporting never re-scan. `ops::diff::diff_sources` runs the analogous flow
 over two sources, pairing entries by path (see [diff.md](diff.md)).
 
 ## Why these choices
@@ -164,7 +191,7 @@ over two sources, pairing entries by path (see [diff.md](diff.md)).
 - **Errors, not panics.** All parsing uses bounds-checked reads returning `Result`;
   anything an inspector can't resolve degrades gracefully (forensic inputs are partial).
 
-## Key types (`models.rs`)
+## Key types (`core/models.rs`)
 
 - `Method` — `Stored` or `Deflate`.
 - `Location` — where a file's bytes live: `Zip { … }` (mmap offsets), `Loose { path }`

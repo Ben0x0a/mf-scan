@@ -8,7 +8,7 @@
 //! subcommand); "extract" is reserved for extracting *meaning* from a file (the
 //! inspectors). So the functions here are `export_*`, not `extract`.
 //! Used by: `main.rs`.
-//! Uses: `crate::engine::MatchedFile`, `crate::models::Entry`, `crate::source::zip`
+//! Uses: `crate::ops::search::MatchedFile`, `crate::core::models::Entry`, `crate::core::source::zip`
 //! (parse + content), `serde`/`serde_json`, `anyhow`.
 //!
 //! Layout: each matched file is written to `DIR/<basename>_<hash>/<basename>` —
@@ -28,10 +28,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::MatchedFile;
-use crate::models::{Entry, RunInfo};
-use crate::source::Source;
-use crate::util::sha256_hex;
+use crate::core::models::{Entry, RunInfo};
+use crate::core::source::Source;
+use crate::core::util::sha256_hex;
+use crate::ops::search::MatchedFile;
 
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
 const HASH_HEX_LEN: usize = 10;
@@ -114,7 +114,7 @@ pub struct ExportedFile {
     pub stored_integrity: StoredIntegrity,
 }
 
-/// The serialisable form of [`crate::source::IntegrityCheck`] for the report.
+/// The serialisable form of [`crate::core::source::IntegrityCheck`] for the report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum StoredIntegrity {
@@ -130,9 +130,9 @@ pub enum StoredIntegrity {
     },
 }
 
-impl From<crate::source::IntegrityCheck> for StoredIntegrity {
-    fn from(check: crate::source::IntegrityCheck) -> Self {
-        use crate::source::IntegrityCheck as I;
+impl From<crate::core::source::IntegrityCheck> for StoredIntegrity {
+    fn from(check: crate::core::source::IntegrityCheck) -> Self {
+        use crate::core::source::IntegrityCheck as I;
         match check {
             I::Unrecorded => StoredIntegrity::Unrecorded,
             I::Verified { algorithm } => StoredIntegrity::Verified {
@@ -384,7 +384,7 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
 ///
 /// WHY longest-prefix wins: containers can nest (an extension container may sit
 /// inside another registered directory), so the most specific owner must claim the
-/// file — the same rule [`crate::ios::containers::AppContainerMap::resolve`] uses.
+/// file — the same rule [`crate::platform::ios::containers::AppContainerMap::resolve`] uses.
 /// WHY per-segment sanitisation (not a single `safe_join` at write time): the tree
 /// is reconstructed here, so each component must be made host-safe as it is built;
 /// re-ingestion still passes through [`safe_join`], which rejects any `..`.
@@ -478,6 +478,121 @@ pub fn write_manifest(plan: &ExportPlan, run: &RunInfo, w: &mut dyn Write) -> Re
     Ok(())
 }
 
+/// Writes one file (plus its sidecars) per call and accumulates the outcome.
+///
+/// WHY this exists: a fresh export ([`export_files`]) and a manifest re-ingestion
+/// ([`export_from_manifest`]) share the same per-file body — path-length guard,
+/// read content, `create_dir_all`, write, integrity check, sidecars — differing
+/// only in how each computes the destination and iterates. Owning that body here
+/// keeps the two loops from drifting (they already had: `safe_join` was applied on
+/// only one path). Each caller keeps its own iteration and destination rule and
+/// hands the located entry + paths to [`write_one`](Self::write_one).
+struct FileExporter<'a> {
+    source: &'a dyn Source,
+    /// The full entry list, so a written file's declared sidecars can be fetched.
+    by_path: &'a HashMap<&'a str, &'a Entry>,
+    dir: &'a Path,
+    max_path_len: usize,
+    report: Vec<ExportedFile>,
+    skipped_too_long: Vec<SkippedFile>,
+    portability_warnings: Vec<SkippedFile>,
+    bytes: u64,
+}
+
+impl<'a> FileExporter<'a> {
+    fn new(
+        source: &'a dyn Source,
+        by_path: &'a HashMap<&'a str, &'a Entry>,
+        dir: &'a Path,
+        max_path_len: usize,
+    ) -> Self {
+        FileExporter {
+            source,
+            by_path,
+            dir,
+            max_path_len,
+            report: Vec::new(),
+            skipped_too_long: Vec::new(),
+            portability_warnings: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Write `entry` to `dest` and record it. `internal_path` is the source path
+    /// (label + sidecar lookup key); `output_path` is the destination relative to
+    /// `dir` (used for the length guard and the skip records). The length guard runs
+    /// BEFORE any bytes are read: an unwritable destination is recorded, not read; a
+    /// non-portable (but locally writable) path is still exported, with a warning.
+    fn write_one(
+        &mut self,
+        entry: &Entry,
+        internal_path: &str,
+        output_path: &str,
+        dest: &Path,
+    ) -> Result<()> {
+        match check_export_path(self.dir, output_path, self.max_path_len) {
+            PathCheck::Skip(reason) => {
+                self.skipped_too_long.push(SkippedFile {
+                    internal_path: internal_path.to_string(),
+                    output_path: output_path.to_string(),
+                    reason,
+                });
+                return Ok(());
+            }
+            PathCheck::NotPortable(reason) => self.portability_warnings.push(SkippedFile {
+                internal_path: internal_path.to_string(),
+                output_path: output_path.to_string(),
+                reason,
+            }),
+            PathCheck::Ok => {}
+        }
+        // Content is read (and decompressed/read-from-disk) once, here.
+        let content = self.source.content(entry)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        fs::write(dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
+        self.bytes += content.len() as u64;
+        let integrity = self.source.integrity_check(entry).into();
+        self.report.push(exported_file(
+            internal_path,
+            dest,
+            self.dir,
+            &content,
+            integrity,
+        )?);
+
+        // Sidecars to export come from the file's inspector (e.g. SQLite's -wal).
+        let suffixes = crate::formats::inspect::sidecars_for(internal_path, &content);
+        let mut sidecars = export_sidecars(
+            self.source,
+            self.by_path,
+            internal_path,
+            dest,
+            self.dir,
+            suffixes,
+        )?;
+        self.bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
+        self.report.append(&mut sidecars);
+        Ok(())
+    }
+
+    /// Consume the accumulated files into an [`ExportOutcome::Exported`]. `skipped`
+    /// is the count of listed files absent from the source (manifest re-ingestion
+    /// only; a fresh export passes 0).
+    fn finish(self, skipped: usize) -> ExportOutcome {
+        ExportOutcome::Exported {
+            files: self.report.len(),
+            bytes: self.bytes,
+            skipped,
+            report: self.report,
+            skipped_too_long: self.skipped_too_long,
+            portability_warnings: self.portability_warnings,
+        }
+    }
+}
+
 /// Export the matched files to `dir`.
 ///
 /// When `max_size` is set and the total exceeds it, nothing is written and
@@ -507,65 +622,12 @@ pub fn export_files(
         .map(|e| (e.name.as_str(), e))
         .collect();
 
-    let mut report: Vec<ExportedFile> = Vec::new();
-    let mut skipped_too_long: Vec<SkippedFile> = Vec::new();
-    let mut portability_warnings: Vec<SkippedFile> = Vec::new();
-    let mut bytes = 0u64;
+    let mut exporter = FileExporter::new(source, &by_path, dir, max_path_len);
     for (item, file) in plan.items.iter().zip(files) {
-        let output_path = item.output_path();
         let dest = dir.join(&item.folder).join(&item.name);
-        // Length guard BEFORE reading content: an unwritable destination means we
-        // never read its bytes, recording it instead. A non-portable (but locally
-        // writable) path is still exported, with a warning recorded.
-        match check_export_path(dir, &output_path, max_path_len) {
-            PathCheck::Skip(reason) => {
-                skipped_too_long.push(SkippedFile {
-                    internal_path: file.entry.name.clone(),
-                    output_path,
-                    reason,
-                });
-                continue;
-            }
-            PathCheck::NotPortable(reason) => portability_warnings.push(SkippedFile {
-                internal_path: file.entry.name.clone(),
-                output_path,
-                reason,
-            }),
-            PathCheck::Ok => {}
-        }
-        // Content is read (and decompressed/read-from-disk) once, here.
-        let content = source.content(&file.entry)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
-        bytes += content.len() as u64;
-        let integrity = source.integrity_check(&file.entry).into();
-        report.push(exported_file(
-            &file.entry.name,
-            &dest,
-            dir,
-            &content,
-            integrity,
-        )?);
-
-        // Sidecars to export come from the file's inspector (e.g. SQLite's -wal).
-        let suffixes = crate::inspect::sidecars_for(&file.entry.name, &content);
-        let mut sidecars =
-            export_sidecars(source, &by_path, &file.entry.name, &dest, dir, suffixes)?;
-        bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
-        report.append(&mut sidecars);
+        exporter.write_one(&file.entry, &file.entry.name, &item.output_path(), &dest)?;
     }
-
-    Ok(ExportOutcome::Exported {
-        files: report.len(),
-        bytes,
-        skipped: 0,
-        report,
-        skipped_too_long,
-        portability_warnings,
-    })
+    Ok(exporter.finish(0))
 }
 
 /// Read a manifest previously written by [`write_manifest`].
@@ -598,65 +660,19 @@ pub fn export_from_manifest(
     let entries = source.entries();
     let by_path: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
-    let mut report: Vec<ExportedFile> = Vec::new();
-    let mut skipped_too_long: Vec<SkippedFile> = Vec::new();
-    let mut portability_warnings: Vec<SkippedFile> = Vec::new();
-    let mut bytes = 0u64;
+    let mut exporter = FileExporter::new(source, &by_path, dir, max_path_len);
     let mut skipped = 0usize;
     for entry in &manifest.files {
         let Some(found) = by_path.get(entry.internal_path.as_str()) else {
             skipped += 1; // listed file is absent from this archive
             continue;
         };
+        // The manifest path is joined through `safe_join` so a tampered manifest
+        // cannot escape `dir`; a fresh export builds its own `dir/folder/name`.
         let dest = safe_join(dir, &entry.output_path);
-        // Same length guard as a fresh export.
-        match check_export_path(dir, &entry.output_path, max_path_len) {
-            PathCheck::Skip(reason) => {
-                skipped_too_long.push(SkippedFile {
-                    internal_path: entry.internal_path.clone(),
-                    output_path: entry.output_path.clone(),
-                    reason,
-                });
-                continue;
-            }
-            PathCheck::NotPortable(reason) => portability_warnings.push(SkippedFile {
-                internal_path: entry.internal_path.clone(),
-                output_path: entry.output_path.clone(),
-                reason,
-            }),
-            PathCheck::Ok => {}
-        }
-        let content = source.content(found)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
-        bytes += content.len() as u64;
-        let integrity = source.integrity_check(found).into();
-        report.push(exported_file(
-            &entry.internal_path,
-            &dest,
-            dir,
-            &content,
-            integrity,
-        )?);
-
-        let suffixes = crate::inspect::sidecars_for(&entry.internal_path, &content);
-        let mut sidecars =
-            export_sidecars(source, &by_path, &entry.internal_path, &dest, dir, suffixes)?;
-        bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
-        report.append(&mut sidecars);
+        exporter.write_one(found, &entry.internal_path, &entry.output_path, &dest)?;
     }
-
-    Ok(ExportOutcome::Exported {
-        files: report.len(),
-        bytes,
-        skipped,
-        report,
-        skipped_too_long,
-        portability_warnings,
-    })
+    Ok(exporter.finish(skipped))
 }
 
 /// Export a file's declared sidecars into the same folder as `main_dest` (e.g.
@@ -664,7 +680,7 @@ pub fn export_from_manifest(
 /// sidecar written.
 ///
 /// The `suffixes` come from the file's inspector (see
-/// [`crate::inspect::sidecars_for`]); each one names a sibling entry to fetch if
+/// [`crate::formats::inspect::sidecars_for`]); each one names a sibling entry to fetch if
 /// present. For SQLite this keeps the exported database complete — uncommitted
 /// rows live in the `-wal`.
 fn export_sidecars(
@@ -856,8 +872,8 @@ impl From<&ExportItem> for ManifestEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::MatchedFile;
-    use crate::models::{Entry, Location};
+    use crate::core::models::{Entry, Location};
+    use crate::ops::search::MatchedFile;
     use std::path::PathBuf;
 
     /// A loose-file [`MatchedFile`] at `name` of `size` bytes, for the planner tests.

@@ -178,7 +178,7 @@ falls relative to those 3-byte groups (its offset **mod 3**) changes its
 encoding. There are three such alignments; for each, the characters in the middle
 of the encoded run depend only on the target and so are a literal that must
 appear. `--base64` searches all three (≈3× the work), which finds the value at
-any alignment. See `src/search/base64.rs` for the bit-level derivation.
+any alignment. See `src/ops/search/base64.rs` for the bit-level derivation.
 
 Constraints and behaviour:
 

@@ -3,18 +3,19 @@
 //! Defines: `--archive-depth` behaviour — a nested `.zip` is opaque at depth 0,
 //! opened one level at depth 1, and a zip-in-zip is opened at depth 2 — plus that a
 //! nested entry's content reads back the inner file's bytes.
-//! Uses: `common` (fixture builder) and `mf_scan::source::{folder, Source}`.
+//! Uses: `common` (fixture builder) and `mf_scan::core::source::{folder, Source}`.
 
 mod common;
 
 use std::fs;
 
 use common::{FileSpec, build_zip};
-use mf_scan::engine::{NoProgress, Query, search_source};
-use mf_scan::filter::EntryFilter;
+use mf_scan::core::filter::EntryFilter;
+use mf_scan::core::source::Source;
+use mf_scan::core::source::folder::FolderSource;
+use mf_scan::engine::NoProgress;
+use mf_scan::ops::search::{Query, search_source};
 use mf_scan::report::export::{self, ExportOutcome};
-use mf_scan::source::Source;
-use mf_scan::source::folder::FolderSource;
 use regex::bytes::Regex;
 use tempfile::tempdir;
 

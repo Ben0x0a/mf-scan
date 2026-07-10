@@ -3,19 +3,22 @@
 //! Defines: the public module surface so both the `mf-scan` binary and the
 //! integration tests can use the parser and search engine without going through
 //! the CLI. Grouped by concern:
-//!   • `models` / `source` — shared data types and the source containers (the ZIP
-//!     central-directory parser + the `Source` trait the engine reads through).
-//!   • `engine` — the search engine: drivers + per-entry `classify`, with `filter`
-//!     and `search` (byte search) as submodules.
-//!   • `inspect` — format parsers (SQLite, plist, JSON, …) that resolve a match.
+//!   • `core` — the foundation primitives: `models` (shared data types), `source`
+//!     (the ZIP central-directory parser + the `Source` trait the engine reads
+//!     through), `filter` (entry selection), and `util` (tiny helpers).
+//!   • `engine` — the shared drive logic over a `Source`: the `is_selected` entry
+//!     rule and the `Progress` contract that `ops::search` and `ops::diff` both reuse.
+//!   • `ops` — the operations driven over a `Source`, as peer modules: `search`
+//!     (scan → `Findings`, incl. the byte-search + per-entry `classify`), `diff`
+//!     (compare two sources), and `apps` (locate/select an app's data across
+//!     acquisition types — iOS FFS / iOS backup / Android — powering `app`).
+//!   • `formats` — file-content understanding: the `inspect` parsers (SQLite, plist,
+//!     JSON, …) that resolve a match, plus the low-level `sqlite` reader they share.
 //!   • `decrypt` — database decryption (profiles, keyfile providers, ciphers).
-//!   • `diff` — compare two sources: which files were added/removed/modified.
 //!   • `report` — result `output`, coverage `stats`, and the `diff` report.
-//!   • `export` / `preset` — file/manifest export and the behaviour-preset schema.
-//!   • `ios` — iOS-specific artefact resolution (container GUID → bundle-ID map,
-//!     etc.).
-//!   • `apps` — locate and select an application's data across acquisition types
-//!     (iOS FFS / iOS backup / Android), powering the `app` subcommand.
+//!   • `preset` — the behaviour-preset schema (file/manifest export lives in `report`).
+//!   • `platform` — per-OS artefact parsing; today `platform::ios` (container
+//!     GUID → bundle-ID map, the iTunes/Finder backup reader).
 //! Used by: `main.rs` (the binary) and everything under `tests/`.
 //! Uses: the modules it declares.
 //!
@@ -23,17 +26,15 @@
 //! in `main.rs`) lets `tests/` link against it directly, which is the standard
 //! Rust layout for a tool that wants both a CLI and a tested core.
 
-pub mod apps;
+pub mod core;
 pub mod decrypt;
-pub mod diff;
 pub mod engine;
-pub mod filter;
-pub mod inspect;
-pub mod ios;
-pub mod models;
+pub mod formats;
+pub mod ops;
+pub mod platform;
 pub mod preset;
 pub mod report;
-pub mod search;
-pub mod source;
-pub mod sqlite;
-pub mod util;
+
+/// Test-only helpers shared across the library's unit tests (see [`testutil`]).
+#[cfg(test)]
+pub(crate) mod testutil;

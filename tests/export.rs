@@ -10,11 +10,12 @@ mod common;
 use std::fs;
 
 use common::{FileSpec, build_zip};
-use mf_scan::engine::{NoProgress, Query, search_with_query};
-use mf_scan::filter::EntryFilter;
-use mf_scan::models::RunInfo;
+use mf_scan::core::filter::EntryFilter;
+use mf_scan::core::models::RunInfo;
+use mf_scan::core::source::zip::ZipSource;
+use mf_scan::engine::NoProgress;
+use mf_scan::ops::search::{Query, search_with_query};
 use mf_scan::report::export::{self, ExportOutcome};
-use mf_scan::source::zip::ZipSource;
 use regex::bytes::Regex;
 
 /// Minimal run metadata for manifest tests.
@@ -43,7 +44,7 @@ fn run_info() -> RunInfo {
 }
 
 /// Build a two-file archive (same basename, different dirs) and search it.
-fn findings_two_infoplists() -> (Vec<u8>, mf_scan::engine::Findings) {
+fn findings_two_infoplists() -> (Vec<u8>, mf_scan::ops::search::Findings) {
     let files = [
         FileSpec::stored("AppA/Info.plist", b"key TARGET one"),
         FileSpec::stored("AppB/Info.plist", b"key TARGET two"),
@@ -234,7 +235,7 @@ fn export_report_attests_copy_and_zip_crc() {
 
 #[test]
 fn zip_integrity_check_detects_corruption() {
-    use mf_scan::source::{IntegrityCheck, Source};
+    use mf_scan::core::source::{IntegrityCheck, Source};
 
     // Build a STORED archive, then flip a byte inside the first entry's payload.
     let payload = b"hello forensic world";

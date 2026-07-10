@@ -1,10 +1,10 @@
 //! Inspector template — a copy-paste starting point for a new format.
 //!
 //! To add an inspector:
-//!   1. Copy this file to `src/inspect/<format>.rs` and `mod <format>;` it in
-//!      `src/inspect/mod.rs`.
+//!   1. Copy this file to `src/formats/inspect/<format>.rs` and `mod <format>;` it in
+//!      `src/formats/inspect/mod.rs`.
 //!   2. Rename `Foo`, fill in the methods below.
-//!   3. Register it: add `&<format>::Foo` to `INSPECTORS` in `src/inspect/mod.rs`
+//!   3. Register it: add `&<format>::Foo` to `INSPECTORS` in `src/formats/inspect/mod.rs`
 //!      (list more specific formats first — header `detect` checks run in order).
 //!   4. Add a test, ideally against a committed fixture in `tests/fixtures/`.
 //!
@@ -17,7 +17,7 @@
 
 use serde_json::json;
 
-use crate::models::Inspection;
+use crate::core::models::Inspection;
 
 /// One-line description of the format this inspector handles.
 pub struct Foo;
