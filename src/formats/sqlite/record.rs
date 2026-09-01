@@ -43,17 +43,7 @@ pub(crate) fn parse_cell(content: &[u8], db: &Db, cell_file: usize) -> Option<Ce
 
     // Local payload size (the rest, if any, lives on overflow pages — which are
     // separate pages, so a match on *this* page is always within local bytes).
-    let usable = db.usable;
-    let max_local = usable.checked_sub(35)?;
-    let local = if payload <= max_local {
-        payload
-    } else {
-        let min_local = (usable.checked_sub(12)? * 32 / 255).checked_sub(23)?;
-        let excess = payload.checked_sub(min_local)?;
-        let divisor = usable.checked_sub(4)?;
-        let k = min_local.checked_add(excess % divisor)?;
-        if k <= max_local { k } else { min_local }
-    };
+    let local = local_payload_len(db, payload)?;
     let overflow = payload > local;
     let total_len = n1
         .checked_add(n2)?
@@ -83,6 +73,116 @@ pub(crate) fn parse_cell(content: &[u8], db: &Db, cell_file: usize) -> Option<Ce
         total_len,
         columns,
     })
+}
+
+/// How many bytes of a `payload`-byte record are stored in the b-tree leaf cell
+/// itself; anything beyond that lives on the overflow-page chain.
+///
+/// This is the SQLite file format's documented `X`/`M`/`K` rule for a table leaf.
+/// Shared by [`parse_cell`] (which needs the cell's on-page length) and
+/// [`cell_record`] (which needs to know where the local bytes stop).
+pub(super) fn local_payload_len(db: &Db, payload: usize) -> Option<usize> {
+    let usable = db.usable;
+    let max_local = usable.checked_sub(35)?;
+    if payload <= max_local {
+        return Some(payload);
+    }
+    let min_local = (usable.checked_sub(12)? * 32 / 255).checked_sub(23)?;
+    let excess = payload.checked_sub(min_local)?;
+    let divisor = usable.checked_sub(4)?;
+    let k = min_local.checked_add(excess % divisor)?;
+    Some(if k <= max_local { k } else { min_local })
+}
+
+/// Read a table-leaf cell's COMPLETE record payload, following the overflow-page
+/// chain when the record does not fit in its leaf cell.
+///
+/// Returns `(rowid, payload)` with the payload as one contiguous buffer, so the
+/// column offsets decoded from it by [`parse_record_columns`] are buffer-relative
+/// and can be read with [`col_value`] against that same buffer.
+///
+/// WHY this exists alongside [`parse_cell`]: `parse_cell` deliberately reports
+/// absolute FILE offsets, because the inspector's job is to map a byte offset back
+/// to a cell — an overflowing record has no contiguous file range, so that view
+/// cannot represent it. A caller extracting VALUES needs the opposite: the bytes,
+/// reassembled. Keeping the two apart lets each be correct for its own use rather
+/// than compromising both.
+///
+/// HOW the chain works: the last 4 bytes of the cell hold the first overflow page
+/// number; each overflow page begins with a 4-byte "next page" number (0 = last)
+/// followed by up to `usable - 4` payload bytes. A cycle or an out-of-range page
+/// number aborts the read (`None`) rather than looping — the file is untrusted.
+pub(crate) fn cell_record(content: &[u8], db: &Db, cell_file: usize) -> Option<(u64, Vec<u8>)> {
+    let (payload_len, n1) = varint(content, cell_file)?;
+    let after_payload = cell_file.checked_add(n1)?;
+    let (rowid, n2) = varint(content, after_payload)?;
+    let record_start = after_payload.checked_add(n2)?;
+    let payload = payload_len as usize;
+    let local = local_payload_len(db, payload)?;
+
+    let mut buf = Vec::with_capacity(payload);
+    buf.extend_from_slice(content.get(record_start..record_start.checked_add(local)?)?);
+    if payload == local {
+        return Some((rowid, buf));
+    }
+
+    // The overflow chain starts at the 4 bytes immediately after the local payload.
+    let mut next = read_u32_be(content, record_start.checked_add(local)?)?;
+    // Bound the walk by the number of pages in the file: a well-formed chain can
+    // never be longer, so this terminates a cyclic or corrupt chain.
+    let max_pages = content.len() / db.page_size + 1;
+    let per_page = db.usable.checked_sub(4)?;
+    for _ in 0..max_pages {
+        if next == 0 || buf.len() >= payload {
+            break;
+        }
+        // Page numbers are 1-based.
+        let page_start = (next as usize).checked_sub(1)?.checked_mul(db.page_size)?;
+        let want = per_page.min(payload - buf.len());
+        let data_start = page_start.checked_add(4)?;
+        buf.extend_from_slice(content.get(data_start..data_start.checked_add(want)?)?);
+        next = read_u32_be(content, page_start)?;
+    }
+
+    // A truncated chain means the record is incomplete; report it as unreadable
+    // rather than hand back a silently short record that would mis-decode.
+    if buf.len() == payload {
+        Some((rowid, buf))
+    } else {
+        None
+    }
+}
+
+/// Parse a standalone record buffer's header into its column slots, with
+/// buffer-relative offsets (the counterpart of [`parse_cell`]'s file-relative
+/// ones, for a payload reassembled by [`cell_record`]).
+pub(crate) fn parse_record_columns(payload: &[u8]) -> Option<Vec<Col>> {
+    let (header_len, h1) = varint(payload, 0)?;
+    let header_end = header_len as usize;
+    if header_end > payload.len() {
+        return None;
+    }
+    let mut p = h1;
+    let mut body = header_end;
+    let mut columns = Vec::new();
+    while p < header_end {
+        let (serial, sn) = varint(payload, p)?;
+        p = p.checked_add(sn)?;
+        let len = serial_len(serial);
+        columns.push(Col {
+            serial,
+            start: body,
+            len,
+        });
+        body = body.checked_add(len)?;
+    }
+    Some(columns)
+}
+
+/// Read a big-endian `u32` at `off` (overflow-page pointers).
+fn read_u32_be(content: &[u8], off: usize) -> Option<u32> {
+    let raw: [u8; 4] = content.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_be_bytes(raw))
 }
 
 /// SQLite storage-class name for a record serial type (for a `column [TYPE]` label).
