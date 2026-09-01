@@ -1,7 +1,8 @@
 //! iOS app-container GUID → bundle-ID mapping.
 //!
-//! Defines: `AppContainerMap` — a table of container-directory paths (as they
-//! appear in the source) mapped to their app bundle IDs (e.g.
+//! Defines: `ContainerMeta` (what a container's metadata plist says about it) and
+//! `AppContainerMap` — a table of container-directory paths (as they appear in the
+//! source) mapped to that metadata, whose identifier is the app bundle ID (e.g.
 //! `com.apple.weather`). Built by reading every
 //! `.com.apple.mobile_container_manager.metadata.plist` found in the source;
 //! unreadable or unparseable metadata files are silently skipped
@@ -9,7 +10,8 @@
 //! longest-prefix matching on `/`-segment boundaries, so a file anywhere inside
 //! a container directory resolves to that container's app.
 //!
-//! Used by: `run::grep` (post-search annotation pass).
+//! Used by: `run::grep` (post-search annotation pass) and `ops::apps::ios_ffs`
+//! (inverts the mapping into the app catalogue).
 //! Uses: `crate::core::source::Source`, `plist` crate (binary/XML plist parsing,
 //! already present in the dependency tree).
 //!
@@ -31,16 +33,39 @@ const CONTAINER_METADATA_NAME: &str = ".com.apple.mobile_container_manager.metad
 /// The plist key whose string value holds the app bundle ID.
 const BUNDLE_ID_KEY: &str = "MCMMetadataIdentifier";
 
-/// A map of container-directory path (in-source) → app bundle ID.
+/// The plist key holding the nested info dictionary.
+const METADATA_INFO_KEY: &str = "MCMMetadataInfo";
+
+/// Key inside `MCMMetadataInfo` naming the app that owns an extension/widget
+/// container — the authoritative parent link, written by `installd`.
+const PARENT_BUNDLE_ID_KEY: &str = "com.apple.MobileInstallation.ParentBundleID";
+
+/// What a container's metadata plist records about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerMeta {
+    /// `MCMMetadataIdentifier` — the bundle ID, group ID or package the container
+    /// belongs to.
+    pub identifier: String,
+    /// `MCMMetadataInfo → com.apple.MobileInstallation.ParentBundleID` — the app
+    /// that owns this extension/widget container, when the plist declares it.
+    ///
+    /// WHY it matters: an extension's bundle ID usually extends its parent's
+    /// (`com.app.Widget` under `com.app`), but not always — `com.apple.siri` and
+    /// `com.apple.siri.SiriGeo` are separate installed apps, so a name-prefix rule
+    /// wrongly hands the latter's extensions to the former. This field is the
+    /// ground truth; the prefix rule is only a fallback where it is absent.
+    pub parent_id: Option<String>,
+}
+
+/// A map of container-directory path (in-source) → that container's metadata.
 ///
 /// Built once per source by scanning for container-metadata plists; used for
 /// O(k * log n) resolution (k = depth of match path, n = number of containers)
 /// by walking the match's path components from longest to shortest.
 pub struct AppContainerMap {
     /// Keys are container-directory paths exactly as they appear in the source
-    /// entries, WITHOUT a trailing `/`. Values are the bundle IDs read from the
-    /// metadata plist.
-    map: HashMap<String, String>,
+    /// entries, WITHOUT a trailing `/`. Values are what the metadata plist said.
+    map: HashMap<String, ContainerMeta>,
 }
 
 impl AppContainerMap {
@@ -49,9 +74,10 @@ impl AppContainerMap {
     ///
     /// HOW: for each entry whose basename equals `CONTAINER_METADATA_NAME`,
     /// take the parent directory path (the container directory), read the entry,
-    /// parse it as a plist, and extract `MCMMetadataIdentifier`. Failures are
-    /// silently skipped — an acquisition may have partial or corrupt metadata
-    /// files, and missing one annotation is far better than aborting the scan.
+    /// parse it as a plist, and extract `MCMMetadataIdentifier` (plus the optional
+    /// parent-bundle link). Failures are silently skipped — an acquisition may
+    /// have partial or corrupt metadata files, and missing one annotation is far
+    /// better than aborting the scan.
     pub fn build(source: &dyn Source) -> Self {
         let mut map = HashMap::new();
 
@@ -71,13 +97,13 @@ impl AppContainerMap {
                 None => continue,
             };
 
-            // Read, parse, and extract the bundle ID. Any failure is skipped.
-            let bundle_id = match extract_bundle_id(source, entry) {
-                Some(id) => id,
+            // Read, parse, and extract the metadata. Any failure is skipped.
+            let meta = match extract_metadata(source, entry) {
+                Some(meta) => meta,
                 None => continue,
             };
 
-            map.insert(container_dir.to_string(), bundle_id);
+            map.insert(container_dir.to_string(), meta);
         }
 
         Self { map }
@@ -91,7 +117,7 @@ impl AppContainerMap {
         self.map.is_empty()
     }
 
-    /// Iterate every `(container_dir, bundle_id)` pair the scan registered.
+    /// Iterate every `(container_dir, metadata)` pair the scan registered.
     ///
     /// WHY this complements [`AppContainerMap::resolve`]: `resolve` answers the
     /// forward question "which app owns this path?" (used by the search-result
@@ -100,8 +126,8 @@ impl AppContainerMap {
     /// Exposing the raw pairs (rather than a second internal index) keeps this
     /// struct the single source of truth for the container→identifier mapping; the
     /// caller groups them however it needs.
-    pub fn containers(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.map.iter().map(|(dir, id)| (dir.as_str(), id.as_str()))
+    pub fn containers(&self) -> impl Iterator<Item = (&str, &ContainerMeta)> {
+        self.map.iter().map(|(dir, meta)| (dir.as_str(), meta))
     }
 
     /// Return the bundle ID for the innermost container whose directory path is
@@ -121,7 +147,8 @@ impl AppContainerMap {
         // max tracking is simpler and fast enough compared to a trie.
         let mut best: Option<(&str, &str)> = None; // (container_dir, bundle_id)
 
-        for (container_dir, bundle_id) in &self.map {
+        for (container_dir, meta) in &self.map {
+            let bundle_id = meta.identifier.as_str();
             // The match path must be a descendant of the container directory.
             // Check: path starts with `<container_dir>/` (file inside), OR
             // path == container_dir (path IS the container dir itself, though
@@ -158,11 +185,16 @@ fn is_path_prefix(prefix: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Read the entry's bytes from `source`, parse as a plist, and return the
-/// string value of `MCMMetadataIdentifier`, if present.
+/// Read the entry's bytes from `source`, parse as a plist, and return what the
+/// container metadata records: the required `MCMMetadataIdentifier` and the
+/// optional parent-bundle link nested in `MCMMetadataInfo`.
 ///
-/// Returns `None` on any read or parse failure — degrade, don't die.
-fn extract_bundle_id(source: &dyn Source, entry: &crate::core::models::Entry) -> Option<String> {
+/// Returns `None` on any read or parse failure, or when the identifier is absent
+/// (a container with no identifier is not attributable) — degrade, don't die.
+fn extract_metadata(
+    source: &dyn Source,
+    entry: &crate::core::models::Entry,
+) -> Option<ContainerMeta> {
     // Read the file; a corrupt or unreadable entry is silently skipped.
     let bytes = source.content(entry).ok()?;
     // WHY reuse the `plist` crate: it is already in the dependency tree (used
@@ -170,13 +202,115 @@ fn extract_bundle_id(source: &dyn Source, entry: &crate::core::models::Entry) ->
     // and is the one source of truth for plist parsing in this project.
     let value = plist::Value::from_reader(Cursor::new(&*bytes)).ok()?;
     let dict = value.as_dictionary()?;
-    let id = dict.get(BUNDLE_ID_KEY)?.as_string()?;
-    Some(id.to_string())
+    let identifier = dict.get(BUNDLE_ID_KEY)?.as_string()?.to_string();
+    // The parent link is present only on extension/widget containers, and only
+    // when installd recorded it — its absence is normal, not a failure.
+    let parent_id = dict
+        .get(METADATA_INFO_KEY)
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|info| info.get(PARENT_BUNDLE_ID_KEY))
+        .and_then(plist::Value::as_string)
+        .map(str::to_string);
+    Some(ContainerMeta {
+        identifier,
+        parent_id,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::source::folder::FolderSource;
+
+    /// Build a one-container source whose metadata plist holds `identifier` and,
+    /// when given, the nested parent link — then read it back through the real
+    /// production path (`AppContainerMap::build`).
+    fn meta_of(identifier: &str, parent: Option<&str>) -> ContainerMeta {
+        let dir = tempfile::tempdir().unwrap();
+        let container = dir.path().join("Containers/Data/PluginKitPlugin/GUID-1");
+        std::fs::create_dir_all(&container).unwrap();
+
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            BUNDLE_ID_KEY.to_string(),
+            plist::Value::String(identifier.to_string()),
+        );
+        let mut info = plist::Dictionary::new();
+        // A real plist always carries MCMMetadataInfo; only the parent key varies.
+        info.insert(
+            "com.apple.MobileInstallation.ContentProtectionClass".to_string(),
+            plist::Value::Integer(0.into()),
+        );
+        if let Some(parent) = parent {
+            info.insert(
+                PARENT_BUNDLE_ID_KEY.to_string(),
+                plist::Value::String(parent.to_string()),
+            );
+        }
+        dict.insert(
+            METADATA_INFO_KEY.to_string(),
+            plist::Value::Dictionary(info),
+        );
+        plist::Value::Dictionary(dict)
+            .to_file_binary(container.join(CONTAINER_METADATA_NAME))
+            .unwrap();
+
+        let source = FolderSource::open(dir.path(), 0).unwrap();
+        let map = AppContainerMap::build(&source);
+        map.containers().next().unwrap().1.clone()
+    }
+
+    /// The authoritative parent link is read when installd wrote it.
+    #[test]
+    fn reads_parent_bundle_id_when_present() {
+        let meta = meta_of(
+            "com.apple.siri.SiriGeo.SiriGeoIntentExtension",
+            Some("com.apple.siri.SiriGeo"),
+        );
+        assert_eq!(
+            meta.identifier,
+            "com.apple.siri.SiriGeo.SiriGeoIntentExtension"
+        );
+        assert_eq!(meta.parent_id.as_deref(), Some("com.apple.siri.SiriGeo"));
+    }
+
+    /// Its absence is normal (app-data, group and bundle containers have none)
+    /// and must not lose the identifier.
+    #[test]
+    fn absent_parent_bundle_id_is_none_not_a_failure() {
+        let meta = meta_of("com.example.app", None);
+        assert_eq!(meta.identifier, "com.example.app");
+        assert!(meta.parent_id.is_none());
+    }
+
+    /// An entry that is not a readable plist registers nothing, rather than
+    /// aborting the whole scan.
+    #[test]
+    fn unparseable_metadata_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let container = dir.path().join("Containers/Data/Application/GUID-2");
+        std::fs::create_dir_all(&container).unwrap();
+        std::fs::write(container.join(CONTAINER_METADATA_NAME), b"not a plist").unwrap();
+        let source = FolderSource::open(dir.path(), 0).unwrap();
+        assert!(AppContainerMap::build(&source).is_empty());
+    }
+
+    /// `resolve` still answers with the identifier — the annotation path used by
+    /// `run::grep` is unchanged by the metadata restructure.
+    #[test]
+    fn resolve_still_returns_the_identifier() {
+        let map = AppContainerMap {
+            map: HashMap::from([(
+                "a/b".to_string(),
+                ContainerMeta {
+                    identifier: "com.example.app".to_string(),
+                    parent_id: None,
+                },
+            )]),
+        };
+        assert_eq!(map.resolve("a/b/Documents/x.db"), Some("com.example.app"));
+        assert_eq!(map.resolve("a/bc/x.db"), None);
+    }
 
     #[test]
     fn is_path_prefix_segment_boundary() {
