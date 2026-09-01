@@ -1,26 +1,30 @@
 //! iOS full-file-system (FFS) app-container resolution.
 //!
 //! Defines: [`resolve`] (every app/extension/group/bundle container, from the
-//! container metadata plists), [`app_entitlement_groups`] (an app's authoritative
-//! App Groups, read from its executable's code signature), and [`display_name`]
-//! (an app's human name from its `Info.plist`).
-//! Used by: `crate::ops::apps` (the platform-agnostic catalog) for the iOS-FFS platform.
+//! container metadata plists) and [`display_name`] (an app's human name from its
+//! `Info.plist`).
+//! Used by: `crate::ops::apps` (the platform-agnostic catalogue) for the iOS-FFS platform.
 //! Uses: [`crate::platform::ios::containers::AppContainerMap`] (the existing container→id
-//! scan — the single source of truth for the mapping), [`super::entitlements`]
-//! (Mach-O code-signature parsing), the `plist` crate (`Info.plist`), and the
-//! [`crate::core::source::Source`] trait.
+//! scan — the single source of truth for the mapping), the `plist` crate
+//! (`Info.plist`), and the [`crate::core::source::Source`] trait.
 //!
 //! WHY reuse `AppContainerMap`: it already scans every
 //! `.com.apple.mobile_container_manager.metadata.plist` in the source — for app
 //! data, extension/widget (PluginKitPlugin), shared App Group, and bundle
 //! containers alike — so the inverse "which directories belong to apps?" view this
-//! module needs is just that scan, classified by container root.
+//! module needs is just that scan, classified by container root. That same scan
+//! now also carries each extension container's authoritative parent app, so the
+//! catalogue never has to infer ownership from the bundle id's shape.
+//!
+//! WHY no code-signature reading here: an app's App Groups come from
+//! [`crate::platform::ios::references`], which MobileContainerManager writes for
+//! every installed app — see that module for why it supersedes parsing the
+//! executable.
 
 use std::io::Cursor;
 
 use plist::Value;
 
-use super::entitlements;
 use super::{AppContainer, ContainerKind};
 use crate::core::source::Source;
 use crate::platform::ios::containers::AppContainerMap;
@@ -30,13 +34,14 @@ use crate::platform::ios::containers::AppContainerMap;
 pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
     AppContainerMap::build(source)
         .containers()
-        .map(|(dir, id)| {
+        .map(|(dir, meta)| {
             let (kind, guid) = classify(dir);
             AppContainer {
-                id: id.to_string(),
+                id: meta.identifier.clone(),
                 kind,
                 prefix: dir.to_string(),
                 guid,
+                parent_id: meta.parent_id.clone(),
                 file_count: 0,
                 total_size: 0,
                 group_link: None,
@@ -71,25 +76,6 @@ fn classify(dir: &str) -> (ContainerKind, Option<String>) {
         .filter(|s| !s.is_empty())
         .map(|seg| seg.chars().take(8).collect::<String>());
     (kind, guid)
-}
-
-/// Read an app's authoritative App Groups from its executable's code-signature
-/// entitlements, given the app's `Bundle/Application` container prefix.
-///
-/// HOW: find the `.app/Info.plist` directly under the bundle container, read
-/// `CFBundleExecutable`, open that executable, and hand its bytes to
-/// [`entitlements::application_groups`]. Returns `None` on any miss (no bundle,
-/// no Info.plist, no executable, or unreadable entitlements) — the caller then
-/// falls back to the vendor-token heuristic.
-pub fn app_entitlement_groups(source: &dyn Source, bundle_prefix: &str) -> Option<Vec<String>> {
-    let info = find_app_info_plist(source, bundle_prefix)?;
-    // `app_dir` is the `.app` directory: the Info.plist path minus `/Info.plist`.
-    let app_dir = info.name.strip_suffix("/Info.plist")?;
-    let exe_name = read_info_string(source, info, "CFBundleExecutable")?;
-    let exe_path = format!("{app_dir}/{exe_name}");
-    let exe = source.entries().iter().find(|e| e.name == exe_path)?;
-    let content = source.content(exe).ok()?;
-    entitlements::application_groups(&content)
 }
 
 /// An app's display name (`CFBundleDisplayName`, falling back to `CFBundleName`)

@@ -5,21 +5,28 @@
 //! platform sniffer), and [`entries_under`] (gather a selection's files for export).
 //! Used by: the binary's `app` subcommand (`run::app`).
 //! Uses: the data types in [`super::types`], the per-platform resolvers
-//! ([`super::ios_ffs`], [`super::ios_backup`], [`super::android`]), and
-//! [`crate::core::source::Source`] / [`crate::core::models::Entry`].
+//! ([`super::ios_ffs`], [`super::ios_backup`], [`super::android`]),
+//! [`crate::platform::ios::references::McmReferences`] (the App Group source on an
+//! iOS FFS), and [`crate::core::source::Source`] / [`crate::core::models::Entry`].
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::core::models::Entry;
 use crate::core::source::Source;
+use crate::platform::ios::references::McmReferences;
 
-use super::types::{AppContainer, AppSummary, ContainerKind, GroupLink, Platform};
+use super::types::{AppContainer, AppSummary, ContainerKind, GroupLink, Platform, SigningRecord};
 use super::{android, ios_backup, ios_ffs};
 
-/// Every app container found in a source, plus the platform it was read as.
+/// Every app container found in a source, plus the platform it was read as and
+/// the MobileContainerManager signing records that go with it.
 pub struct AppCatalog {
     pub platform: Platform,
     pub containers: Vec<AppContainer>,
+    /// MCM's code-signing/entitlement records, read once per source. Empty for
+    /// every platform but iOS FFS, and for an FFS that did not capture the
+    /// database — in which case group attribution falls back to the heuristic.
+    references: McmReferences,
 }
 
 impl AppCatalog {
@@ -34,10 +41,28 @@ impl AppCatalog {
             Platform::Unknown => Vec::new(),
         };
         tally(source, &mut containers);
+        // WHY read the database here and not per app: it is one file holding every
+        // app's record, so one read per source serves the whole catalogue.
+        let references = match platform {
+            Platform::IosFfs => McmReferences::build(source),
+            _ => McmReferences::empty(),
+        };
         Self {
             platform,
             containers,
+            references,
         }
+    }
+
+    /// True when a `references.sqlite3-wal` sidecar was replayed into the MCM
+    /// database image, so the caller can record that in the analyst-facing output.
+    pub fn mcm_wal_replayed(&self) -> bool {
+        self.references.wal_replayed()
+    }
+
+    /// The MobileContainerManager signing record for an app, when the source has one.
+    pub fn signing_record(&self, id: &str) -> Option<&SigningRecord> {
+        self.references.get(id)
     }
 
     /// `app grep`: one [`AppSummary`] per installed (primary) app, optionally
@@ -63,6 +88,7 @@ impl AppCatalog {
                 name: self.display_name(source, id),
                 container_count: count,
                 total_size: size,
+                signing: self.references.get(id).cloned(),
             })
             .filter(|s| match pattern {
                 None => true,
@@ -81,12 +107,7 @@ impl AppCatalog {
     /// can write — the app's own data (`id`), its extensions/widgets (`id.*`), the
     /// app bundle, and, when `with_groups`, its App Groups (each tagged with how it
     /// was attributed). Returned in a stable, grouped order.
-    pub fn containers_for(
-        &self,
-        source: &dyn Source,
-        id: &str,
-        with_groups: bool,
-    ) -> Vec<AppContainer> {
+    pub fn containers_for(&self, id: &str, with_groups: bool) -> Vec<AppContainer> {
         let mut out: Vec<AppContainer> = self
             .containers
             .iter()
@@ -95,7 +116,7 @@ impl AppCatalog {
             .collect();
 
         if with_groups {
-            let links = self.resolve_group_links(source, id);
+            let links = self.resolve_group_links(id);
             for c in &self.containers {
                 if c.kind == ContainerKind::AppGroup
                     && let Some(&link) = links.get(c.id.as_str())
@@ -128,23 +149,24 @@ impl AppCatalog {
 
     /// Resolve which App Groups belong to app `id`, and how each was attributed.
     ///
-    /// Authoritative path (iOS FFS): the app binary's code-signature entitlements.
-    /// When those can't be read — and always for a backup, which ships no binary —
-    /// fall back to the reverse-DNS vendor-token heuristic over the group ids.
-    fn resolve_group_links(&self, source: &dyn Source, id: &str) -> HashMap<String, GroupLink> {
-        let entitlement_groups = if self.platform == Platform::IosFfs {
-            self.bundle_prefix(id)
-                .and_then(|bundle| ios_ffs::app_entitlement_groups(source, bundle))
-        } else {
-            None
-        };
-
-        match entitlement_groups {
-            Some(groups) => groups
-                .into_iter()
-                .map(|g| (g, GroupLink::Entitlement))
+    /// Authoritative path: the app's entitlements as MobileContainerManager
+    /// recorded them (`references.sqlite3`). When the source records no
+    /// entitlements for this app — always the case for an iOS backup, which ships
+    /// no MCM database — fall back to the reverse-DNS vendor-token heuristic.
+    ///
+    /// WHY a recorded-but-empty entitlement list ends the search rather than
+    /// falling through: it says the app was provisioned with no App Groups, which
+    /// is an answer. Running the heuristic anyway would re-add exactly the
+    /// false positives this source exists to remove — measured at 518 spurious
+    /// group inclusions across 7 apps on one real device.
+    fn resolve_group_links(&self, id: &str) -> HashMap<String, GroupLink> {
+        match self.references.get(id) {
+            Some(record) if record.entitlements_recorded => record
+                .application_groups
+                .iter()
+                .map(|g| (g.clone(), GroupLink::ContainerManager))
                 .collect(),
-            None => self.vendor_heuristic_groups(id),
+            _ => self.vendor_heuristic_groups(id),
         }
     }
 
@@ -253,14 +275,24 @@ fn longest_container(path: &str, index: &HashMap<String, usize>) -> Option<usize
 /// Whether container `c` is the app `id`'s own data, an extension/widget of it, or
 /// its bundle — the non-group part of an app's selection.
 ///
-/// Child matching (`id.*`) applies only to extension-style containers: on iOS an
+/// An extension container is claimed by its DECLARED parent when the container
+/// metadata names one, and only otherwise by the `id.*` name-prefix rule. WHY the
+/// declared parent must win: bundle ids nest, but installed apps do not nest with
+/// them — `com.apple.siri` and `com.apple.siri.SiriGeo` are two separate apps, so
+/// the prefix rule alone hands the latter's extensions to the former (measured: 17
+/// and 19 such misattributions on two real acquisitions).
+///
+/// The prefix fallback applies only to extension-style containers: on iOS an
 /// extension's bundle id extends the app's (`com.app.Widget`); a sibling Android
 /// package (`com.app.helper`) is a *different* app, so Android containers match by
 /// exact package only.
 fn is_app_or_extension(c: &AppContainer, id: &str) -> bool {
     match c.kind {
         ContainerKind::AppData | ContainerKind::Bundle => c.id == id,
-        ContainerKind::Extension => c.id == id || c.id.starts_with(&format!("{id}.")),
+        ContainerKind::Extension => match &c.parent_id {
+            Some(parent) => parent == id,
+            None => c.id == id || c.id.starts_with(&format!("{id}.")),
+        },
         ContainerKind::AndroidData
         | ContainerKind::AndroidUserDe
         | ContainerKind::AndroidExternal
@@ -307,9 +339,18 @@ mod tests {
             kind,
             prefix: "p".to_string(),
             guid: None,
+            parent_id: None,
             file_count: 0,
             total_size: 0,
             group_link: None,
+        }
+    }
+
+    /// An extension container whose metadata plist declares its owning app.
+    fn extension_of(id: &str, parent: &str) -> AppContainer {
+        AppContainer {
+            parent_id: Some(parent.to_string()),
+            ..container(id, ContainerKind::Extension)
         }
     }
 
@@ -344,6 +385,28 @@ mod tests {
         assert!(is_app_or_extension(&app, "com.x.App"));
         assert!(is_app_or_extension(&ext, "com.x.App")); // child extension included
         assert!(!is_app_or_extension(&other, "com.x.App")); // sibling app excluded
+    }
+
+    /// The real misattribution the declared parent fixes: `com.apple.siri` and
+    /// `com.apple.siri.SiriGeo` are two separate installed apps, so the latter's
+    /// extension must NOT be swept into an export of the former.
+    #[test]
+    fn declared_parent_beats_the_name_prefix_rule() {
+        let ext = extension_of(
+            "com.apple.siri.SiriGeo.SiriGeoIntentExtension",
+            "com.apple.siri.SiriGeo",
+        );
+        assert!(is_app_or_extension(&ext, "com.apple.siri.SiriGeo"));
+        assert!(!is_app_or_extension(&ext, "com.apple.siri"));
+    }
+
+    /// Where the metadata declares no parent (147/785 plugin containers on a real
+    /// device), the name-prefix rule still applies — the fallback is not dropped.
+    #[test]
+    fn undeclared_parent_falls_back_to_the_prefix_rule() {
+        let ext = container("com.x.App.Widget", ContainerKind::Extension);
+        assert!(is_app_or_extension(&ext, "com.x.App"));
+        assert!(!is_app_or_extension(&ext, "com.x.Other"));
     }
 
     #[test]

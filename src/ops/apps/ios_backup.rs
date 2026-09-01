@@ -40,6 +40,9 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
                 // the domain itself is both the match prefix and the output label.
                 prefix: domain.to_string(),
                 guid: None,
+                // A backup carries no container metadata plists, so no declared
+                // parent — extension ownership falls back to the name-prefix rule.
+                parent_id: None,
                 file_count: 0,
                 total_size: 0,
                 group_link: None,

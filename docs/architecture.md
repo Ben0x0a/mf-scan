@@ -43,12 +43,16 @@ src/
       txt.rs json.rs xml.rs csv.rs plist.rs sqlite.rs   (resolve offsets; some diff)
       value_diff.rs  shared JSON-tree diff used by json + plist
       media/        the `media` category (classification only)
-    sqlite/       low-level SQLite reader (page/record/schema/table), shared by the
-                  inspector and the backup Manifest.db reader
+    sqlite/       low-level SQLite reader (page/record/schema/table + wal replay),
+                  shared by the inspector, the backup Manifest.db reader and the
+                  MobileContainerManager references reader
   decrypt/      database decryption — profiles, keyfile providers, ciphers (see ADR 0001)
   platform/     per-OS artefact parsing (low-level; consumed by apps/)
     ios/          iOS-specific layers
-      containers.rs GUID→bundle-id container annotation
+      containers.rs GUID→bundle-id container annotation, + each extension
+                    container's declared parent app (ParentBundleID)
+      references.rs MobileContainerManager references.sqlite3: per-app code-signing
+                    record — entitlements (App Groups), team, signer (see ADR 0003)
       backup/       iTunes/Finder backup → logical domain/relativePath view:
                     profile (recognise), manifest (MBFile decode), password
                     (provenance), common (shared Files-table walk, blob locating,
@@ -71,10 +75,9 @@ src/
       mod.rs        thin dispatcher: re-exports the surface below
       types.rs      Platform, ContainerKind, GroupLink, AppContainer, AppSummary
       catalog.rs    AppCatalog (build/inventory/containers_for) + detect + tally
-      ios_ffs.rs    iOS-FFS containers (reuses platform::ios::containers) + entitlement groups
+      ios_ffs.rs    iOS-FFS containers (reuses platform::ios::containers)
       ios_backup.rs iOS-backup domains (over platform::ios::backup's domain/relativePath view)
       android.rs    Android package-under-storage-root resolution
-      entitlements.rs  Mach-O code-signature reader: app's authoritative App Groups
   report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
                 stored-digest integrity; flat `plan` for search hits + tree-preserving
                 `plan_tree` for `app export`; the --max-path-len guard) · diff.rs

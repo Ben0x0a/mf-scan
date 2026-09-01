@@ -42,9 +42,9 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   find **every** place an app's data lives — its own container, its
   extension/**widget** containers, and its shared **App Groups** — and export the
   lot, one tidy subfolder per container. Works on iOS full-file-system, iOS backups,
-  and Android. App Groups are attributed **authoritatively** from the app binary's
-  code-signature entitlements (with a vendor-token heuristic fallback). See
-  [`app`](#app).
+  and Android. App Groups are attributed **authoritatively** from the entitlements
+  MobileContainerManager recorded for the app (with a vendor-token heuristic
+  fallback where those are unavailable, such as on a backup). See [`app`](#app).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
 - **Find base64-encoded values** (`--base64`), **find files by path**
@@ -229,8 +229,8 @@ mf-scan app export SOURCE BUNDLE_ID --to DIR [options]   # copy one app's data o
 
 | Verb | What it does |
 |---|---|
-| `grep` | Lists one line per installed app: bundle id, display name, container count, total size. An optional `PATTERN` filters by a substring of the id/name. |
-| `paths` | Lists every container the app or its dependencies can write to, tagged by kind (`AppData` / `Extension` / `AppGroup` / `Bundle`, or the Android storage root) and — for groups — by how it was attributed (`Entitlement` vs `VendorHeuristic`). |
+| `grep` | Lists one line per installed app: bundle id, display name, container count, total size, signing team. An optional `PATTERN` filters by a substring of the id/name. `--format json` adds the full signing record (team, signer identity/organisation, App Groups, keychain groups). |
+| `paths` | Lists every container the app or its dependencies can write to, tagged by kind (`AppData` / `Extension` / `AppGroup` / `Bundle`, or the Android storage root) and — for groups — by how it was attributed (`ContainerManager` vs `VendorHeuristic`). |
 | `export` | Copies all of the app's data out, **one subfolder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain), and writes `export-report.json` with per-file integrity. Excludes the `.app` bundle (binary, not data). |
 
 Common `app` flags: `--dir-mode`, `--archive-depth N`, `--io-mode`,
@@ -238,14 +238,36 @@ Common `app` flags: `--dir-mode`, `--archive-depth N`, `--io-mode`,
 also `--no-groups`; for `export` also `--to DIR`, `--max-size SIZE`,
 `--max-path-len N`, `--verify`.
 
-**App Group attribution.** An app's App Groups are read **authoritatively** from the
-app binary's code-signature entitlements (`com.apple.security.application-groups`) —
-so a cross-brand shared group (e.g. `group.com.facebook.family` used by Instagram) is
-found even though its name shares no token with the app. When the binary can't be
-read (always for a backup, which ships no executable), mf-scan falls back to a
-reverse-DNS **vendor-token heuristic** and tags every such inclusion
-`VendorHeuristic` in the output and report so it can be audited. Use `--no-groups` to
-exclude shared containers entirely.
+**App Group attribution.** On an iOS full-file-system extraction, an app's App
+Groups are read **authoritatively** from the entitlements iOS itself recorded when
+it provisioned the app's containers, in
+`/private/var/mobile/Library/MobileContainerManager/references.sqlite3`
+(`com.apple.security.application-groups`). A cross-brand shared group — e.g.
+`group.com.facebook.family` used by Instagram — is therefore found even though its
+name shares no token with the app, and an app that was provisioned with **no** App
+Groups is reported as having none rather than being guessed at. Such inclusions are
+tagged `ContainerManager`.
+
+Where that database is unavailable — **always on an iOS backup**, which does not
+contain it — mf-scan falls back to a reverse-DNS **vendor-token heuristic** and tags
+every such inclusion `VendorHeuristic` in the output and report so it can be
+audited. The heuristic finds same-vendor groups (`group.net.whatsapp.WhatsApp.shared`
+for WhatsApp) but cannot find cross-brand ones, and is imprecise for apps whose
+vendor token is shared by many groups. Use `--no-groups` to exclude shared containers
+entirely.
+
+Two details worth knowing when reconciling against another tool:
+
+- mf-scan **replays** `references.sqlite3-wal` before reading, so it reports the
+  committed database state rather than the possibly stale main file, and says so on
+  stderr when it does. On one test device the log added 12 app records and
+  superseded 8 — including replacing a placeholder stub for an installed messaging
+  app with its real record and its App Group.
+- **Extensions and widgets** are attributed to the app their container metadata
+  names (`com.apple.MobileInstallation.ParentBundleID`), not to whichever installed
+  app their bundle id happens to start with. `com.apple.siri` and
+  `com.apple.siri.SiriGeo` are separate apps, and only the latter owns
+  `com.apple.siri.SiriGeo.SiriGeoIntentExtension`.
 
 **Path-length guard (`--max-path-len`, default 260).** Deep on-device trees can
 produce paths longer than Windows' `MAX_PATH`. On Windows an over-limit path cannot

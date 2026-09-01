@@ -7,12 +7,17 @@
 //! Used by: [`crate::ops::apps::catalog`] (builds and queries these) and the per-platform
 //! resolvers ([`crate::ops::apps::ios_ffs`], [`crate::ops::apps::ios_backup`],
 //! [`crate::ops::apps::android`], which construct [`AppContainer`]s).
-//! Uses: `std` plus `serde` (the two output types derive `Serialize` so the
+//! Uses: `std`, `serde` (the two output types derive `Serialize` so the
 //! `app grep`/`app paths` JSON is the struct itself, not a hand-mirrored field
-//! list) — otherwise plain data types, kept in their own module so the resolvers
-//! and the catalogue depend on the data shape, not on each other.
+//! list), and [`crate::platform::ios::references::SigningRecord`], re-exported here
+//! so consumers of this namespace have one import path for it and the type keeps a
+//! single definition beside the artefact it is parsed from — otherwise plain data
+//! types, kept in their own module so the resolvers and the catalogue depend on the
+//! data shape, not on each other.
 
 use serde::{Serialize, Serializer};
+
+pub use crate::platform::ios::references::SigningRecord;
 
 /// Which acquisition layout a source presents, deciding how its app data is found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,11 +83,16 @@ impl ContainerKind {
 
 /// How an App Group was attributed to an app — recorded so an analyst can audit
 /// which group inclusions are authoritative.
+///
+/// The tag names the *artefact* the claim came from, not the class of evidence,
+/// because auditing an inclusion means going back to that artefact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupLink {
-    /// Declared in the app binary's code-signature entitlements (authoritative).
-    Entitlement,
-    /// Matched by the reverse-DNS vendor-token heuristic (best-effort fallback).
+    /// Declared in the app's entitlements as MobileContainerManager recorded them
+    /// (`references.sqlite3`) — authoritative, and available on an iOS FFS.
+    ContainerManager,
+    /// Matched by the reverse-DNS vendor-token heuristic (best-effort fallback,
+    /// and the only option on an iOS backup, which ships no MCM database).
     VendorHeuristic,
 }
 
@@ -90,7 +100,7 @@ impl GroupLink {
     /// Tag used in output and the export report.
     pub fn as_str(self) -> &'static str {
         match self {
-            GroupLink::Entitlement => "Entitlement",
+            GroupLink::ContainerManager => "ContainerManager",
             GroupLink::VendorHeuristic => "VendorHeuristic",
         }
     }
@@ -115,6 +125,11 @@ pub struct AppContainer {
     /// Internal-only: not part of the JSON output.
     #[serde(skip)]
     pub guid: Option<String>,
+    /// For an extension/widget container, the app that owns it, as the container
+    /// metadata plist declares it (iOS FFS only) — the authoritative alternative
+    /// to inferring ownership from the bundle id's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     pub file_count: usize,
     pub total_size: u64,
     /// Set only on a group container included in an app's selection.
@@ -189,6 +204,10 @@ pub struct AppSummary {
     pub name: Option<String>,
     pub container_count: usize,
     pub total_size: u64,
+    /// The app's code-signing record from MobileContainerManager (iOS FFS only);
+    /// `None` when the source carries no such record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing: Option<SigningRecord>,
 }
 
 #[cfg(test)]
@@ -201,6 +220,7 @@ mod tests {
             kind,
             prefix: prefix.to_string(),
             guid: guid.map(str::to_string),
+            parent_id: None,
             file_count: 0,
             total_size: 0,
             group_link: None,

@@ -34,6 +34,9 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
                 kind,
                 prefix,
                 guid: None,
+                // Android has no per-container parent declaration: a sibling package
+                // is a separate app, never an extension of another.
+                parent_id: None,
                 file_count: 0,
                 total_size: 0,
                 group_link: None,
