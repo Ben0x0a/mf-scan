@@ -33,7 +33,7 @@
 //! filters are NEVER decrypted — the performance guarantee for a backup where
 //! every file is encrypted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use anyhow::{Context, Result, bail};
@@ -42,7 +42,7 @@ use plist::Value;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    check_blob_digest, logical_entry, meta_index, read_backup_blob, read_entry, read_present_files,
+    BlobStore, logical_entry, meta_index, name_index, read_entry, read_present_files,
 };
 use crate::platform::ios::backup::keybag;
 use crate::platform::ios::backup::keys::{aes_cbc_decrypt, aes_unwrap};
@@ -80,15 +80,17 @@ struct BackupEntry {
 /// decorator.
 pub struct EncryptedBackupSource<'a> {
     inner: &'a dyn Source,
-    /// The backup root prefix within the inner source's namespace (e.g. `""` or
-    /// `"<udid>/"`).
-    root_prefix: String,
+    /// Locates each file's encrypted on-disk blob inside `inner` by `fileID`.
+    blobs: BlobStore,
     /// Class number → 32-byte class key, recovered once at build.
     class_keys: BTreeMap<u32, [u8; KEY_SZ]>,
     /// Public logical entries (sorted by name), parallel to `meta`.
     entries: Vec<Entry>,
     /// Per-entry decryption metadata, indexed parallel to `entries`.
     meta: Vec<BackupEntry>,
+    /// Entry name → index into `entries`/`meta`, so a lookup is a hash probe
+    /// rather than a scan of every entry (see [`BlobStore`] for why).
+    index: HashMap<String, usize>,
     /// Files `Manifest.db` lists as regular files but whose encrypted blob is
     /// absent on disk — surfaced (never dropped silently) as a sign of an
     /// incomplete or modified acquisition.
@@ -156,14 +158,17 @@ impl<'a> EncryptedBackupSource<'a> {
             .context("cannot decrypt Manifest.db")?;
 
         // ── Read the Files table, build the logical entries ─────────────────
-        let (entries, meta, missing_files) = build_entries(&manifest_db, inner, &root_prefix);
+        let blobs = BlobStore::build(inner, &root_prefix);
+        let (entries, meta, missing_files) = build_entries(&manifest_db, &blobs);
 
+        let index = name_index(&entries);
         Ok(Self {
             inner,
-            root_prefix,
+            blobs,
             class_keys,
             entries,
             meta,
+            index,
             missing_files,
             provenance,
         })
@@ -208,7 +213,7 @@ impl<'a> EncryptedBackupSource<'a> {
 
     /// Read the encrypted on-disk blob for `file_id` from the inner source.
     fn read_blob(&self, file_id: &str) -> Result<Vec<u8>> {
-        read_backup_blob(self.inner, &self.root_prefix, file_id)
+        self.blobs.read(self.inner, file_id)
     }
 }
 
@@ -222,7 +227,7 @@ impl Source for EncryptedBackupSource<'_> {
     /// Filtered-out files are therefore never decrypted — the performance
     /// guarantee for a backup where every file is individually encrypted.
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
-        let idx = meta_index(&self.entries, &entry.name)?;
+        let idx = meta_index(&self.index, &entry.name)?;
         let plain = self.decrypt_file(&self.meta[idx])?;
         Ok(Content::Owned(plain))
     }
@@ -240,16 +245,12 @@ impl Source for EncryptedBackupSource<'_> {
     /// be located, return [`IntegrityCheck::Unrecorded`] (degrade, don't fail —
     /// the export still records the bytes it wrote).
     fn integrity_check(&self, entry: &Entry) -> IntegrityCheck {
-        let Ok(idx) = meta_index(&self.entries, &entry.name) else {
+        let Ok(idx) = meta_index(&self.index, &entry.name) else {
             return IntegrityCheck::Unrecorded;
         };
         let meta = &self.meta[idx];
-        check_blob_digest(
-            self.inner,
-            &self.root_prefix,
-            &meta.file_id,
-            meta.digest.as_deref(),
-        )
+        self.blobs
+            .attest(self.inner, &meta.file_id, meta.digest.as_deref())
     }
 }
 
@@ -275,12 +276,8 @@ fn unwrap_key(kek: &[u8; KEY_SZ], wrapped: &[u8]) -> Result<[u8; KEY_SZ]> {
 /// an `EncryptionKey` — a present regular file without one is not decryptable and
 /// is dropped (it is not counted as missing). Records arrive sorted by name, so
 /// `entries`/`meta` stay aligned and deterministic.
-fn build_entries(
-    manifest_db: &[u8],
-    inner: &dyn Source,
-    root_prefix: &str,
-) -> (Vec<Entry>, Vec<BackupEntry>, usize) {
-    let (records, missing) = read_present_files(manifest_db, inner, root_prefix);
+fn build_entries(manifest_db: &[u8], blobs: &BlobStore) -> (Vec<Entry>, Vec<BackupEntry>, usize) {
+    let (records, missing) = read_present_files(manifest_db, blobs);
 
     let mut entries = Vec::new();
     let mut meta = Vec::new();

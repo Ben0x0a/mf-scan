@@ -27,12 +27,14 @@
 //! same blob with SHA-1 and compares it to the recorded `Digest` (for an
 //! unencrypted backup the Digest is the SHA-1 of the file content itself).
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    self, check_blob_digest, logical_entry, meta_index, read_backup_blob, read_present_files,
+    self, BlobStore, logical_entry, meta_index, name_index, read_present_files,
 };
 use crate::platform::ios::backup::profile::BackupProfile;
 
@@ -49,13 +51,15 @@ struct PlainEntry {
 /// A [`Source`] presenting an unencrypted iOS backup by logical paths.
 pub struct PlainBackupSource<'a> {
     inner: &'a dyn Source,
-    /// The backup root prefix within the inner source's namespace (`""` or
-    /// `"<udid>/"`).
-    root_prefix: String,
+    /// Locates each file's on-disk blob inside `inner` by `fileID`.
+    blobs: BlobStore,
     /// Public logical entries (sorted by name), parallel to `meta`.
     entries: Vec<Entry>,
     /// Per-entry metadata, indexed parallel to `entries`.
     meta: Vec<PlainEntry>,
+    /// Entry name → index into `entries`/`meta`, so a lookup is a hash probe
+    /// rather than a scan of every entry (see [`BlobStore`] for why).
+    index: HashMap<String, usize>,
     /// Files `Manifest.db` lists as regular files but whose blob is absent on
     /// disk — surfaced (never dropped silently) as a sign of an incomplete or
     /// modified acquisition.
@@ -74,7 +78,8 @@ impl<'a> PlainBackupSource<'a> {
         // Manifest.db is a plain SQLite file for an unencrypted backup.
         let manifest_db = common::read_entry(inner, &format!("{root_prefix}Manifest.db"))?;
 
-        let (records, missing_files) = read_present_files(&manifest_db, inner, &root_prefix);
+        let blobs = BlobStore::build(inner, &root_prefix);
+        let (records, missing_files) = read_present_files(&manifest_db, &blobs);
         let mut entries = Vec::with_capacity(records.len());
         let mut meta = Vec::with_capacity(records.len());
         for r in records {
@@ -85,11 +90,13 @@ impl<'a> PlainBackupSource<'a> {
             });
         }
 
+        let index = name_index(&entries);
         Ok(Self {
             inner,
-            root_prefix,
+            blobs,
             entries,
             meta,
+            index,
             missing_files,
         })
     }
@@ -112,8 +119,8 @@ impl Source for PlainBackupSource<'_> {
     }
 
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
-        let idx = meta_index(&self.entries, &entry.name)?;
-        let blob = read_backup_blob(self.inner, &self.root_prefix, &self.meta[idx].file_id)?;
+        let idx = meta_index(&self.index, &entry.name)?;
+        let blob = self.blobs.read(self.inner, &self.meta[idx].file_id)?;
         Ok(Content::Owned(blob))
     }
 
@@ -125,15 +132,11 @@ impl Source for PlainBackupSource<'_> {
     /// For an unencrypted backup the recorded Digest is the SHA-1 of the file
     /// content itself, so this attests the stored evidence was read intact.
     fn integrity_check(&self, entry: &Entry) -> IntegrityCheck {
-        let Ok(idx) = meta_index(&self.entries, &entry.name) else {
+        let Ok(idx) = meta_index(&self.index, &entry.name) else {
             return IntegrityCheck::Unrecorded;
         };
         let meta = &self.meta[idx];
-        check_blob_digest(
-            self.inner,
-            &self.root_prefix,
-            &meta.file_id,
-            meta.digest.as_deref(),
-        )
+        self.blobs
+            .attest(self.inner, &meta.file_id, meta.digest.as_deref())
     }
 }

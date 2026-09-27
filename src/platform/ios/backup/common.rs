@@ -6,7 +6,8 @@
 //! by logical name ([`read_entry`]), walking `Manifest.db`'s `Files` table into
 //! present-on-disk records ([`read_present_files`], [`FileRecord`]), building the
 //! logical [`Entry`] ([`logical_entry`]), mapping an entry back to its metadata
-//! ([`meta_index`]), and the SHA-1 `Digest` attestation ([`check_blob_digest`]).
+//! ([`name_index`], [`meta_index`]), and the SHA-1 `Digest` attestation
+//! ([`BlobStore::attest`]).
 //! Used by: `source::encrypted` and `source::plain` — the two sources differ only
 //! in how they turn a [`FileRecord`] into their own per-entry metadata and (for
 //! encrypted) decrypt the bytes; everything structural lives here so they never
@@ -14,7 +15,7 @@
 //! Uses: `crate::formats::sqlite` (the `Manifest.db` reader), `super::manifest`
 //! (`MBFile` decode), `crate::core::source` (the `Source` trait), `sha1`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use sha1::{Digest as _, Sha1};
@@ -53,29 +54,111 @@ pub(crate) fn blob_names(root_prefix: &str, file_id: &str) -> (String, String) {
 }
 
 /// Locate and read a backup file's on-disk blob from `inner`, trying the sharded
-/// path first then the flat one. Errors when neither is present.
-pub(crate) fn read_backup_blob(
-    inner: &dyn Source,
-    root_prefix: &str,
-    file_id: &str,
-) -> Result<Vec<u8>> {
-    let (sharded, flat) = blob_names(root_prefix, file_id);
-    if let Some(bytes) = try_read_entry(inner, &sharded) {
-        return Ok(bytes);
+/// Locates a backup's on-disk blobs inside the inner source, by `fileID`.
+///
+/// Holds a name → index map over the inner source's entries, built once. WHY that
+/// matters: every blob lookup used to be a linear scan of the inner source, and
+/// `Source::content` plus `Source::integrity_check` each perform one per file. A
+/// whole-backup operation touches every file, so the cost was quadratic in the
+/// entry count — invisible when exporting one app's data out of a large backup,
+/// prohibitive when rebuilding the whole thing.
+///
+/// The same index answers "does the backup actually hold this blob?", which the
+/// `Manifest.db` walk needs, so one structure serves both.
+pub(crate) struct BlobStore {
+    /// The backup root within the inner source's namespace (`""` or `"<udid>/"`).
+    root_prefix: String,
+    /// Inner entry name → index into `inner.entries()`.
+    index: HashMap<String, usize>,
+}
+
+impl BlobStore {
+    /// Index `inner`'s entries once for the backup rooted at `root_prefix`.
+    pub(crate) fn build(inner: &dyn Source, root_prefix: &str) -> Self {
+        Self {
+            root_prefix: root_prefix.to_string(),
+            index: name_index(inner.entries()),
+        }
     }
-    try_read_entry(inner, &flat)
-        .with_context(|| format!("blob for {file_id} not found in the backup"))
+
+    /// Whether the inner source holds an entry with this exact name.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// Whether either candidate blob path for `file_id` is present on disk.
+    pub(crate) fn holds_blob(&self, file_id: &str) -> bool {
+        let (sharded, flat) = blob_names(&self.root_prefix, file_id);
+        self.contains(&sharded) || self.contains(&flat)
+    }
+
+    /// Read a blob's bytes, trying the sharded layout then the flat one.
+    pub(crate) fn read(&self, inner: &dyn Source, file_id: &str) -> Result<Vec<u8>> {
+        let (sharded, flat) = blob_names(&self.root_prefix, file_id);
+        if let Some(bytes) = self.read_named(inner, &sharded) {
+            return Ok(bytes);
+        }
+        self.read_named(inner, &flat)
+            .with_context(|| format!("blob for {file_id} not found in the backup"))
+    }
+
+    /// Read an inner entry's bytes by exact name, or `None` if it is absent.
+    pub(crate) fn read_named(&self, inner: &dyn Source, name: &str) -> Option<Vec<u8>> {
+        let entry = inner.entries().get(*self.index.get(name)?)?;
+        inner.content(entry).ok().map(|c| c.into_owned())
+    }
+
+    /// Attest a file's on-disk blob against the SHA-1 `Digest` recorded in
+    /// `Manifest.db`.
+    ///
+    /// The recorded digest is the SHA-1 of the bytes as stored on disk — the
+    /// ciphertext for an encrypted backup, the file content for an unencrypted one
+    /// — so recomputing it from the blob attests the original evidence was read
+    /// intact. Returns [`IntegrityCheck::Unrecorded`] when no digest is recorded or
+    /// the blob cannot be located (degrade, don't fail — the export still records
+    /// what it wrote).
+    pub(crate) fn attest(
+        &self,
+        inner: &dyn Source,
+        file_id: &str,
+        expected: Option<&[u8]>,
+    ) -> IntegrityCheck {
+        let Some(expected) = expected else {
+            return IntegrityCheck::Unrecorded;
+        };
+        let Ok(blob) = self.read(inner, file_id) else {
+            return IntegrityCheck::Unrecorded;
+        };
+        attest_bytes(&blob, expected)
+    }
+}
+
+/// Compare a SHA-1 of `bytes` against the digest `Manifest.db` recorded.
+pub(crate) fn attest_bytes(bytes: &[u8], expected: &[u8]) -> IntegrityCheck {
+    let actual = Sha1::digest(bytes);
+    if actual.as_slice() == expected {
+        IntegrityCheck::Verified { algorithm: "sha1" }
+    } else {
+        IntegrityCheck::Mismatch {
+            algorithm: "sha1",
+            expected: hex(expected),
+            actual: hex(&actual),
+        }
+    }
 }
 
 /// Read an entry's bytes from `source` by exact logical name, erroring if absent.
+///
+/// Used for the handful of one-off reads at build time (`Manifest.plist`,
+/// `Manifest.db`), so a linear scan is fine here — unlike the per-file blob reads,
+/// which go through [`BlobStore`].
 pub(crate) fn read_entry(source: &dyn Source, name: &str) -> Result<Vec<u8>> {
-    try_read_entry(source, name).with_context(|| format!("backup file {name} not found"))
-}
-
-/// Read an entry's bytes by exact logical name, or `None` if it is absent.
-fn try_read_entry(source: &dyn Source, name: &str) -> Option<Vec<u8>> {
-    let entry = source.entries().iter().find(|e| e.name == name)?;
-    source.content(entry).ok().map(|c| c.into_owned())
+    let entry = source
+        .entries()
+        .iter()
+        .find(|e| e.name == name)
+        .with_context(|| format!("backup file {name} not found"))?;
+    Ok(source.content(entry)?.into_owned())
 }
 
 /// Walk `Manifest.db`'s `Files` table into the regular files whose blob is present
@@ -91,17 +174,12 @@ fn try_read_entry(source: &dyn Source, name: &str) -> Option<Vec<u8>> {
 /// aligned and deterministic.
 pub(crate) fn read_present_files(
     manifest_db: &[u8],
-    inner: &dyn Source,
-    root_prefix: &str,
+    blobs: &BlobStore,
 ) -> (Vec<FileRecord>, usize) {
     let columns = ["fileID", "domain", "relativePath", "flags", "file"];
     let Some(rows) = read_sqlite_table(manifest_db, "Files", &columns) else {
         return (Vec::new(), 0);
     };
-
-    // Names present on disk, so a file the manifest lists but the backup does not
-    // actually hold is detected here rather than failing lazily when searched.
-    let present: HashSet<&str> = inner.entries().iter().map(|e| e.name.as_str()).collect();
 
     let mut records = Vec::new();
     let mut missing = 0usize;
@@ -121,8 +199,9 @@ pub(crate) fn read_present_files(
         let Some(mb) = parse_mbfile(file_blob) else {
             continue;
         };
-        let (sharded, flat) = blob_names(root_prefix, file_id);
-        if !present.contains(sharded.as_str()) && !present.contains(flat.as_str()) {
+        // A file the manifest lists but the backup does not actually hold is
+        // detected here rather than failing lazily when it is read.
+        if !blobs.holds_blob(file_id) {
             missing += 1;
             continue;
         }
@@ -153,48 +232,29 @@ pub(crate) fn logical_entry(name: &str, size: u64) -> Entry {
     }
 }
 
+/// Build a name → index map over `entries`.
+///
+/// WHY first-wins on a duplicate name: this replaced an `Iterator::position`
+/// scan, which returned the FIRST match. Two `Files` rows can in principle map to
+/// the same `domain/relativePath`, so inserting only when absent keeps the
+/// resolution identical to the scan it replaces.
+pub(crate) fn name_index(entries: &[Entry]) -> HashMap<String, usize> {
+    let mut map = HashMap::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        map.entry(entry.name.clone()).or_insert(idx);
+    }
+    map
+}
+
 /// The index in `entries` (and the parallel `meta`) of the entry named `name`.
 ///
 /// `entries` and a source's `meta` are built together and never reordered apart,
 /// so a name lookup yields the right metadata slot.
-pub(crate) fn meta_index(entries: &[Entry], name: &str) -> Result<usize> {
-    entries
-        .iter()
-        .position(|e| e.name == name)
+pub(crate) fn meta_index(index: &HashMap<String, usize>, name: &str) -> Result<usize> {
+    index
+        .get(name)
+        .copied()
         .with_context(|| format!("unknown backup entry {name}"))
-}
-
-/// Attest a file's on-disk blob against the SHA-1 `Digest` recorded in
-/// `Manifest.db`.
-///
-/// The recorded digest is the SHA-1 of the bytes as stored on disk — the
-/// ciphertext for an encrypted backup, the file content for an unencrypted one —
-/// so recomputing it from the blob attests the original evidence was read intact.
-/// Returns [`IntegrityCheck::Unrecorded`] when no digest is recorded or the blob
-/// cannot be located (degrade, don't fail — the export still records what it
-/// wrote).
-pub(crate) fn check_blob_digest(
-    inner: &dyn Source,
-    root_prefix: &str,
-    file_id: &str,
-    expected: Option<&[u8]>,
-) -> IntegrityCheck {
-    let Some(expected) = expected else {
-        return IntegrityCheck::Unrecorded;
-    };
-    let Ok(blob) = read_backup_blob(inner, root_prefix, file_id) else {
-        return IntegrityCheck::Unrecorded;
-    };
-    let actual = Sha1::digest(&blob);
-    if actual.as_slice() == expected {
-        IntegrityCheck::Verified { algorithm: "sha1" }
-    } else {
-        IntegrityCheck::Mismatch {
-            algorithm: "sha1",
-            expected: hex(expected),
-            actual: hex(&actual),
-        }
-    }
 }
 
 /// Lowercase-hex encode bytes (for digest reporting).
