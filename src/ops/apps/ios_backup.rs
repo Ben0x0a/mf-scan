@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use super::{AppContainer, ContainerKind};
 use crate::core::source::Source;
+use crate::platform::ios::domains::{self, BackupDomain};
 
 /// Resolve every app-scoped backup domain into an [`AppContainer`] (file counts
 /// are filled by the caller's tally pass). Non-app domains (`HomeDomain`,
@@ -55,23 +56,28 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
 /// Map a backup domain to its container kind and the app/group identifier it
 /// carries, or `None` for a non-app domain.
 ///
-/// WHY the `Plugin`/`Group` prefixes are tested before the bare `AppDomain-`:
-/// `AppDomainPlugin-` and `AppDomainGroup-` both start with `AppDomain`, so the
-/// more specific prefixes must win or an extension would be mis-read as the app.
+/// The domain grammar itself lives in [`crate::platform::ios::domains`], which is
+/// the single place the prefix set and its ordering are defined — this function
+/// only decides what each parsed domain means to the app catalogue.
 fn parse_domain(domain: &str) -> Option<(ContainerKind, String)> {
-    if let Some(id) = domain.strip_prefix("AppDomainPlugin-") {
-        Some((ContainerKind::Extension, id.to_string()))
-    } else if let Some(id) = domain.strip_prefix("AppDomainGroup-") {
-        Some((ContainerKind::AppGroup, id.to_string()))
-    } else if let Some(id) = domain.strip_prefix("SysSharedContainerDomain-") {
-        Some((ContainerKind::AppGroup, id.to_string()))
-    } else {
-        // `AppDomain-` is tested last because the more specific `AppDomainPlugin-`
-        // / `AppDomainGroup-` prefixes start with it.
-        domain
-            .strip_prefix("AppDomain-")
-            .map(|id| (ContainerKind::AppData, id.to_string()))
+    let parsed = domains::parse(domain)?;
+    // Only app-scoped domains name an installed app; the rest (HomeDomain,
+    // system containers, …) are not attributable to one.
+    if !parsed.is_app_scoped() {
+        return None;
     }
+    let id = parsed.identifier()?.to_string();
+    let kind = match parsed {
+        BackupDomain::App(_) => ContainerKind::AppData,
+        BackupDomain::Plugin(_) => ContainerKind::Extension,
+        // A shared App Group and a shared system group are the same kind of
+        // thing to the catalogue: storage several apps can reach.
+        BackupDomain::AppGroup(_) | BackupDomain::SystemGroup(_) => ContainerKind::AppGroup,
+        // Excluded by `is_app_scoped` above; a new app-scoped variant must be
+        // given a kind here rather than silently falling through.
+        other => unreachable!("non-app-scoped domain passed the guard: {other:?}"),
+    };
+    Some((kind, id))
 }
 
 #[cfg(test)]

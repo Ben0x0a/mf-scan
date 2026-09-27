@@ -28,6 +28,9 @@ use plist::Value;
 use super::{AppContainer, ContainerKind};
 use crate::core::source::Source;
 use crate::platform::ios::containers::AppContainerMap;
+use crate::platform::ios::domains::{
+    FRAGMENT_APPGROUP, FRAGMENT_BUNDLE_APPLICATION, FRAGMENT_PLUGINKIT,
+};
 
 /// Resolve every iOS container in `source` into an [`AppContainer`] (file counts
 /// are filled by the caller's tally pass).
@@ -58,12 +61,16 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
 /// extension/widget), `Shared/AppGroup` (a shared group), `Bundle/Application`
 /// (the installed `.app`). Any other `Data/*` container (e.g. an internal daemon)
 /// falls through to `AppData` so it is still listed rather than lost.
+///
+/// The root fragments come from [`crate::platform::ios::domains`], which is also
+/// where a rebuilt backup's container paths are built — so the paths this
+/// recognises and the paths a rebuild writes cannot drift apart.
 fn classify(dir: &str) -> (ContainerKind, Option<String>) {
-    let kind = if dir.contains("/PluginKitPlugin/") {
+    let kind = if dir.contains(FRAGMENT_PLUGINKIT) {
         ContainerKind::Extension
-    } else if dir.contains("/AppGroup/") {
+    } else if dir.contains(FRAGMENT_APPGROUP) {
         ContainerKind::AppGroup
-    } else if dir.contains("/Bundle/Application/") {
+    } else if dir.contains(FRAGMENT_BUNDLE_APPLICATION) {
         ContainerKind::Bundle
     } else {
         ContainerKind::AppData

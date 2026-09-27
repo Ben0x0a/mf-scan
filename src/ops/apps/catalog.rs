@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::core::models::Entry;
 use crate::core::source::Source;
+use crate::platform::ios::domains;
 use crate::platform::ios::references::McmReferences;
 
 use super::types::{AppContainer, AppSummary, ContainerKind, GroupLink, Platform, SigningRecord};
@@ -228,12 +229,16 @@ pub fn detect(source: &dyn Source) -> Platform {
 }
 
 /// Whether an entry name's first segment is an app-scoped iOS-backup domain.
+///
+/// Delegates to [`crate::platform::ios::domains`] so the prefix set is defined
+/// once. NOTE this counts only APP-SCOPED domains, so a backup holding no
+/// third-party app data scores zero here and [`detect`] reports
+/// `Platform::Unknown` for it. That is the long-standing behaviour and is left
+/// deliberately unchanged: `detect` drives every `app` subcommand, and widening
+/// it is a behavioural change that belongs in its own commit.
 fn is_backup_domain(name: &str) -> bool {
     let domain = name.split('/').next().unwrap_or("");
-    domain.starts_with("AppDomain-")
-        || domain.starts_with("AppDomainPlugin-")
-        || domain.starts_with("AppDomainGroup-")
-        || domain.starts_with("SysSharedContainerDomain-")
+    domains::parse(domain).is_some_and(|d| d.is_app_scoped())
 }
 
 /// Tally each container's file count and total size in one pass: every
