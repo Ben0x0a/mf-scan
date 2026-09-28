@@ -42,7 +42,8 @@ use plist::Value;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    BlobStore, logical_entry, meta_index, name_index, read_entry, read_present_files,
+    BackupStructure, BlobStore, logical_entry, meta_index, name_index, read_directory_records,
+    read_entry, read_present_files,
 };
 use crate::platform::ios::backup::keybag;
 use crate::platform::ios::backup::keys::{aes_cbc_decrypt, aes_unwrap};
@@ -91,6 +92,9 @@ pub struct EncryptedBackupSource<'a> {
     /// Entry name → index into `entries`/`meta`, so a lookup is a hash probe
     /// rather than a scan of every entry (see [`BlobStore`] for why).
     index: HashMap<String, usize>,
+    /// The directory and symlink rows, kept out of `entries` on purpose (see
+    /// [`BackupStructure`]).
+    structure: BackupStructure,
     /// Files `Manifest.db` lists as regular files but whose encrypted blob is
     /// absent on disk — surfaced (never dropped silently) as a sign of an
     /// incomplete or modified acquisition.
@@ -160,6 +164,7 @@ impl<'a> EncryptedBackupSource<'a> {
         // ── Read the Files table, build the logical entries ─────────────────
         let blobs = BlobStore::build(inner, &root_prefix);
         let (entries, meta, missing_files) = build_entries(&manifest_db, &blobs);
+        let structure = read_directory_records(&manifest_db);
 
         let index = name_index(&entries);
         Ok(Self {
@@ -170,6 +175,7 @@ impl<'a> EncryptedBackupSource<'a> {
             meta,
             index,
             missing_files,
+            structure,
             provenance,
         })
     }
@@ -209,6 +215,14 @@ impl<'a> EncryptedBackupSource<'a> {
         // CBC rounds up to a block; the manifest size is authoritative.
         plain.truncate(meta.size as usize);
         Ok(plain)
+    }
+
+    /// The directory and symlink rows `Manifest.db` records.
+    ///
+    /// Deliberately NOT part of `entries()`: see [`BackupStructure`] for the three
+    /// invariants that routing them through it would break.
+    pub fn structure(&self) -> &BackupStructure {
+        &self.structure
     }
 
     /// Read the encrypted on-disk blob for `file_id` from the inner source.

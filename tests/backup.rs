@@ -107,3 +107,44 @@ fn encrypted_backup_wrong_password_errors() {
     let p = profile::detect(&folder).unwrap();
     assert!(BackupSource::build(&folder, &p, Some("not-the-password")).is_err());
 }
+
+/// Directory and symlink rows are exposed SEPARATELY from `entries()`.
+///
+/// The three invariants this protects: `missing_files` must not count directories
+/// (they have no blob), the encrypted and plain sources must agree about what a
+/// backup contains, and `Source::content` must never be asked for a directory.
+#[test]
+fn directory_records_are_separate_from_entries() {
+    let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("fixture opens");
+    let profile = profile::detect(&folder).expect("fixture is recognised as a backup");
+    let source = BackupSource::build(&folder, &profile, None).expect("builds");
+
+    // The fixture carries one directory row (flags == 2).
+    let structure = source.structure();
+    assert!(
+        !structure.directories.is_empty(),
+        "the fixture's directory row must be reported"
+    );
+
+    // …and it must NOT appear among the file entries.
+    for dir in &structure.directories {
+        assert!(
+            !source.entries().iter().any(|e| &e.name == dir),
+            "directory {dir} leaked into entries()"
+        );
+    }
+
+    // No entry is a directory placeholder, so nothing can reach content() as one.
+    assert!(
+        !source.entries().iter().any(|e| e.is_dir()),
+        "entries() must stay files-only"
+    );
+
+    // The missing-file signal is unchanged by reading directories.
+    let record = source.record(&profile);
+    assert_eq!(
+        record.missing_files, 1,
+        "missing_files must still count only files"
+    );
+    assert_eq!(record.files, 3, "file count must be unchanged");
+}

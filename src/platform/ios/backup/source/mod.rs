@@ -24,6 +24,7 @@ use anyhow::Result;
 
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
+use crate::platform::ios::backup::common::BackupStructure;
 use crate::platform::ios::backup::password::BackupRecord;
 use crate::platform::ios::backup::profile::BackupProfile;
 
@@ -62,6 +63,16 @@ impl<'a> BackupSource<'a> {
     /// The provenance/audit record for this backup (encrypted vs not, how the
     /// password resolved, files mapped, and any listed-but-missing-on-disk count),
     /// for the stderr line and the scan report.
+    /// The directory and symlink rows the backup records, for a caller that
+    /// rebuilds the tree. Not exposed through [`Source::entries`] — see
+    /// [`crate::platform::ios::backup::common::BackupStructure`].
+    pub fn structure(&self) -> &BackupStructure {
+        match self {
+            Self::Encrypted(s) => s.structure(),
+            Self::Plain(s) => s.structure(),
+        }
+    }
+
     pub fn record(&self, profile: &BackupProfile) -> BackupRecord {
         match self {
             BackupSource::Encrypted(s) => BackupRecord::new(

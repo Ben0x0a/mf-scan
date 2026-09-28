@@ -11,15 +11,18 @@ from it. `mf_scan::<module>` is the library path each folder maps to.
 ```
 src/
   lib.rs        library root (declares the library modules below)
-  main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff | App
+  main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff | App |
+                IosBackup
 
   cmd/          BINARY ONLY — the CLI front end (declared in main.rs, not lib.rs)
     cli/          clap argument structs, split per subcommand
       mod.rs        Cli + Command enum
       grep.rs export.rs diff.rs app.rs   per-subcommand args (app.rs: grep/paths/export)
+      ios_backup.rs per-subcommand args (info / rebuild)
       common.rs     shared value types + size parser + the flatten arg-groups
                     (FilterArgs / DecryptArgs / ExportSink) reused by grep & diff
-    run/          one orchestrator per command (grep.rs / export.rs / diff.rs / app.rs)
+    run/          one orchestrator per command (grep.rs / export.rs / diff.rs / app.rs /
+                  ios_backup.rs)
     support/      machinery the commands share — sources (resolve operands), presets,
                   decryption setup, progress reporter, reporting, exporting
 
@@ -49,6 +52,9 @@ src/
   decrypt/      database decryption — profiles, keyfile providers, ciphers (see ADR 0001)
   platform/     per-OS artefact parsing (low-level; consumed by apps/)
     ios/          iOS-specific layers
+      domains.rs    backup domain grammar + device mount points (ADR 0004) — the ONE
+                    definition apps::ios_backup, apps::catalog and apps::ios_ffs
+                    all consume
       containers.rs GUID→bundle-id container annotation, + each extension
                     container's declared parent app (ParentBundleID)
       references.rs MobileContainerManager references.sqlite3: per-app code-signing
@@ -70,6 +76,8 @@ src/
       scan.rs base64.rs   per-entry byte search + base64 alignment fragments
       classify.rs   the per-entry body of the parallel map (filter→decrypt→search)
     diff/         compare two Sources -> DiffReport (mod.rs) using compare.rs (meta|hash)
+    rebuild.rs    whole iOS backup -> filesystem-like tree: one (prefix,label) root per
+                  domain, fed to report::export::plan_tree (`ios-backup rebuild`)
     apps/         locate & export an app's data across acquisition types (the `app`
                   subcommand). Layered ON TOP of a Source — search stays app-agnostic.
       mod.rs        thin dispatcher: re-exports the surface below
@@ -104,6 +112,7 @@ flowchart TD
             search["search"]
             diff["diff"]
             apps["apps"]
+            rebuild["rebuild"]
         end
         formats
         report
@@ -115,6 +124,7 @@ flowchart TD
     run --> search
     run --> diff
     run --> apps
+    run --> rebuild
     run --> report
     run --> core
     support --> search

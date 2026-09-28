@@ -23,7 +23,6 @@ use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
 use mf_scan::ops::search;
 use mf_scan::ops::search::Query;
-use mf_scan::platform::ios::backup::password::BackupRecord;
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{OutputFormat, write_counts, write_results};
@@ -39,7 +38,8 @@ use crate::cmd::support::reporting::{
     write_scan_report_if_enabled,
 };
 use crate::cmd::support::sources::{
-    BackupOptions, BackupProvenance, IoMode, ResolvedSource, resolve_sources, with_operand_source,
+    BackupFacts, BackupOptions, BackupProvenance, IoMode, ResolvedSource, resolve_sources,
+    with_operand_source,
 };
 
 /// Run the `grep` subcommand.
@@ -405,7 +405,7 @@ struct SearchCtx<'a> {
     /// The resolved backup password (flag/env), and the sink the open path fills
     /// when a source is an encrypted backup it unlocks.
     backup_opts: &'a BackupOptions,
-    backup_record: &'a RefCell<Option<BackupRecord>>,
+    backup_record: &'a RefCell<BackupFacts>,
 }
 
 /// Open one source, search it, and hand the findings to `handle`; then fold the
@@ -451,7 +451,7 @@ fn with_source<R>(
     archive_depth: u32,
     io_mode: IoMode,
     backup_opts: &BackupOptions,
-    backup_record: &RefCell<Option<BackupRecord>>,
+    backup_record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
     let operand = resolved.operand(archive_depth);

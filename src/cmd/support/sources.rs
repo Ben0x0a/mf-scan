@@ -23,6 +23,7 @@ use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::ranged::RangedZipSource;
 use mf_scan::core::source::tar::TarSource;
 use mf_scan::core::source::zip::ZipSource;
+use mf_scan::platform::ios::backup::common::BackupStructure;
 use mf_scan::platform::ios::backup::password::BackupRecord;
 use mf_scan::platform::ios::backup::profile;
 use mf_scan::platform::ios::backup::source::BackupSource;
@@ -129,25 +130,49 @@ impl ResolvedSource {
 /// `RefCell` here keeps that reporting rule in one place. (`diff` deliberately
 /// discards provenance, documented there, so it does not use this.)
 pub(crate) struct BackupProvenance {
-    record: RefCell<Option<BackupRecord>>,
+    facts: RefCell<BackupFacts>,
+}
+
+/// What the open path learned while recognising a backup source.
+///
+/// WHY the directory records ride along here rather than through
+/// [`crate::core::source::Source`]: they are not files and must not appear in
+/// `entries()` (see [`BackupStructure`]), but a caller that rebuilds the tree
+/// needs them. This sink already exists to carry backup-specific facts out of the
+/// closure, so it carries these too rather than widening the `Source` trait with
+/// something only one acquisition type has.
+#[derive(Default)]
+pub(crate) struct BackupFacts {
+    /// Unlock provenance, when the source was a backup.
+    pub(crate) record: Option<BackupRecord>,
+    /// The backup's directory and symlink records, when the source was a backup.
+    pub(crate) structure: Option<BackupStructure>,
 }
 
 impl BackupProvenance {
     pub(crate) fn new() -> Self {
         Self {
-            record: RefCell::new(None),
+            facts: RefCell::new(BackupFacts::default()),
         }
     }
 
-    /// The sink the open path fills when a source is an encrypted backup it unlocks.
-    pub(crate) fn sink(&self) -> &RefCell<Option<BackupRecord>> {
-        &self.record
+    /// The sink the open path fills when a source is a backup it recognises.
+    pub(crate) fn sink(&self) -> &RefCell<BackupFacts> {
+        &self.facts
+    }
+
+    /// The backup's directory/symlink records, if the source was a backup.
+    ///
+    /// Readable from inside the `with_operand_source` closure: the sink is filled
+    /// when the `BackupSource` is built, which happens before the closure runs.
+    pub(crate) fn structure(&self) -> Option<BackupStructure> {
+        self.facts.borrow().structure.clone()
     }
 
     /// Emit the stderr provenance line (if any) and return the record so the caller
     /// can also embed it in the scan report.
     pub(crate) fn report(self) -> Option<BackupRecord> {
-        let rec = self.record.into_inner();
+        let rec = self.facts.into_inner().record;
         if let Some(r) = &rec {
             eprintln!("{}", r.stderr_line());
         }
@@ -267,7 +292,7 @@ pub(crate) fn with_operand_source<R>(
     operand: Operand<'_>,
     backup: &BackupOptions,
     io_mode: IoMode,
-    record: &RefCell<Option<BackupRecord>>,
+    record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
     match operand {
@@ -365,7 +390,7 @@ fn statfs(path: &Path) -> Option<libc::statfs> {
 fn with_maybe_backup<R>(
     inner: &dyn Source,
     backup: &BackupOptions,
-    record: &RefCell<Option<BackupRecord>>,
+    record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
     match profile::detect(inner) {
@@ -375,7 +400,11 @@ fn with_maybe_backup<R>(
             // output and export use the real names and each file is attested
             // against its Manifest.db digest.
             let bs = BackupSource::build(inner, &p, backup.password.as_deref())?;
-            *record.borrow_mut() = Some(bs.record(&p));
+            {
+                let mut facts = record.borrow_mut();
+                facts.record = Some(bs.record(&p));
+                facts.structure = Some(bs.structure().clone());
+            }
             f(&bs)
         }
         // Not a backup at all: search the raw files unchanged.

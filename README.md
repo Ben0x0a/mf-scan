@@ -45,6 +45,13 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   and Android. App Groups are attributed **authoritatively** from the entitlements
   MobileContainerManager recorded for the app (with a vendor-token heuristic
   fallback where those are unavailable, such as on a backup). See [`app`](#app).
+- **Rebuild an iOS backup** (`mf-scan ios-backup rebuild`): turn an iTunes/Finder
+  backup's flat blob store back into the device's directory tree
+  (`HomeDomain/Library/SMS/sms.db` → `private/var/mobile/Library/SMS/sms.db`),
+  decrypting on the way when the password is known. Paths that had to be invented
+  (a backup records no container GUIDs) and domains with no known mount point are
+  reported, never disguised. `mf-scan ios-backup info` reports what a backup is
+  without writing anything. See [`ios-backup`](docs/ios-backup.md).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
 - **Find base64-encoded values** (`--base64`), **find files by path**

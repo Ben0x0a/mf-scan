@@ -16,8 +16,10 @@ mod app;
 mod diff;
 mod export;
 mod grep;
+mod ios_backup;
 
 pub(crate) use app::run_app;
 pub(crate) use diff::run_diff;
 pub(crate) use export::run_export;
 pub(crate) use grep::run_grep;
+pub(crate) use ios_backup::run_ios_backup;

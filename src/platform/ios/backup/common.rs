@@ -25,9 +25,13 @@ use crate::core::source::{IntegrityCheck, Source};
 use crate::formats::sqlite::{Value as SqliteValue, read_table as read_sqlite_table};
 use crate::platform::ios::backup::manifest::{MBFile, parse_mbfile};
 
-/// The `Files.flags` value marking a regular file. Directories and symlinks carry
-/// other values and are skipped.
+/// The `Files.flags` value marking a regular file.
 const FLAG_REGULAR_FILE: i64 = 1;
+/// The `Files.flags` value marking a directory. Directory rows carry no blob and
+/// are read separately by [`read_directory_records`], never through `entries()`.
+const FLAG_DIRECTORY: i64 = 2;
+/// The `Files.flags` value marking a symlink. Recorded for reporting, not recreated.
+const FLAG_SYMLINK: i64 = 4;
 
 /// One regular backed-up file recovered from `Manifest.db`, whose blob is present
 /// on disk. The two sources turn this into their own per-entry metadata.
@@ -214,6 +218,59 @@ pub(crate) fn read_present_files(
 
     records.sort_by(|a, b| a.name.cmp(&b.name));
     (records, missing)
+}
+
+/// The non-file structure a backup records: directories and symlinks.
+///
+/// WHY these are returned separately rather than as `entries()`:
+/// - a directory row has no blob, so the `Manifest.db` walk would count every one
+///   as a missing file and destroy the "incomplete or modified acquisition" signal
+///   that `missing_files` carries;
+/// - the encrypted source drops records with no `EncryptionKey`, which directories
+///   have none of, so the two sources would disagree about what a backup contains;
+/// - `report::export` calls `Source::content` unconditionally, so the first
+///   directory entry would abort a whole export.
+///
+/// Callers that want to recreate the tree ask for these explicitly.
+#[derive(Debug, Default, Clone)]
+pub struct BackupStructure {
+    /// Logical `domain/relativePath` names of directory records, sorted.
+    pub directories: Vec<String>,
+    /// Logical names of symlink records, sorted. Reported, never recreated — the
+    /// target is not recorded in a form we resolve, and writing a link into an
+    /// export is a way to escape it.
+    pub symlinks: Vec<String>,
+}
+
+/// Read the directory and symlink rows from `Manifest.db`.
+///
+/// Independent of [`read_present_files`], which handles regular files, so neither
+/// walk can perturb the other's counters.
+pub(crate) fn read_directory_records(manifest_db: &[u8]) -> BackupStructure {
+    let columns = ["domain", "relativePath", "flags"];
+    let Some(rows) = read_sqlite_table(manifest_db, "Files", &columns) else {
+        return BackupStructure::default();
+    };
+    let mut out = BackupStructure::default();
+    for row in rows {
+        let (Some(domain), Some(rel), Some(flags)) =
+            (as_text(&row[0]), as_text(&row[1]), as_int(&row[2]))
+        else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let name = format!("{domain}/{rel}");
+        match flags {
+            FLAG_DIRECTORY => out.directories.push(name),
+            FLAG_SYMLINK => out.symlinks.push(name),
+            _ => {}
+        }
+    }
+    out.directories.sort();
+    out.symlinks.sort();
+    out
 }
 
 /// Build the public logical [`Entry`] for a backup file.

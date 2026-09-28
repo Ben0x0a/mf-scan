@@ -395,19 +395,10 @@ pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPla
         .map(|file| {
             total_size += file.entry.uncompressed_size;
             let path = file.entry.name.as_str();
-            // The longest `prefix` that contains this file, with the file's path
-            // relative to that prefix.
-            let best = roots
-                .iter()
-                .filter_map(|(prefix, label)| {
-                    relative_under(prefix, path).map(|rel| (prefix.len(), label, rel))
-                })
-                .max_by_key(|(prefix_len, _, _)| *prefix_len);
-
-            let (folder, name) = match best {
-                Some((_, label, rel)) => {
+            let (folder, name) = match attribute(path, roots) {
+                Some((label, rel)) => {
                     let (dirs, base) = split_dir_base(rel);
-                    let mut folder = label.clone();
+                    let mut folder = label;
                     for seg in dirs {
                         folder.push('/');
                         folder.push_str(&sanitise_segment(seg));
@@ -447,6 +438,59 @@ fn relative_under<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
     }
     path.strip_prefix(prefix)
         .and_then(|rest| rest.strip_prefix('/'))
+}
+
+/// Attribute `path` to the longest root containing it, returning that root's
+/// sanitised output label and `path` relative to the root's prefix.
+///
+/// WHY longest-prefix wins: containers nest, so the most specific owner must claim
+/// the file. Shared by [`plan_tree`] (which then splits the remainder into folder
+/// and basename) and [`tree_dir`] (which keeps it whole), so a rebuilt tree's
+/// files and its directories cannot be attributed differently.
+fn attribute<'p>(path: &'p str, roots: &[(String, String)]) -> Option<(String, &'p str)> {
+    roots
+        .iter()
+        .filter_map(|(prefix, label)| {
+            relative_under(prefix, path).map(|rel| (prefix.len(), label, rel))
+        })
+        .max_by_key(|(prefix_len, _, _)| *prefix_len)
+        .map(|(_, label, rel)| (sanitise_label(label), rel))
+}
+
+/// The output-relative DIRECTORY path for a logical directory name under `roots`.
+///
+/// `None` when no root contains it. Used to recreate a backup's directory records,
+/// which are not files and so never appear in an [`ExportPlan`].
+pub fn tree_dir(path: &str, roots: &[(String, String)]) -> Option<String> {
+    let (label, rel) = attribute(path, roots)?;
+    let mut out = label;
+    for seg in rel.split('/').filter(|seg| !seg.is_empty()) {
+        out.push('/');
+        out.push_str(&sanitise_segment(seg));
+    }
+    Some(out)
+}
+
+/// Make an output label safe to join onto the destination directory.
+///
+/// Keeps the label's own `/` separators (it names a subtree, not one segment) but
+/// drops anything that would let it escape: a leading separator, and any `.` or
+/// `..` component. Each remaining component is sanitised like any other path
+/// segment.
+///
+/// WHY this is load-bearing: the destination is built with `dir.join(folder)`, and
+/// `Path::join` DISCARDS the base when its argument is absolute — `dir.join("/a")`
+/// is `/a`, not `dir/a`. Labels used to be copied verbatim, which was safe only
+/// because every caller derived them from bundle identifiers. A label built from
+/// iOS filesystem knowledge naturally reads `/private/var/mobile`, and that would
+/// have written to the real filesystem root instead of the export directory.
+fn sanitise_label(label: &str) -> String {
+    label
+        .split(['/', '\\'])
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .map(sanitise_segment)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Split a `/`-separated relative path into its directory segments and basename,
@@ -887,6 +931,100 @@ mod tests {
             },
             offsets: Vec::new(),
         }
+    }
+
+    /// An absolute label must not escape the destination. `Path::join` discards
+    /// its base for an absolute argument, so a label of `/private/var/mobile`
+    /// would previously have written to the real filesystem root.
+    #[test]
+    fn plan_tree_label_cannot_escape_the_destination() {
+        let files = vec![MatchedFile {
+            entry: Entry {
+                name: "HomeDomain/Library/SMS/sms.db".into(),
+                uncompressed_size: 4,
+                mtime: None,
+                location: Location::Loose {
+                    path: std::path::PathBuf::from("x"),
+                },
+            },
+            offsets: Vec::new(),
+        }];
+
+        for label in [
+            "/private/var/mobile",
+            "//private/var/mobile",
+            "../../private/var/mobile",
+            "private/../../../var/mobile",
+            r"\\private\\var\\mobile",
+        ] {
+            let roots = vec![("HomeDomain".to_string(), label.to_string())];
+            let plan = plan_tree(&files, &roots);
+            let folder = &plan.items[0].folder;
+            assert!(
+                !folder.starts_with('/') && !folder.starts_with('\\'),
+                "label {label:?} produced an absolute folder {folder:?}"
+            );
+            assert!(
+                !folder.split('/').any(|seg| seg == ".."),
+                "label {label:?} kept a parent-directory escape: {folder:?}"
+            );
+            // The joined destination must stay inside the export directory.
+            let dest = std::path::Path::new("/tmp/export").join(folder);
+            assert!(
+                dest.starts_with("/tmp/export"),
+                "label {label:?} escaped to {dest:?}"
+            );
+        }
+    }
+
+    /// A file and the directory containing it must land in the same place, or a
+    /// rebuilt tree would create the directory somewhere other than its contents.
+    #[test]
+    fn tree_dir_agrees_with_plan_tree() {
+        let roots = vec![("HomeDomain".to_string(), "private/var/mobile".to_string())];
+        let files = vec![MatchedFile {
+            entry: Entry {
+                name: "HomeDomain/Library/SMS/sms.db".into(),
+                uncompressed_size: 1,
+                mtime: None,
+                location: Location::Loose {
+                    path: std::path::PathBuf::from("x"),
+                },
+            },
+            offsets: Vec::new(),
+        }];
+        let plan = plan_tree(&files, &roots);
+        assert_eq!(plan.items[0].folder, "private/var/mobile/Library/SMS");
+        assert_eq!(
+            tree_dir("HomeDomain/Library/SMS", &roots).as_deref(),
+            Some("private/var/mobile/Library/SMS"),
+            "the directory record must map to exactly the folder its files land in"
+        );
+        assert_eq!(tree_dir("OtherDomain/x", &roots), None);
+    }
+
+    /// A well-formed relative label must survive untouched, so hardening the
+    /// label did not change the existing `app export` layout.
+    #[test]
+    fn plan_tree_leaves_a_relative_label_intact() {
+        let files = vec![MatchedFile {
+            entry: Entry {
+                name: "AppDomain-com.x/Documents/a.txt".into(),
+                uncompressed_size: 1,
+                mtime: None,
+                location: Location::Loose {
+                    path: std::path::PathBuf::from("x"),
+                },
+            },
+            offsets: Vec::new(),
+        }];
+        let roots = vec![(
+            "AppDomain-com.x".to_string(),
+            "com.x/AppData_5A92C2C1".to_string(),
+        )];
+        let plan = plan_tree(&files, &roots);
+        assert_eq!(plan.items[0].folder, "com.x/AppData_5A92C2C1/Documents");
+        assert_eq!(plan.items[0].name, "a.txt");
     }
 
     /// `plan_tree` preserves the directory tree under a per-container label, and

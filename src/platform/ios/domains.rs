@@ -60,10 +60,13 @@ pub enum FixedDomain {
 impl FixedDomain {
     /// Every fixed domain, paired with its `Manifest.db` spelling and mount point.
     const TABLE: &'static [(&'static str, FixedDomain, &'static str)] = &[
+        // NOT ".../Media": a CameraRollDomain relativePath already begins with
+        // "Media/" (verified against 2,638 rows of a real reconstruction), so
+        // appending it here doubled the segment. Same for MediaDomain below.
         (
             "CameraRollDomain",
             FixedDomain::CameraRoll,
-            "private/var/mobile/Media",
+            "private/var/mobile",
         ),
         ("DatabaseDomain", FixedDomain::Database, "private/var/db"),
         (
@@ -93,11 +96,7 @@ impl FixedDomain {
             FixedDomain::ManagedPreferences,
             "private/var/Managed Preferences",
         ),
-        (
-            "MediaDomain",
-            FixedDomain::Media,
-            "private/var/mobile/Media",
-        ),
+        ("MediaDomain", FixedDomain::Media, "private/var/mobile"),
         (
             "MobileDeviceDomain",
             FixedDomain::MobileDevice,
@@ -394,6 +393,63 @@ mod tests {
         for domain in ["AppDomain-com.x", "AppDomainPlugin-com.x.e", "HomeDomain"] {
             let mapped = parse(domain).unwrap().filesystem_path().path;
             assert!(!mapped.contains(FRAGMENT_BUNDLE_APPLICATION.trim_matches('/')));
+        }
+    }
+
+    /// Regression: a domain root must not repeat a segment the `relativePath`
+    /// already carries.
+    ///
+    /// Verified against 2,638 rows of a real iPhone reconstruction: every
+    /// `CameraRollDomain` path begins `Media/`, so mapping the domain to
+    /// `private/var/mobile/Media` produced `private/var/mobile/Media/Media/...`.
+    /// 35 rows were affected.
+    #[test]
+    fn domain_roots_do_not_double_a_relative_path_segment() {
+        // (domain, a real relativePath, the device path it must produce)
+        let cases = [
+            (
+                "CameraRollDomain",
+                "Media/PhotoData/Photos.sqlite",
+                "private/var/mobile/Media/PhotoData/Photos.sqlite",
+            ),
+            (
+                "CameraRollDomain",
+                "Media/DCIM/100APPLE/IMG_0001.JPG",
+                "private/var/mobile/Media/DCIM/100APPLE/IMG_0001.JPG",
+            ),
+            (
+                "MediaDomain",
+                "Media/Recordings/x.m4a",
+                "private/var/mobile/Media/Recordings/x.m4a",
+            ),
+            // A MediaDomain path that does NOT start with Media/ must land under
+            // Library, not under Media/Library.
+            (
+                "MediaDomain",
+                "Library/Logs/x.log",
+                "private/var/mobile/Library/Logs/x.log",
+            ),
+            // Unchanged mappings, guarding against over-correction.
+            (
+                "HomeDomain",
+                "Library/SMS/sms.db",
+                "private/var/mobile/Library/SMS/sms.db",
+            ),
+            (
+                "HealthDomain",
+                "Health/healthdb.sqlite",
+                "private/var/mobile/Library/Health/healthdb.sqlite",
+            ),
+        ];
+        for (domain, rel, expected) in cases {
+            let root = parse(domain).unwrap().filesystem_path().path;
+            let full = format!("{root}/{rel}");
+            assert_eq!(full, expected, "{domain} + {rel}");
+            let segs: Vec<&str> = full.split('/').collect();
+            assert!(
+                segs.windows(2).all(|w| w[0] != w[1]),
+                "{domain} + {rel} produced a doubled segment: {full}"
+            );
         }
     }
 

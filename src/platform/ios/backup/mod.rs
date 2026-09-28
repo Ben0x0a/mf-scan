@@ -62,7 +62,7 @@
 //! versus the SHA-1 of the *ciphertext* in the encrypted case — both are the SHA-1
 //! of the bytes on disk, so the `Source::integrity_check` is identical for both.
 
-pub(crate) mod common;
+pub mod common;
 pub mod keybag;
 pub mod keys;
 pub(crate) mod manifest;

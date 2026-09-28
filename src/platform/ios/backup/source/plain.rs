@@ -34,7 +34,8 @@ use anyhow::Result;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    self, BlobStore, logical_entry, meta_index, name_index, read_present_files,
+    self, BackupStructure, BlobStore, logical_entry, meta_index, name_index,
+    read_directory_records, read_present_files,
 };
 use crate::platform::ios::backup::profile::BackupProfile;
 
@@ -60,6 +61,9 @@ pub struct PlainBackupSource<'a> {
     /// Entry name → index into `entries`/`meta`, so a lookup is a hash probe
     /// rather than a scan of every entry (see [`BlobStore`] for why).
     index: HashMap<String, usize>,
+    /// The directory and symlink rows, kept out of `entries` on purpose (see
+    /// [`BackupStructure`]).
+    structure: BackupStructure,
     /// Files `Manifest.db` lists as regular files but whose blob is absent on
     /// disk — surfaced (never dropped silently) as a sign of an incomplete or
     /// modified acquisition.
@@ -80,6 +84,7 @@ impl<'a> PlainBackupSource<'a> {
 
         let blobs = BlobStore::build(inner, &root_prefix);
         let (records, missing_files) = read_present_files(&manifest_db, &blobs);
+        let structure = read_directory_records(&manifest_db);
         let mut entries = Vec::with_capacity(records.len());
         let mut meta = Vec::with_capacity(records.len());
         for r in records {
@@ -98,12 +103,21 @@ impl<'a> PlainBackupSource<'a> {
             meta,
             index,
             missing_files,
+            structure,
         })
     }
 
     /// The number of logical files this view exposes (provenance reporting).
     pub fn file_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The directory and symlink rows `Manifest.db` records.
+    ///
+    /// Deliberately NOT part of `entries()`: see [`BackupStructure`] for the three
+    /// invariants that routing them through it would break.
+    pub fn structure(&self) -> &BackupStructure {
+        &self.structure
     }
 
     /// The number of files `Manifest.db` listed whose blob was absent on disk —

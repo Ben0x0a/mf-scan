@@ -31,5 +31,6 @@ fn main() -> Result<()> {
         Command::Export(args) => cmd::run::run_export(args),
         Command::Diff(args) => cmd::run::run_diff(args),
         Command::App(args) => cmd::run::run_app(args),
+        Command::IosBackup(args) => cmd::run::run_ios_backup(args),
     }
 }

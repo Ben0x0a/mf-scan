@@ -29,7 +29,7 @@ use crate::cmd::cli::DiffArgs;
 use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
 use crate::cmd::support::sources::{
-    BackupOptions, IoMode, Operand, is_tar_path, with_operand_source,
+    BackupFacts, BackupOptions, IoMode, Operand, is_tar_path, with_operand_source,
 };
 
 /// Run the `diff` subcommand.
@@ -150,7 +150,9 @@ fn with_diff_side<R>(
             path.display()
         )
     };
-    let record = RefCell::new(None);
+    // diff deliberately discards backup provenance (documented above); the sink
+    // still has to exist for the open path to fill.
+    let record = RefCell::new(BackupFacts::default());
     // diff has no --io-mode flag; auto-detect a remote source per side.
     with_operand_source(
         operand,
