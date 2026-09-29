@@ -53,6 +53,7 @@ pub enum TypeDecision {
 
 /// Which entries to search: path include/exclude globs, a `--type` allowlist,
 /// and the media skip.
+#[derive(Clone)]
 pub struct EntryFilter {
     /// `--path` globs; empty means "every entry" (subject to the rules below).
     include: Vec<String>,
@@ -110,6 +111,19 @@ impl EntryFilter {
     /// separately by [`accept_type`](Self::accept_type) once the header has been
     /// inspected. Exclude wins over include — a path matching both is skipped,
     /// attributed to the matching `--not-path` glob.
+    /// A copy of this filter with extra include/exclude globs appended.
+    ///
+    /// Used to fold in globs derived from something the filter itself must not
+    /// know about — currently the iOS container globs an app-identity `--path`
+    /// pattern resolves to. Keeping the derivation outside means the filter, and
+    /// the search engine driving it, stay app-agnostic.
+    pub fn with_extra_globs(&self, include: &[String], exclude: &[String]) -> Self {
+        let mut widened = self.clone();
+        widened.include.extend_from_slice(include);
+        widened.exclude.extend_from_slice(exclude);
+        widened
+    }
+
     pub fn select(&self, path: &str) -> PathDecision {
         if !self.include.is_empty() && !self.include.iter().any(|g| matches(g, path)) {
             return PathDecision::SkipNotIncluded;
@@ -151,7 +165,7 @@ impl EntryFilter {
 }
 
 /// True if `path` matches the `*`/`?` wildcard `pattern`.
-fn matches(pattern: &str, path: &str) -> bool {
+pub fn matches(pattern: &str, path: &str) -> bool {
     wildcard_match(pattern.as_bytes(), path.as_bytes())
 }
 

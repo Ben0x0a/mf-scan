@@ -104,7 +104,11 @@ jobs:
           mkdir "${{ matrix.asset_stem }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${{ matrix.asset_stem }}/"
           cp README.md LICENSE "${{ matrix.asset_stem }}/"
-          cp -r presets "${{ matrix.asset_stem }}/"
+          # BOTH data directories must ship: each is resolved beside the binary at
+          # run time. `profiles/` was missing until v0.5.0, so every earlier release
+          # reported "no decryption profiles available" and could not decrypt
+          # anything, even though the profiles were in the repo.
+          cp -r presets profiles "${{ matrix.asset_stem }}/"
 
       # Unix: tar.gz preserves the executable bit. COPYFILE_DISABLE stops macOS
       # tar from injecting AppleDouble (._*) metadata files into the archive.

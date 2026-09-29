@@ -21,6 +21,7 @@ use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
+use mf_scan::ops::apps::expand_app_globs;
 use mf_scan::ops::search;
 use mf_scan::ops::search::Query;
 use mf_scan::platform::ios::containers::AppContainerMap;
@@ -125,7 +126,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, _source| {
+            with_searched_source(src, ctx, |findings, _source, _containers| {
                 for f in &findings.files {
                     let path = if multi {
                         format!("{}/{}", src.label, f.entry.name)
@@ -156,7 +157,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, source| {
+            with_searched_source(src, ctx, |findings, source, container_map| {
                 // Every record carries its source's full path (for JSON); multi-source
                 // runs also get the short display label (for txt/csv).
                 let full = src.path.display().to_string();
@@ -167,13 +168,12 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                     }
                 }
 
-                // iOS container annotation: build the container map once per source
-                // (reads only the small metadata plists), then set bundle_id on every
-                // record whose path falls inside a known container directory.
-                // WHY post-search, not in the hot parallel path: this is a cheap
-                // sequential pass; container metadata plists are tiny; and the parallel
-                // engine must remain oblivious to iOS-specific enrichment.
-                let container_map = AppContainerMap::build(source);
+                // iOS container annotation: set bundle_id on every record whose
+                // path falls inside a known container directory. The map was built
+                // before the search (it also widens the path filter), so this is a
+                // cheap sequential pass.
+                // WHY post-search, not in the hot parallel path: the parallel engine
+                // must remain oblivious to iOS-specific enrichment.
                 if !container_map.is_empty() {
                     for r in &mut findings.records {
                         r.bundle_id = container_map.resolve(&r.path).map(str::to_string);
@@ -415,7 +415,11 @@ struct SearchCtx<'a> {
 fn with_searched_source(
     src: &ResolvedSource,
     ctx: SearchCtx<'_>,
-    handle: impl FnOnce(&mut mf_scan::ops::search::Findings, &dyn Source) -> Result<()>,
+    handle: impl FnOnce(
+        &mut mf_scan::ops::search::Findings,
+        &dyn Source,
+        &AppContainerMap,
+    ) -> Result<()>,
 ) -> Result<()> {
     with_source(
         src,
@@ -425,21 +429,66 @@ fn with_searched_source(
         ctx.backup_record,
         |source, raw| {
             let verify_before = (ctx.cli.verify).then(|| raw.map(sha256_hex)).flatten();
+
+            // Build the container map BEFORE the search: it both widens the path
+            // filter (an app-identity `--path` glob names a GUID-named container)
+            // and annotates the records afterwards, so it is built once and used
+            // twice rather than rebuilt.
+            let container_map = AppContainerMap::build(source);
+            let widened = widen_filter_for_apps(ctx.filter, &container_map, ctx.cli);
+            let filter = widened.as_ref().unwrap_or(ctx.filter);
+
             let mut findings = search_with_reporter(
                 source,
                 ctx.query,
                 ctx.deep,
                 ctx.cli.match_path,
-                ctx.filter,
+                filter,
                 ctx.decrypt_ctx,
             )?;
-            handle(&mut findings, source)?;
+            handle(&mut findings, source, &container_map)?;
             ctx.decryptions.append(&mut findings.decryptions);
             ctx.stats.merge(findings.stats);
             report_verify_for(ctx.cli.verify, verify_before, raw);
             Ok(())
         },
     )
+}
+
+/// Widen the path filter with the containers an app-identity `--path`/`--not-path`
+/// glob names, or `None` when nothing resolved.
+///
+/// On a full-filesystem acquisition an app's container is named by a GUID, so
+/// `--path '*com.burbn.instagram*'` matches nothing even though the identifier is
+/// recorded in the container's metadata plist. Resolving it here — once, before the
+/// search — keeps the engine and the filter app-agnostic.
+///
+/// What was added is reported, because a filter that quietly matches more than it
+/// was asked to is worse than one that matches less.
+fn widen_filter_for_apps(
+    filter: &EntryFilter,
+    map: &AppContainerMap,
+    cli: &GrepArgs,
+) -> Option<EntryFilter> {
+    if map.is_empty() || (cli.filter.path.is_empty() && cli.filter.not_path.is_empty()) {
+        return None;
+    }
+    let include = expand_app_globs(map, &cli.filter.path);
+    let exclude = expand_app_globs(map, &cli.filter.not_path);
+    if include.is_empty() && exclude.is_empty() {
+        return None;
+    }
+    for (resolved, flag) in [(&include, "--path"), (&exclude, "--not-path")] {
+        for g in resolved {
+            eprintln!(
+                "{flag} {:?} resolved to app {} -> {}",
+                g.pattern, g.bundle_id, g.glob
+            );
+        }
+    }
+    let include: Vec<String> = include.into_iter().map(|g| g.glob).collect();
+    let exclude: Vec<String> = exclude.into_iter().map(|g| g.glob).collect();
+    Some(filter.with_extra_globs(&include, &exclude))
 }
 
 /// Adapt a pre-resolved [`ResolvedSource`] onto the shared [`with_operand_source`]

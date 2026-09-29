@@ -69,6 +69,27 @@ pub struct AppContainerMap {
 }
 
 impl AppContainerMap {
+    /// Build a map directly from `(container_dir, bundle_id)` pairs.
+    ///
+    /// For tests and for callers that already know the container layout; the
+    /// normal path is [`AppContainerMap::build`], which reads it from the source.
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            map: pairs
+                .iter()
+                .map(|(dir, id)| {
+                    (
+                        (*dir).to_string(),
+                        ContainerMeta {
+                            identifier: (*id).to_string(),
+                            parent_id: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     /// Build the map by iterating all entries in `source` and parsing every
     /// container-metadata plist found.
     ///

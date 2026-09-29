@@ -28,10 +28,12 @@
 
 pub mod android;
 pub mod catalog;
+pub mod globs;
 
 pub mod ios_backup;
 pub mod ios_ffs;
 pub mod types;
 
 pub use catalog::{AppCatalog, detect, entries_under};
+pub use globs::{AppGlob, expand as expand_app_globs};
 pub use types::{AppContainer, AppSummary, ContainerKind, GroupLink, Platform, SigningRecord};

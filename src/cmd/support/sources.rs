@@ -226,20 +226,27 @@ pub(crate) fn resolve_sources(
                 kind: ResolvedKind::Folder,
             });
         } else if recursive {
-            let mut zips = Vec::new();
-            collect_zips(arg, &mut zips)
+            let mut archives = Vec::new();
+            collect_archives(arg, &mut archives)
                 .with_context(|| format!("cannot read directory {}", arg.display()))?;
-            zips.sort();
-            for zip in zips {
-                let label = zip
+            archives.sort();
+            for archive in archives {
+                let label = archive
                     .strip_prefix(arg)
-                    .unwrap_or(&zip)
+                    .unwrap_or(&archive)
                     .to_string_lossy()
                     .into_owned();
+                // Classify each harvested file the same way a directly-named one
+                // is, so `-r` and naming the archive give identical treatment.
+                let kind = if is_tar_path(&archive) {
+                    ResolvedKind::Tar
+                } else {
+                    ResolvedKind::Archive
+                };
                 sources.push(ResolvedSource {
-                    path: zip,
+                    path: archive,
                     label,
-                    kind: ResolvedKind::Archive,
+                    kind,
                 });
             }
         } else {
@@ -309,12 +316,13 @@ pub(crate) fn with_operand_source<R>(
             let source = ZipSource::open(&mmap)?;
             with_maybe_backup(&source, backup, record, |s| f(s, Some(&mmap)))
         }
-        // Tar owns its backing buffer (mmap or the decompressed stream) internally,
-        // so there is no single raw slice to hand to `--verify` — like a folder, it
-        // passes `None` (the per-file offsets are still exact for a plain `.tar`).
+        // Tar keeps its on-disk mapping alive alongside any inflated stream, so
+        // `--verify` attests the archive FILE — the `.tar.gz` as stored, not the
+        // bytes it inflates to (which would be identical after a re-compression at
+        // a different level, and so a weaker attestation).
         Operand::Tar(path) => {
             let source = TarSource::open(path)?;
-            with_maybe_backup(&source, backup, record, |s| f(s, None))
+            with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
         }
         Operand::Folder {
             path,
@@ -412,18 +420,94 @@ fn with_maybe_backup<R>(
     }
 }
 
-/// Recursively collect `*.zip` files under `dir` into `out`.
-fn collect_zips(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// Recursively collect the archives `-r` should scan under `dir` into `out`.
+///
+/// Both ZIP and tar (`.tar`, `.tar.gz`, `.tgz`) are harvested. WHY tar belongs
+/// here: it is a first-class acquisition container everywhere else in the tool, so
+/// collecting only `*.zip` made `-r` silently skip every tar acquisition in a case
+/// folder — a scope loss the operator had no way to notice.
+///
+/// Tar membership is decided by [`is_tar_path`], the same predicate that
+/// classifies a directly-named operand, so the two cannot diverge.
+fn collect_archives(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_zips(&path, out)?;
-        } else if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            collect_archives(&path, out)?;
+        } else if is_tar_path(&path)
+            || path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
         {
             out.push(path);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// `-r` must harvest tar acquisitions, not just ZIPs.
+    ///
+    /// Collecting only `*.zip` made `mf-scan grep -r ./cases` silently skip every
+    /// `.tar`/`.tar.gz` in a case folder — a scope loss with no visible symptom,
+    /// which is the worst kind for a forensic tool.
+    #[test]
+    fn recursive_harvest_collects_zip_and_tar() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).expect("subdir");
+        for rel in [
+            "a.zip",
+            "sub/b.tar",
+            "sub/c.tar.gz",
+            "sub/d.tgz",
+            "e.ZIP",
+            "notes.txt",
+            "image.jpg",
+        ] {
+            std::fs::write(root.join(rel), b"x").expect("write");
+        }
+
+        let mut found = Vec::new();
+        collect_archives(root, &mut found).expect("walks");
+        let mut names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec!["a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.ZIP"],
+            "every archive form must be harvested, and nothing else"
+        );
+    }
+
+    /// A harvested archive must be classified exactly as a directly-named one, or
+    /// `-r` would hand a tar to the ZIP reader.
+    #[test]
+    fn recursive_harvest_classifies_tar_as_tar() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("a.zip"), b"x").expect("write");
+        std::fs::write(root.join("b.tar.gz"), b"x").expect("write");
+
+        let resolved = resolve_sources(&[root.to_path_buf()], false, true).expect("resolves");
+        let kinds: Vec<(String, bool)> = resolved
+            .iter()
+            .map(|r| {
+                (
+                    r.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    matches!(r.kind, ResolvedKind::Tar),
+                )
+            })
+            .collect();
+
+        assert!(kinds.contains(&("a.zip".to_string(), false)), "{kinds:?}");
+        assert!(kinds.contains(&("b.tar.gz".to_string(), true)), "{kinds:?}");
+    }
 }

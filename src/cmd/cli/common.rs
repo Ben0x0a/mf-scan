@@ -71,6 +71,10 @@ impl PlatformArg {
 pub(crate) struct FilterArgs {
     /// Only handle files whose internal path matches this wildcard (`*`, `?`).
     /// Repeatable; a file matching any pattern is kept.
+    ///
+    /// A pattern that names an iOS app by bundle identifier also matches that
+    /// app's container, whose directory is named by a GUID and so contains the
+    /// identifier nowhere. Each such resolution is reported on stderr.
     #[arg(long = "path", value_name = "GLOB")]
     pub(crate) path: Vec<String>,
 

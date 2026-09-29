@@ -29,38 +29,23 @@ use crate::core::source::{Content, Source, nested};
 /// A tar block: header and data are both padded to this size.
 const BLOCK: usize = 512;
 
-/// How a [`TarSource`]'s bytes are backed, which decides whether byte offsets are
-/// true file offsets (a carve coordinate) or index a decompressed stream.
-enum Backing {
-    /// A memory map of a plain `.tar` — offsets are true offsets in the file.
-    Mapped(memmap2::Mmap),
-    /// The decompressed stream of a `.tar.gz`/`.tgz` — offsets index the stream,
-    /// not the on-disk file, so they are not archive carve coordinates.
-    Owned(Vec<u8>),
-}
-
-impl Backing {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Backing::Mapped(m) => m,
-            Backing::Owned(v) => v,
-        }
-    }
-
-    /// Whether byte offsets into [`bytes`](Self::bytes) are true offsets in the
-    /// on-disk file (a plain `.tar`) rather than into a decompressed stream.
-    fn physical(&self) -> bool {
-        matches!(self, Backing::Mapped(_))
-    }
-}
-
 /// A [`Source`] backed by a tar archive (plain or gzip-compressed).
 ///
 /// Parses the whole block sequence once on [`TarSource::open`], then serves each
 /// entry's bytes straight from the backing buffer (always zero-copy — tar stores
 /// files uncompressed and contiguous).
 pub struct TarSource {
-    backing: Backing,
+    /// The archive exactly as it is on disk, always mapped.
+    ///
+    /// WHY kept even when the stream is decompressed: `--verify` attests the
+    /// EVIDENCE FILE, so it must hash the `.tar.gz` as stored, not the bytes it
+    /// inflates to. Hashing the inflated stream would also be a weaker
+    /// attestation — re-compressing the same content at a different level yields
+    /// identical inflated bytes.
+    raw: memmap2::Mmap,
+    /// The tar stream, when it had to be inflated. `None` for a plain `.tar`,
+    /// whose stream IS [`raw`](Self::raw).
+    inflated: Option<Vec<u8>>,
     entries: Vec<Entry>,
 }
 
@@ -77,15 +62,38 @@ impl TarSource {
         // as the ZIP and large-loose-file mmap paths.
         let map = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("cannot map {}", path.display()))?;
-        let backing = if map.starts_with(&[0x1f, 0x8b]) {
-            let bytes =
-                gunzip(&map).with_context(|| format!("cannot decompress {}", path.display()))?;
-            Backing::Owned(bytes)
+        let inflated = if map.starts_with(&[0x1f, 0x8b]) {
+            Some(gunzip(&map).with_context(|| format!("cannot decompress {}", path.display()))?)
         } else {
-            Backing::Mapped(map)
+            None
         };
-        let entries = parse_entries(backing.bytes());
-        Ok(Self { backing, entries })
+        let entries = parse_entries(inflated.as_deref().unwrap_or(&map));
+        Ok(Self {
+            raw: map,
+            inflated,
+            entries,
+        })
+    }
+}
+
+impl TarSource {
+    /// The tar stream the entries index into.
+    fn stream(&self) -> &[u8] {
+        self.inflated.as_deref().unwrap_or(&self.raw)
+    }
+
+    /// Whether entry offsets are true offsets in the on-disk file (a plain
+    /// `.tar`) rather than into a decompressed stream.
+    fn physical(&self) -> bool {
+        self.inflated.is_none()
+    }
+
+    /// The archive exactly as stored on disk, for `--verify` attestation.
+    ///
+    /// This is the `.tar.gz` as written, NOT the stream it inflates to, so the
+    /// hash attests the evidence file itself.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.raw
     }
 }
 
@@ -105,7 +113,7 @@ impl Source for TarSource {
                 entry.name
             );
         };
-        let bytes = self.backing.bytes();
+        let bytes = self.stream();
         let start = *data_offset as usize;
         let end = start
             .checked_add(*data_len as usize)
@@ -115,7 +123,7 @@ impl Source for TarSource {
     }
 
     fn byte_size(&self) -> u64 {
-        self.backing.bytes().len() as u64
+        self.stream().len() as u64
     }
 
     /// A plain `.tar` entry's data offset is a true file offset (a real carve
@@ -123,7 +131,7 @@ impl Source for TarSource {
     /// no absolute archive byte can be reported (like a loose/nested entry).
     fn archive_data_start(&self, entry: &Entry) -> Option<u64> {
         match &entry.location {
-            Location::Tar { data_offset, .. } if self.backing.physical() => Some(*data_offset),
+            Location::Tar { data_offset, .. } if self.physical() => Some(*data_offset),
             _ => None,
         }
     }
@@ -371,7 +379,7 @@ mod tests {
     }
 
     /// Assemble a plain tar from `(name, data)` pairs, terminated by two zero blocks.
-    fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, data) in files {
             out.extend_from_slice(&header(name, data.len(), b'0'));
@@ -489,5 +497,63 @@ mod tests {
         assert_eq!(&*src.content(e).unwrap(), b"needle-bytes");
         // A plain `.tar` is memory-mapped, so the data offset is a true file offset.
         assert_eq!(src.archive_data_start(e), Some(512));
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use std::io::Write as _;
+    use tempfile::tempdir;
+
+    fn tar_bytes() -> Vec<u8> {
+        super::tests::build_tar(&[("a.txt", b"hello tar")])
+    }
+
+    /// `--verify` must attest the archive FILE. For a plain `.tar` the stream and
+    /// the file are the same bytes.
+    #[test]
+    fn raw_bytes_of_a_plain_tar_are_the_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("a.tar");
+        let bytes = tar_bytes();
+        std::fs::write(&path, &bytes).expect("write");
+
+        let source = TarSource::open(&path).expect("opens");
+        assert_eq!(source.raw_bytes(), bytes.as_slice());
+        assert_eq!(source.stream(), bytes.as_slice());
+        assert!(source.physical(), "a plain tar keeps true file offsets");
+    }
+
+    /// For a `.tar.gz` the two DIFFER, and `raw_bytes` must be the compressed file
+    /// as stored — hashing the inflated stream would attest something that is not
+    /// the evidence, and would be identical after a re-compression at another
+    /// level.
+    #[test]
+    fn raw_bytes_of_a_gzipped_tar_are_the_compressed_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("a.tar.gz");
+        let plain = tar_bytes();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("compress");
+        let compressed = encoder.finish().expect("finish");
+        std::fs::write(&path, &compressed).expect("write");
+
+        let source = TarSource::open(&path).expect("opens");
+        assert_eq!(
+            source.raw_bytes(),
+            compressed.as_slice(),
+            "raw_bytes must be the .tar.gz as stored"
+        );
+        assert_ne!(
+            source.raw_bytes(),
+            source.stream(),
+            "the stored file and the inflated stream must not be conflated"
+        );
+        assert_eq!(source.stream(), plain.as_slice());
+        assert!(
+            !source.physical(),
+            "gzip offsets index the stream, not the file"
+        );
     }
 }
