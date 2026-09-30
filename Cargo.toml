@@ -2,6 +2,11 @@
 name = "mf-scan"
 version = "0.5.1"
 edition = "2024"
+# Minimum supported Rust. 1.98 stabilised `slice::as_chunks`, which the hex, UTF-16
+# and WAL-checksum decoders use so their fixed-size indices are checked at compile
+# time instead of at run time. Declared explicitly so a build on an older toolchain
+# fails with a clear message rather than an obscure "method not found".
+rust-version = "1.98"
 description = "Fast, forensic-aware search, export, and diff over mobile-acquisition archives and folders."
 keywords = ["forensics", "zip", "grep", "search", "mobile"]
 categories = ["command-line-utilities", "filesystem"]

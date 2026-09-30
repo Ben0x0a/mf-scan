@@ -399,8 +399,10 @@ fn decode_hex(data: &[u8]) -> Result<Vec<u8>> {
         bail!("hex key has an odd number of digits ({})", digits.len());
     }
     let mut out = Vec::with_capacity(digits.len() / 2);
-    for pair in digits.chunks_exact(2) {
-        out.push((hex_val(pair[0])? << 4) | hex_val(pair[1])?);
+    // `as_chunks` yields fixed-size arrays, so the two indices below are checked
+    // at compile time rather than at run time.
+    for [hi, lo] in digits.as_chunks::<2>().0 {
+        out.push((hex_val(*hi)? << 4) | hex_val(*lo)?);
     }
     Ok(out)
 }

@@ -147,7 +147,7 @@ fn accumulate(seed: (u32, u32), bytes: &[u8], big_endian: bool) -> Option<(u32, 
         return None;
     }
     let (mut s0, mut s1) = seed;
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let raw = |a: &[u8]| -> u32 {
             let w: [u8; 4] = a.try_into().unwrap_or([0; 4]);
             if big_endian {
