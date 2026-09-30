@@ -107,6 +107,7 @@ fn run_rebuild(args: IosBackupRebuildArgs) -> Result<()> {
             .collect();
 
         let export_plan = export::plan_tree(&files, &plan.roots);
+        report_renamed(&export_plan);
         let run = rebuild_run_info(path);
 
         report_plan(&plan, files.len(), export_plan.total_size);
@@ -174,6 +175,27 @@ fn create_directories(dir: &std::path::Path, directories: &[String]) -> Result<(
             .map_err(|e| anyhow!("cannot create {}: {e}", target.display()))?;
     }
     Ok(())
+}
+
+/// Report any destination that had to be renamed to avoid overwriting another.
+///
+/// A backup can hold two files whose paths differ only in case — on a real iPhone,
+/// `com.apple.Preferences.plist` and `com.apple.preferences.plist` are distinct
+/// files. On a case-insensitive file system one would overwrite the other, so the
+/// second is given a `~1` suffix. Silently renaming a file is nearly as bad as
+/// silently losing it, so every instance is named.
+fn report_renamed(plan: &export::ExportPlan) {
+    if plan.renamed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "⚠ {} file(s) renamed: another file already claimed that destination \
+         (paths differing only in case collide on macOS/Windows):",
+        plan.renamed.len()
+    );
+    for r in &plan.renamed {
+        eprintln!("    {} -> {}", r.wanted, r.used);
+    }
 }
 
 /// Report what the plan will do, including everything an examiner must not

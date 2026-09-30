@@ -20,7 +20,7 @@
 //! appended, since the archive offset is unique. Only a basename is ever joined
 //! under the folder, so an entry path can never escape `DIR` (no zip-slip).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -85,6 +85,21 @@ impl ExportItem {
 pub struct ExportPlan {
     pub items: Vec<ExportItem>,
     pub total_size: u64,
+    /// Files whose destination had to be renamed because another file already
+    /// claimed that path. Empty in the normal case, and reported when not: a tool
+    /// must not quietly hand back a name other than the one it was asked for.
+    pub renamed: Vec<Renamed>,
+}
+
+/// One file whose output path collided with another's and was disambiguated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    /// The path inside the source.
+    pub internal_path: String,
+    /// The destination it would have taken.
+    pub wanted: String,
+    /// The destination it was given instead.
+    pub used: String,
 }
 
 /// One exported file recorded with its integrity hashes, for the export report.
@@ -367,7 +382,55 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
         }
     }
 
-    ExportPlan { items, total_size }
+    let renamed = disambiguate(&mut items);
+    ExportPlan {
+        items,
+        total_size,
+        renamed,
+    }
+}
+
+/// Give every item a destination no other item claims, comparing case-INSENSITIVELY.
+///
+/// WHY case-insensitively even on a case-sensitive host: macOS and Windows file
+/// systems are case-insensitive by default, so `com.apple.Preferences.plist` and
+/// `com.apple.preferences.plist` — two DISTINCT files with distinct `fileID`s, both
+/// present in a real iPhone backup — silently overwrite each other there. Folding
+/// only on hosts that need it would make the output depend on where the tool ran,
+/// which is exactly what a forensic export must not do: the same evidence must
+/// produce the same tree everywhere.
+///
+/// The suffix format (`name~1`, `name~2`) matches the Python
+/// `ios-backup-reconstructor`, so the two tools agree on the resulting paths.
+///
+/// Items are walked in order and the FIRST claimant keeps the unsuffixed name.
+/// Callers build `items` from entries sorted by name, so the assignment is
+/// reproducible.
+fn disambiguate(items: &mut [ExportItem]) -> Vec<Renamed> {
+    let mut claimed: HashSet<String> = HashSet::with_capacity(items.len());
+    let mut renamed = Vec::new();
+    for item in items.iter_mut() {
+        let wanted = item.output_path();
+        if claimed.insert(wanted.to_ascii_lowercase()) {
+            continue;
+        }
+        let base = item.name.clone();
+        let mut suffix = 1usize;
+        loop {
+            item.name = format!("{base}~{suffix}");
+            let candidate = item.output_path();
+            if claimed.insert(candidate.to_ascii_lowercase()) {
+                renamed.push(Renamed {
+                    internal_path: item.internal_path.clone(),
+                    wanted,
+                    used: candidate,
+                });
+                break;
+            }
+            suffix += 1;
+        }
+    }
+    renamed
 }
 
 /// Build an export plan that PRESERVES each file's directory tree under a
@@ -390,7 +453,7 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
 /// re-ingestion still passes through [`safe_join`], which rejects any `..`.
 pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPlan {
     let mut total_size = 0u64;
-    let items = files
+    let mut items: Vec<ExportItem> = files
         .iter()
         .map(|file| {
             total_size += file.entry.uncompressed_size;
@@ -426,7 +489,12 @@ pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPla
         })
         .collect();
 
-    ExportPlan { items, total_size }
+    let renamed = disambiguate(&mut items);
+    ExportPlan {
+        items,
+        total_size,
+        renamed,
+    }
 }
 
 /// The portion of `path` inside container `prefix`: `Some("")` when `path` IS the
@@ -975,6 +1043,112 @@ mod tests {
                 "label {label:?} escaped to {dest:?}"
             );
         }
+    }
+
+    /// Regression: two files whose paths differ ONLY in case must both survive.
+    ///
+    /// A real iPhone backup holds `com.apple.Preferences.plist` and
+    /// `com.apple.preferences.plist` as distinct files with distinct `fileID`s. On
+    /// a case-insensitive file system the second overwrote the first, so a rebuild
+    /// reported 815 files exported while writing 813 to disk — silent evidence
+    /// loss, with a report that said otherwise.
+    #[test]
+    fn plan_tree_does_not_let_case_colliding_files_overwrite_each_other() {
+        let names = [
+            "HomeDomain/Library/Preferences/com.apple.Preferences.plist",
+            "HomeDomain/Library/Preferences/com.apple.preferences.plist",
+            "HomeDomain/Library/Preferences/com.apple.SpringBoard.plist",
+            "HomeDomain/Library/Preferences/com.apple.springboard.plist",
+        ];
+        let files: Vec<MatchedFile> = names
+            .iter()
+            .map(|n| MatchedFile {
+                entry: Entry {
+                    name: (*n).to_string(),
+                    uncompressed_size: 1,
+                    mtime: None,
+                    location: Location::Loose {
+                        path: std::path::PathBuf::from(n),
+                    },
+                },
+                offsets: Vec::new(),
+            })
+            .collect();
+        let roots = vec![("HomeDomain".to_string(), "private/var/mobile".to_string())];
+        let plan = plan_tree(&files, &roots);
+
+        assert_eq!(plan.items.len(), 4, "every file must still be planned");
+        let destinations: HashSet<String> = plan
+            .items
+            .iter()
+            .map(|i| i.output_path().to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            destinations.len(),
+            4,
+            "each file needs a destination no other file claims, case-insensitively: {:?}",
+            plan.items
+                .iter()
+                .map(|i| i.output_path())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.renamed.len(), 2, "the two collisions must be reported");
+        // The first claimant keeps the plain name; the suffix matches the Python tool.
+        assert!(
+            plan.renamed.iter().all(|r| r.used.ends_with("~1")),
+            "{:?}",
+            plan.renamed
+        );
+    }
+
+    /// The flat layout must hold the same invariant.
+    #[test]
+    fn plan_does_not_let_two_files_share_a_destination() {
+        let files: Vec<MatchedFile> = ["a/X.db", "a/x.db"]
+            .iter()
+            .map(|n| MatchedFile {
+                entry: Entry {
+                    name: (*n).to_string(),
+                    uncompressed_size: 1,
+                    mtime: None,
+                    location: Location::Loose {
+                        path: std::path::PathBuf::from(n),
+                    },
+                },
+                offsets: Vec::new(),
+            })
+            .collect();
+        let plan = plan(&files);
+        let destinations: HashSet<String> = plan
+            .items
+            .iter()
+            .map(|i| i.output_path().to_ascii_lowercase())
+            .collect();
+        assert_eq!(destinations.len(), 2);
+    }
+
+    /// Without a collision nothing is renamed, so ordinary exports are unchanged.
+    #[test]
+    fn distinct_paths_are_never_renamed() {
+        let files: Vec<MatchedFile> = ["HomeDomain/a.db", "HomeDomain/b.db"]
+            .iter()
+            .map(|n| MatchedFile {
+                entry: Entry {
+                    name: (*n).to_string(),
+                    uncompressed_size: 1,
+                    mtime: None,
+                    location: Location::Loose {
+                        path: std::path::PathBuf::from(n),
+                    },
+                },
+                offsets: Vec::new(),
+            })
+            .collect();
+        let roots = vec![("HomeDomain".to_string(), "private/var/mobile".to_string())];
+        let plan = plan_tree(&files, &roots);
+        assert!(plan.renamed.is_empty());
+        assert_eq!(plan.items[0].name, "a.db");
+        assert_eq!(plan.items[1].name, "b.db");
     }
 
     /// A file and the directory containing it must land in the same place, or a

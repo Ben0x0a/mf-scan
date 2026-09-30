@@ -37,7 +37,10 @@ use crate::report::export::tree_dir;
 /// WHY they get a root rather than being skipped: an unrecognised domain is still
 /// evidence, and dropping it would be a silent loss. WHY a visibly non-device
 /// name: nothing under it should be mistaken for a real filesystem location.
-pub const UNMAPPED_ROOT: &str = "_unmapped_domains";
+/// Matches the `unknown_domain_template` the Python `ios-backup-reconstructor`
+/// has shipped since its first release, so the two tools put an unrecognised
+/// domain in the same place and their outputs can be compared directly.
+pub const UNMAPPED_ROOT: &str = "unknown_backup_domains";
 
 /// The plan for rebuilding a backup.
 pub struct Rebuild {
@@ -220,7 +223,7 @@ mod tests {
         let rebuilt = plan(&src, &BackupStructure::default());
         assert_eq!(rebuilt.unmapped, vec!["MysteryDomain"]);
         let map: BTreeMap<_, _> = rebuilt.roots.iter().cloned().collect();
-        assert_eq!(map["MysteryDomain"], "_unmapped_domains/MysteryDomain");
+        assert_eq!(map["MysteryDomain"], "unknown_backup_domains/MysteryDomain");
         // Every entry must be attributable to some root.
         for e in src.entries() {
             assert!(

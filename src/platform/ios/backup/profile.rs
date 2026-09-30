@@ -9,11 +9,13 @@
 //! `plist` crate (read `Manifest.plist`/`Status.plist`).
 //!
 //! ── What identifies an iOS backup ───────────────────────────────────────────
-//! A backup directory holds `Manifest.plist`, `Manifest.db`, `Status.plist` and
-//! `Info.plist` side by side. The backup may be the source root, or — when a
+//! A backup directory holds `Manifest.plist` and `Manifest.db`, usually beside
+//! `Status.plist` and `Info.plist`. The backup may be the source root, or — when a
 //! whole `MobileSync/Backup` tree is handed over — a single UDID subdirectory.
 //! We locate it by finding `Manifest.plist` by basename and taking its parent as
-//! the root, then confirming `Manifest.db` and `Status.plist` sit beside it.
+//! the root, then confirming `Manifest.db` sits beside it. `Status.plist` and
+//! `Info.plist` are read when present but are NOT required: they carry provenance
+//! only, and older backups may not have them.
 //! `Manifest.plist`'s `IsEncrypted` boolean says whether the payload is
 //! encrypted. This recognition lives ONLY here so the profiler and the source
 //! never drift on what "is a backup" means (the one-source-of-truth rule).
@@ -52,9 +54,16 @@ pub struct BackupProfile {
 pub fn detect(source: &dyn Source) -> Option<BackupProfile> {
     let root_prefix = locate_root_prefix(source)?;
 
-    // Confirm the two other marker files sit beside Manifest.plist.
+    // Confirm the one other REQUIRED file sits beside Manifest.plist.
+    //
+    // WHY `Status.plist` is not required: it is read only for a best-effort
+    // product version, which already falls back to `Manifest.plist`'s `Lockdown`
+    // dictionary. Older backups — and backups produced by some acquisition tools —
+    // simply do not carry one, and demanding it meant they were not recognised as
+    // backups at all: their files were searched as opaque blobs under hashed
+    // names, silently, with no indication that a logical view was available.
     let has = |base: &str| entry_named(source, &format!("{root_prefix}{base}")).is_some();
-    if !has(MANIFEST_DB) || !has(STATUS_PLIST) {
+    if !has(MANIFEST_DB) {
         return None;
     }
 

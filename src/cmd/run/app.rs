@@ -113,6 +113,18 @@ fn run_export(args: AppExportArgs) -> Result<()> {
             .collect();
 
         let plan = export::plan_tree(&files, &roots);
+        if !plan.renamed.is_empty() {
+            // Two files whose paths differ only in case collide on a
+            // case-insensitive file system; the later one is suffixed rather than
+            // overwriting the earlier. Never do that silently.
+            eprintln!(
+                "⚠ {} file(s) renamed to avoid overwriting another file:",
+                plan.renamed.len()
+            );
+            for r in &plan.renamed {
+                eprintln!("    {} -> {}", r.wanted, r.used);
+            }
+        }
         let run = app_run_info(&args.bundle_id, &containers, platform, path);
 
         match export::export_files(
