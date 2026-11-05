@@ -1,0 +1,3 @@
+# Test fixtures are evidence-shaped bytes whose hashes the tests check. Git on Windows
+# converts line endings in text files by default, which would change them on checkout.
+tests/fixtures/** -text

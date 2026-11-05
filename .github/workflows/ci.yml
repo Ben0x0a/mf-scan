@@ -6,6 +6,10 @@ name: CI
 # CI red with no code change — as happened when 1.98 added `chunks_exact_to_as_chunks`.
 # Keep a local toolchain at current stable (`rustup update stable`) so `scripts/check.sh`
 # reproduces CI; the crate's floor is `rust-version` in Cargo.toml.
+#
+# Linux and Windows both run the tests, because the tool is used on both and the Windows
+# code paths (paths, file locking, long paths in a rebuilt archive) cannot be tested by
+# compiling alone. Formatting is checked once, on Linux.
 on:
   push:
     branches: [main]
@@ -21,24 +25,30 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every platform's result, rather than cancelling the rest on one failure.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Formatting
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all
+        run: cargo test --all --locked
