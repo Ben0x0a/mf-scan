@@ -24,6 +24,7 @@ fn run_info() -> RunInfo {
         tool: "mf-scan".into(),
         version: "test".into(),
         pattern: "TARGET".into(),
+        patterns: vec![],
         literal: false,
         ignore_case: false,
         match_path: false,
@@ -40,6 +41,7 @@ fn run_info() -> RunInfo {
         app: None,
         app_containers: vec![],
         app_group_links: vec![],
+        loose_files_skipped: 0,
     }
 }
 

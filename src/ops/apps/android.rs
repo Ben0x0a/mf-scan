@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use super::{AppContainer, ContainerKind};
 use crate::core::source::Source;
+use crate::platform::android::paths::is_backup_member;
 
 /// Resolve every distinct per-package data location in `source` (file counts are
 /// filled by the caller's tally pass).
@@ -54,6 +55,15 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
 /// directory (reverse-DNS, e.g. `com.whatsapp`); requiring a dot rejects stray
 /// non-package entries (a loose file or `lost+found`) sitting at a root.
 pub fn container_for_path(path: &str) -> Option<(String, String, ContainerKind)> {
+    // An `adb backup` member names its package directly: apps/<package>/<token>/...
+    if is_backup_member(path) {
+        let package = path.split('/').nth(1)?;
+        return Some((
+            format!("apps/{package}"),
+            package.to_string(),
+            ContainerKind::AndroidData,
+        ));
+    }
     let had_lead = path.starts_with('/');
     let body = path.trim_start_matches('/');
     let segs: Vec<&str> = body.split('/').collect();

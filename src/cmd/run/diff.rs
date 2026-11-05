@@ -29,7 +29,7 @@ use crate::cmd::cli::DiffArgs;
 use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
 use crate::cmd::support::sources::{
-    BackupFacts, BackupOptions, IoMode, Operand, is_tar_path, with_operand_source,
+    BackupFacts, BackupOptions, IoMode, Operand, resolve_file, with_operand_source,
 };
 
 /// Run the `diff` subcommand.
@@ -133,12 +133,10 @@ fn with_diff_side<R>(
     backup_opts: &BackupOptions,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
+    let resolved;
     let operand = if !path.is_dir() {
-        if is_tar_path(path) {
-            Operand::Tar(path)
-        } else {
-            Operand::Archive(path)
-        }
+        resolved = resolve_file(path)?;
+        resolved.operand(archive_depth)
     } else if dir_mode {
         Operand::Folder {
             path,

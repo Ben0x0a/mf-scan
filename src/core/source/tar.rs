@@ -43,10 +43,14 @@ pub struct TarSource {
     /// attestation — re-compressing the same content at a different level yields
     /// identical inflated bytes.
     raw: memmap2::Mmap,
-    /// The tar stream, when it had to be inflated. `None` for a plain `.tar`,
-    /// whose stream IS [`raw`](Self::raw).
-    inflated: Option<Vec<u8>>,
+    /// The tar stream, when it had to be decoded. `None` for a plain `.tar`, whose
+    /// stream IS [`raw`](Self::raw).
+    inflated: Option<Content<'static>>,
     entries: Vec<Entry>,
+    /// Names of link and device members, which have no content to present.
+    links: Vec<String>,
+    /// What stopped the walk early, when the block sequence is cut short or corrupt.
+    damage: Option<String>,
 }
 
 impl TarSource {
@@ -63,16 +67,43 @@ impl TarSource {
         let map = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("cannot map {}", path.display()))?;
         let inflated = if map.starts_with(&[0x1f, 0x8b]) {
-            Some(gunzip(&map).with_context(|| format!("cannot decompress {}", path.display()))?)
+            Some(Content::Owned(gunzip(&map).with_context(|| {
+                format!("cannot decompress {}", path.display())
+            })?))
         } else {
             None
         };
-        let entries = parse_entries(inflated.as_deref().unwrap_or(&map));
+        let parsed = parse(inflated.as_deref().unwrap_or(&map));
         Ok(Self {
             raw: map,
             inflated,
-            entries,
+            entries: parsed.entries,
+            links: parsed.links,
+            damage: parsed.damage,
         })
+    }
+
+    /// A source over a tar stream some other container decoded (an Android backup),
+    /// with `raw` the file as stored, which `--verify` attests.
+    pub(crate) fn from_decoded(raw: memmap2::Mmap, stream: Content<'static>) -> Self {
+        let parsed = parse(&stream);
+        Self {
+            raw,
+            inflated: Some(stream),
+            entries: parsed.entries,
+            links: parsed.links,
+            damage: parsed.damage,
+        }
+    }
+
+    /// Names of link and device members, which have no content to present.
+    pub(crate) fn links(&self) -> &[String] {
+        &self.links
+    }
+
+    /// What cut the block sequence short, if anything did.
+    pub(crate) fn damage(&self) -> Option<&str> {
+        self.damage.as_deref()
     }
 }
 
@@ -158,12 +189,22 @@ fn gunzip(compressed: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// What a walk of the block sequence found.
+struct ParsedTar {
+    entries: Vec<Entry>,
+    links: Vec<String>,
+    damage: Option<String>,
+}
+
 /// Walk the tar block sequence, yielding one [`Entry`] per regular file and
 /// directory placeholder. Stops cleanly at the end-of-archive marker (a zero
 /// block), at EOF, or on the first header that fails its checksum (lost sync /
-/// trailing garbage) — never panics on a malformed archive.
-fn parse_entries(data: &[u8]) -> Vec<Entry> {
+/// trailing garbage) — never panics on a malformed archive. Stopping for any reason
+/// but the marker or a clean EOF is recorded as damage.
+fn parse(data: &[u8]) -> ParsedTar {
     let mut entries = Vec::new();
+    let mut links = Vec::new();
+    let mut damage = None;
     let mut pos = 0usize;
     // Overrides carried from a preceding GNU long-name (`L`) or PAX (`x`) header;
     // each applies to the very next file/dir header, then is consumed.
@@ -180,20 +221,30 @@ fn parse_entries(data: &[u8]) -> Vec<Entry> {
         // A bad checksum means we have lost sync with the block stream; stop rather
         // than fabricate entries from garbage.
         if !checksum_ok(header) {
+            damage = Some(format!("a corrupt tar header at byte {pos}"));
             break;
         }
         let size = match pax_size.take().or_else(|| parse_octal(&header[124..136])) {
             Some(s) => s,
-            None => break, // unreadable size ⇒ we can't find the next header
+            None => {
+                // Unreadable size: the next header cannot be found.
+                damage = Some(format!("an unreadable tar size at byte {pos}"));
+                break;
+            }
         };
         let data_start = pos + BLOCK;
         // Data is `size` bytes padded up to the next block boundary.
-        let Some(data_end) = data_start.checked_add(size as usize) else {
+        let Some(data_end) = data_start
+            .checked_add(size as usize)
+            .filter(|&end| end <= data.len())
+        else {
+            // Truncated archive: the entry's data is not fully present.
+            damage = Some(format!(
+                "a truncated tar member, {}",
+                take_name(&mut long_name, &mut pax_path, header)
+            ));
             break;
         };
-        if data_end > data.len() {
-            break; // truncated archive: the entry's data is not fully present
-        }
         let next = data_start + (size as usize).next_multiple_of(BLOCK);
         let typeflag = header[156];
 
@@ -239,16 +290,21 @@ fn parse_entries(data: &[u8]) -> Vec<Entry> {
                     },
                 });
             }
-            // Symlinks, hardlinks, devices, etc.: not searchable content. Consume
-            // any pending overrides so they don't leak onto a later entry.
-            _ => {
-                long_name = None;
-                pax_path = None;
-            }
+            // Symlinks, hardlinks, devices, etc.: not searchable content. Recorded,
+            // and taking the name consumes any pending overrides, so they don't leak
+            // onto a later entry.
+            _ => links.push(take_name(&mut long_name, &mut pax_path, header)),
         }
         pos = next;
     }
-    entries
+    if damage.is_none() && pos < data.len() && data.len() - pos < BLOCK {
+        damage = Some("a truncated tar header at the end of the stream".to_string());
+    }
+    ParsedTar {
+        entries,
+        links,
+        damage,
+    }
 }
 
 /// Resolve an entry's name, preferring a pending GNU long name, then a PAX `path`,
@@ -393,7 +449,7 @@ mod tests {
     #[test]
     fn parses_files_with_offsets_and_sizes() {
         let tar = build_tar(&[("a.txt", b"hello"), ("dir/b.bin", b"abcdef")]);
-        let entries = parse_entries(&tar);
+        let entries = parse(&tar).entries;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "a.txt");
         assert_eq!(entries[0].uncompressed_size, 5);
@@ -423,21 +479,21 @@ mod tests {
         set_checksum(&mut h);
         let mut tar = h.to_vec();
         tar.resize(tar.len() + 2 * BLOCK, 0);
-        let entries = parse_entries(&tar);
+        let entries = parse(&tar).entries;
         assert_eq!(entries[0].name, "long/prefix/path/name.txt");
     }
 
     #[test]
     fn strips_leading_dot_slash() {
         let tar = build_tar(&[("./data/x.txt", b"y")]);
-        assert_eq!(parse_entries(&tar)[0].name, "data/x.txt");
+        assert_eq!(parse(&tar).entries[0].name, "data/x.txt");
     }
 
     #[test]
     fn stops_on_bad_checksum_rather_than_emitting_junk() {
         let mut tar = build_tar(&[("a.txt", b"hi")]);
         tar[148] = b'9'; // corrupt the stored checksum (9 is not even octal)
-        assert!(parse_entries(&tar).is_empty());
+        assert!(parse(&tar).entries.is_empty());
     }
 
     #[test]
@@ -478,7 +534,7 @@ mod tests {
         tar.resize(tar.len() + (BLOCK - 3) % BLOCK, 0);
         tar.resize(tar.len() + 2 * BLOCK, 0);
 
-        let entries = parse_entries(&tar);
+        let entries = parse(&tar).entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, long);
         assert_eq!(entries[0].uncompressed_size, 3);

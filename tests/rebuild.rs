@@ -30,7 +30,7 @@ fn rebuild_fixture(
     let profile = profile::detect(&folder).expect("fixture is a backup");
     let source = BackupSource::build(&folder, &profile, password).expect("builds");
 
-    let plan = rebuild::plan(&source, source.structure());
+    let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);
     let files: Vec<MatchedFile> = rebuild::files_to_rebuild(&source)
         .into_iter()
         .map(|e| MatchedFile {
@@ -47,8 +47,8 @@ fn rebuild_fixture(
         }
         ExportOutcome::Refused { .. } => panic!("export refused unexpectedly"),
     };
-    for rel in &plan.directories {
-        std::fs::create_dir_all(dir.join(rel)).expect("directory created");
+    for directory in &plan.directories {
+        std::fs::create_dir_all(dir.join(&directory.path)).expect("directory created");
     }
     (plan, written)
 }
@@ -127,7 +127,7 @@ fn every_entry_is_attributable_to_a_root() {
     let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("opens");
     let profile = profile::detect(&folder).expect("is a backup");
     let source = BackupSource::build(&folder, &profile, None).expect("builds");
-    let plan = rebuild::plan(&source, source.structure());
+    let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);
 
     for entry in source.entries() {
         let attributed = plan.roots.iter().any(|(prefix, _)| {

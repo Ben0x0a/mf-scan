@@ -75,8 +75,11 @@ pub struct ExportItem {
 }
 
 impl ExportItem {
-    /// Relative output path: `<folder>/<basename>`.
-    fn output_path(&self) -> String {
+    /// Relative output path: `<folder>/<basename>`, or just the name at the root.
+    pub(crate) fn output_path(&self) -> String {
+        if self.folder.is_empty() {
+            return self.name.clone();
+        }
         format!("{}/{}", self.folder, self.name)
     }
 }
@@ -127,6 +130,10 @@ pub struct ExportedFile {
     /// Source-recorded stored-bytes integrity, when the source carries one (an
     /// encrypted backup's per-file SHA-1). `Unrecorded` for plain sources.
     pub stored_integrity: StoredIntegrity,
+    /// The file's modification time as the source recorded it, in UTC. Written by a
+    /// backup rebuild, so the report states the time each archive member must carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_utc: Option<String>,
 }
 
 /// The serialisable form of [`crate::core::source::IntegrityCheck`] for the report.
@@ -459,6 +466,11 @@ pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPla
             total_size += file.entry.uncompressed_size;
             let path = file.entry.name.as_str();
             let (folder, name) = match attribute(path, roots) {
+                // The file IS the root: the label's last segment is its name.
+                Some((label, "")) => match label.rsplit_once('/') {
+                    Some((folder, name)) => (folder.to_string(), name.to_string()),
+                    None => (String::new(), label),
+                },
                 Some((label, rel)) => {
                     let (dirs, base) = split_dir_base(rel);
                     let mut folder = label;
@@ -862,6 +874,7 @@ fn exported_file(
         source_sha256,
         copy_verified,
         stored_integrity,
+        mtime_utc: None,
     })
 }
 

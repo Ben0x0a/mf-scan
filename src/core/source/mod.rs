@@ -4,8 +4,10 @@
 //! and read any file's logical bytes ([`Source::content`]) — plus [`Content`]
 //! (the borrowed/owned/mapped byte carrier) and the concrete containers. A
 //! `Source` is whatever yields located files with bytes: a ZIP archive
-//! ([`zip::ZipSource`]), a tar archive ([`tar::TarSource`], plain or `.tar.gz`), or a
-//! directory of loose files ([`folder::FolderSource`]).
+//! ([`zip::ZipSource`]), a tar archive ([`tar::TarSource`], plain or `.tar.gz`), a
+//! directory of loose files or one such file ([`folder::FolderSource`]), or bytes held
+//! in memory ([`bytes::BytesSource`], standard input). [`sniff_container`] is the single
+//! decision on which of these a file is.
 //! Used by: `engine` (search), `report::export` and `diff`. Built by the
 //! binary's `support::sources`.
 //! Uses: `crate::core::models::Entry`, `anyhow`, `memmap2` (large loose files).
@@ -16,17 +18,100 @@
 //! the exact same search/inspect/export pipeline, with the offset model
 //! (`MatchRecord::archive_offset`) becoming `None` where there is no archive.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Deref;
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::core::models::Entry;
+use crate::platform::android::backup::is_android_backup;
 
+pub mod bytes;
 pub mod folder;
 mod nested;
 pub mod ranged;
 pub mod tar;
 pub mod zip;
+
+/// What kind of container a file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    Zip,
+    Tar,
+    AndroidBackup,
+    /// Not a container: an ordinary file, to be searched as itself.
+    Other,
+}
+
+/// Whether `path` is named like a tar archive, plain or gzip-compressed.
+pub fn is_tar_name(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".tar") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+}
+
+fn is_zip_name(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+/// Decide what kind of container the file at `path` is.
+///
+/// HOW: from its content first (the `.ab` magic, a ZIP header or end-of-central-directory
+/// record, the `ustar` tar magic), because forensic file names are often wrong or
+/// absent. The name is the fallback, and it decides in one case the content cannot: a
+/// damaged `.zip` or `.tar` must fail loudly as an archive rather than be quietly
+/// searched as one opaque file.
+pub fn sniff_container(path: &Path) -> Result<Container> {
+    /// Where the `ustar` magic sits in a tar header.
+    const USTAR_OFFSET: usize = 257;
+    /// An end-of-central-directory record, plus the longest possible comment.
+    const ZIP_TAIL: u64 = 22 + u16::MAX as u64;
+
+    let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut head = Vec::with_capacity(512);
+    file.by_ref()
+        .take(512)
+        .read_to_end(&mut head)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+
+    if is_android_backup(&head) {
+        return Ok(Container::AndroidBackup);
+    }
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        return Ok(Container::Zip);
+    }
+    if head.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
+        return Ok(Container::Tar);
+    }
+    if is_tar_name(path) {
+        return Ok(Container::Tar);
+    }
+    if is_zip_name(path) {
+        return Ok(Container::Zip);
+    }
+
+    // A ZIP can start with anything (a self-extractor's stub), so look for its tail.
+    let len = file
+        .metadata()
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .len();
+    file.seek(SeekFrom::Start(len.saturating_sub(ZIP_TAIL)))
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(if zip::has_end_record(&tail) {
+        Container::Zip
+    } else {
+        Container::Other
+    })
+}
 
 /// One entry's logical bytes, however the source backs them.
 ///

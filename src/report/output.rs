@@ -1,9 +1,11 @@
 //! Result formatting and writing (txt / json / csv).
 //!
-//! Defines: `OutputFormat`, `write_results` (one line/object per match), and
-//! `write_counts` (one line per file, for `--count`), rendering to any `Write`
-//! sink in the chosen format.
-//! Used by: `main.rs` (picks the format from `--format`, the sink from `-o`).
+//! Defines: `OutputFormat`, `TxtStyle`, `write_results` (one line/object per match),
+//! `write_counts` (one line per file, for `--count`), and `write_file_list` (one
+//! line per file, for `--files-with-matches`), rendering to any `Write` sink in the
+//! chosen format.
+//! Used by: `cmd::run::grep` (picks the format from `--format`, the sink from
+//! `--output`).
 //!
 //! Output rules: at most one line per match, and binary file content is never
 //! raw-dumped. The matched line is shown only when it looks textual (see
@@ -57,12 +59,22 @@ impl FromStr for OutputFormat {
     }
 }
 
+/// What a txt result line shows after its location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxtStyle {
+    /// `path:0x<offset>:<matched line>` — the default.
+    Line,
+    /// `path:0x<offset>:<matched text>` — `--only-matching`.
+    OnlyMatching,
+    /// Just the path — `--match-path`, where the file's path IS the match, so there
+    /// is no in-file offset or line to show.
+    PathOnly,
+}
+
 /// Write all `records` to `w` in `format`.
 ///
-/// `colourise` applies only to the txt format; JSON/CSV are machine-readable
-/// and never receive ANSI escapes. `path_match` selects the `--match-path`
-/// rendering, where each record is a file matched by its path: txt then prints
-/// just the (highlighted) path, with no in-file offset or duplicated line.
+/// `colourise` and `style` apply only to the txt format; JSON/CSV are
+/// machine-readable and never receive ANSI escapes.
 ///
 /// `stats` is the run's coverage tally; JSON embeds it so the result file is
 /// self-describing (txt/csv stay line-oriented and rely on the stderr summary
@@ -71,13 +83,13 @@ pub fn write_results(
     records: &[MatchRecord],
     format: OutputFormat,
     colourise: bool,
-    path_match: bool,
+    style: TxtStyle,
     run: &RunInfo,
     stats: &ScanStats,
     w: &mut dyn Write,
 ) -> Result<()> {
     match format {
-        OutputFormat::Txt => write_txt(records, colourise, path_match, w),
+        OutputFormat::Txt => write_txt(records, colourise, style, w),
         OutputFormat::Json => write_json(run, stats, records, w),
         OutputFormat::Csv => write_csv(records, w),
     }
@@ -126,6 +138,9 @@ struct JsonView<'a> {
     path: &'a str,
     file_start: String,
     file_offset: String,
+    /// The match's line number, present only with `-n`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_number: Option<u64>,
     /// Absolute archive byte of the match; omitted for a loose file, a DEFLATE
     /// entry, or decrypted content (where no single archive byte exists).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +176,7 @@ impl<'a> From<&'a MatchRecord> for JsonView<'a> {
             path: &r.path,
             file_start: hex(r.file_start),
             file_offset: hex(r.file_offset),
+            line_number: r.line_number,
             archive_offset: r.archive_offset.map(hex),
             compressed: r.compressed,
             decrypted: r.decrypted,
@@ -248,6 +264,8 @@ struct CsvView<'a> {
     format: &'a str,
     context: &'a str,
     line: Cow<'a, str>,
+    /// The match's line number; empty unless `-n` was given.
+    line_number: Option<u64>,
 }
 
 impl<'a> From<&'a MatchRecord> for CsvView<'a> {
@@ -265,6 +283,7 @@ impl<'a> From<&'a MatchRecord> for CsvView<'a> {
             format: r.inspection.as_ref().map_or("", |i| i.format.as_str()),
             context: r.inspection.as_ref().map_or("", |i| i.summary.as_str()),
             line: textual_line(r).unwrap_or(Cow::Borrowed("")),
+            line_number: r.line_number,
         }
     }
 }
@@ -277,14 +296,14 @@ impl<'a> From<&'a MatchRecord> for CsvView<'a> {
 fn write_txt(
     records: &[MatchRecord],
     colourise: bool,
-    path_match: bool,
+    style: TxtStyle,
     w: &mut dyn Write,
 ) -> Result<()> {
     for r in records {
         // --match-path: the "match" is the file's path itself, so print just the
         // path (the source archive joined like a folder), highlighting the part
         // the pattern matched. No in-file offset — there is no content position.
-        if path_match {
+        if style == TxtStyle::PathOnly {
             let out = match &r.archive {
                 Some(a) => format!("{a}/{}", render_line(r, colourise)),
                 None => render_line(r, colourise),
@@ -293,13 +312,33 @@ fn write_txt(
             continue;
         }
 
+        // Like grep -o, an empty match (`x*` between characters) shows nothing.
+        let matched = &r.line[r.match_in_line.clone()];
+        if style == TxtStyle::OnlyMatching && matched.is_empty() {
+            continue;
+        }
+
         // The source archive (when set) joins the internal path like a folder,
         // so a match reads as `case.zip/internal/file:0x<off>`.
         let mut out = match &r.archive {
-            Some(a) => format!("{a}/{}:0x{:x}", r.path, r.file_offset),
-            None => format!("{}:0x{:x}", r.path, r.file_offset),
+            Some(a) => format!("{a}/{}", r.path),
+            None => r.path.clone(),
         };
-        if is_textual(&r.line) {
+        // With -n the line number takes the place grep gives it, right after the path,
+        // and the offset stays: the "where" is always present.
+        if let Some(line) = r.line_number {
+            out.push_str(&format!(":{line}"));
+        }
+        out.push_str(&format!(":0x{:x}", r.file_offset));
+        // WHY --only-matching tests the match, not the line: a readable match inside
+        // a binary line (a string in a SQLite page) is exactly what the flag is for,
+        // and showing only those bytes cannot dump the binary around it.
+        if style == TxtStyle::OnlyMatching {
+            if is_textual(matched) {
+                out.push(':');
+                out.push_str(&render_match(matched, colourise));
+            }
+        } else if is_textual(&r.line) {
             out.push(':');
             out.push_str(&render_line(r, colourise));
         }
@@ -371,6 +410,39 @@ pub fn write_counts(
     }
 }
 
+/// One file in a `--files-with-matches` list.
+#[derive(Serialize)]
+struct FileView<'a> {
+    path: &'a str,
+}
+
+/// Write one path per file (txt), or a structured equivalent (json/csv).
+pub fn write_file_list(paths: &[&str], format: OutputFormat, w: &mut dyn Write) -> Result<()> {
+    match format {
+        OutputFormat::Txt => {
+            for path in paths {
+                writeln!(w, "{path}").context("failed writing file list")?;
+            }
+            Ok(())
+        }
+        OutputFormat::Json => {
+            let views: Vec<FileView> = paths.iter().map(|&path| FileView { path }).collect();
+            serde_json::to_writer_pretty(&mut *w, &views).context("failed writing file list")?;
+            writeln!(w).context("failed writing file list")?;
+            Ok(())
+        }
+        OutputFormat::Csv => {
+            let mut wtr = csv::Writer::from_writer(w);
+            for &path in paths {
+                wtr.serialize(FileView { path })
+                    .context("failed writing file list row")?;
+            }
+            wtr.flush().context("failed flushing file list")?;
+            Ok(())
+        }
+    }
+}
+
 /// json: a single pretty-printed `{ run, stats, results }` object — the run
 /// metadata (archives, pattern, filters), the coverage statistics, then one
 /// object per match.
@@ -399,6 +471,19 @@ fn write_csv(records: &[MatchRecord], w: &mut dyn Write) -> Result<()> {
     }
     wtr.flush().context("failed flushing CSV output")?;
     Ok(())
+}
+
+/// Render just the matched bytes for display, optionally in colour.
+fn render_match(matched: &[u8], colourise: bool) -> String {
+    let text = String::from_utf8_lossy(matched);
+    if colourise {
+        // The escapes are plain ASCII constants, so this conversion cannot fail.
+        let on = std::str::from_utf8(COLOUR_ON).unwrap_or_default();
+        let off = std::str::from_utf8(COLOUR_OFF).unwrap_or_default();
+        format!("{on}{text}{off}")
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Render a record's line for display, optionally wrapping the matched bytes in

@@ -1,13 +1,13 @@
-//! mf-scan — fast, forensic-aware regex search inside ZIP acquisitions.
+//! mf-scan — fast, forensic-aware regex search inside mobile acquisitions.
 //!
-//! Defines: the binary entry point. CLI definitions live in `cli`, and the
+//! Defines: the binary entry point. CLI definitions live in `cmd::cli`, and the
 //! orchestration that ties the parser, the search engine, the inspectors, and
-//! the output/export writers together lives in `run`; `main` only parses the
-//! arguments and dispatches to the chosen subcommand.
-//! Used by: invoked from the shell (`mf-scan search PATTERN ARCHIVE`).
-//! Uses: `cli` (clap structs), `run` (the two `search`/`export` operations) and
-//! `helpers` (the support machinery those operations lean on), plus the
-//! `mf_scan` library crate.
+//! the output/export writers together lives in `cmd::run`; `main` only parses the
+//! arguments, dispatches to the chosen subcommand, and maps the result to an exit
+//! status.
+//! Used by: invoked from the shell (`mf-scan grep PATTERN SOURCE`).
+//! Uses: `cmd::cli` (clap structs), `cmd::run` (one orchestrator per subcommand),
+//! plus the `mf_scan` library crate.
 //!
 //! Why mmap: phone acquisitions are large, and STORED entries (the common case)
 //! are uncompressed on disk, so memory-mapping lets the SIMD regex engine run
@@ -20,17 +20,33 @@
 
 mod cmd;
 
+use std::process::ExitCode;
+
 use anyhow::Result;
-use clap::Parser;
 
-use cmd::cli::{Cli, Command};
+use cmd::cli::Command;
+use cmd::run::EXIT_ERROR;
 
-fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Grep(args) => cmd::run::run_grep(args),
-        Command::Export(args) => cmd::run::run_export(args),
-        Command::Diff(args) => cmd::run::run_diff(args),
-        Command::App(args) => cmd::run::run_app(args),
-        Command::IosBackup(args) => cmd::run::run_ios_backup(args),
+fn main() -> ExitCode {
+    match dispatch(cmd::cli::parse().command) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Run the chosen subcommand. `grep` and `find` choose their own exit status; the others
+/// succeed or fail.
+fn dispatch(command: Command) -> Result<ExitCode> {
+    let succeeded = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
+    match command {
+        Command::Grep(args) => cmd::run::run_grep(args).map(ExitCode::from),
+        Command::Find(args) => cmd::run::run_find(args),
+        Command::Export(args) => succeeded(cmd::run::run_export(args)),
+        Command::Diff(args) => succeeded(cmd::run::run_diff(args)),
+        Command::App(args) => succeeded(cmd::run::run_app(args)),
+        Command::Backup(args) => succeeded(cmd::run::run_backup(args)),
     }
 }

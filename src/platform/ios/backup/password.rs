@@ -75,6 +75,9 @@ pub struct BackupRecord {
     /// silently. `0` (and omitted from the report) for an intact backup.
     #[serde(skip_serializing_if = "is_zero")]
     pub missing_files: usize,
+    /// What an Android backup's header recorded; omitted for an iOS backup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub android: Option<crate::platform::android::backup::AndroidFacts>,
 }
 
 /// Serde predicate: skip a `0` count in the JSON report.
@@ -115,6 +118,7 @@ impl BackupRecord {
             default_password_used,
             files,
             missing_files,
+            android: None,
         }
     }
 
@@ -136,14 +140,31 @@ impl BackupRecord {
             default_password_used: None,
             files,
             missing_files,
+            android: None,
         }
+    }
+
+    /// Assemble the audit record for an Android backup.
+    pub fn new_android(
+        provenance: Option<&UnlockProvenance>,
+        files: usize,
+        facts: crate::platform::android::backup::AndroidFacts,
+    ) -> Self {
+        let mut record = match provenance {
+            Some(provenance) => Self::new(None, None, provenance, files, 0),
+            None => Self::new_unencrypted(None, None, files, 0),
+        };
+        record.android = Some(facts);
+        record
     }
 
     /// The one-line stderr provenance string an examiner sees at run time. A
     /// non-zero `missing_files` is appended as a loud warning so an incomplete or
     /// modified acquisition is never passed over in silence.
     pub fn stderr_line(&self) -> String {
-        let base = if !self.encrypted {
+        let base = if self.android.is_some() && !self.encrypted {
+            format!("backup: Android (.ab), unencrypted; {} file(s)", self.files)
+        } else if !self.encrypted {
             format!(
                 "backup: unencrypted; {} file(s) mapped to logical paths via Manifest.db",
                 self.files

@@ -42,8 +42,8 @@ use plist::Value;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    BackupStructure, BlobStore, logical_entry, meta_index, name_index, read_directory_records,
-    read_entry, read_present_files,
+    BackupStructure, BlobStore, logical_entry, meta_index, name_index, read_entry,
+    read_present_files, read_structure, strip_manifest_padding,
 };
 use crate::platform::ios::backup::keybag;
 use crate::platform::ios::backup::keys::{aes_cbc_decrypt, aes_unwrap};
@@ -156,15 +156,17 @@ impl<'a> EncryptedBackupSource<'a> {
         let db_key = unwrap_key(db_class_key, wrapped_db_key)
             .context("cannot unwrap the Manifest.db key (wrong password?)")?;
 
-        let manifest_db_enc = read_entry(inner, &format!("{root_prefix}Manifest.db"))
-            .context("cannot read Manifest.db")?;
+        let manifest_name = format!("{root_prefix}Manifest.db");
+        let manifest_db_enc =
+            read_entry(inner, &manifest_name).context("cannot read Manifest.db")?;
         let manifest_db = aes_cbc_decrypt(&db_key, &ZERO_IV, &manifest_db_enc)
             .context("cannot decrypt Manifest.db")?;
+        let manifest_db = strip_manifest_padding(manifest_db);
 
         // ── Read the Files table, build the logical entries ─────────────────
         let blobs = BlobStore::build(inner, &root_prefix);
         let (entries, meta, missing_files) = build_entries(&manifest_db, &blobs);
-        let structure = read_directory_records(&manifest_db);
+        let structure = read_structure(inner, &manifest_name, &manifest_db);
 
         let index = name_index(&entries);
         Ok(Self {
@@ -299,7 +301,7 @@ fn build_entries(manifest_db: &[u8], blobs: &BlobStore) -> (Vec<Entry>, Vec<Back
         let Some(wrapped_key) = r.mb.encryption_key else {
             continue;
         };
-        entries.push(logical_entry(&r.name, r.mb.size));
+        entries.push(logical_entry(&r.name, r.mb.size, r.mb.last_modified));
         meta.push(BackupEntry {
             file_id: r.file_id,
             protection_class: r.mb.protection_class,

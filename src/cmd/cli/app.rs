@@ -32,36 +32,46 @@ pub(crate) struct AppArgs {
 /// The `app` verbs, mirroring the top-level `grep`/`export` where they overlap.
 #[derive(Subcommand)]
 pub(crate) enum AppCommand {
-    /// Search the installed-app inventory: list each app's bundle id, name, and size.
+    /// List the installed apps: bundle id, name and size.
     Grep(AppGrepArgs),
-    /// List every data location an app or its widgets/extensions/groups can write.
+    /// List everywhere an app and its widgets, extensions and groups keep data.
     Paths(AppPathsArgs),
-    /// Export all of an app's data (and its groups) into a directory, kind-labelled.
+    /// Copy all of an app's data (and its groups) into a directory.
     Export(AppExportArgs),
 }
 
 /// How to open the acquisition — shared by all three verbs.
 #[derive(Args)]
 pub(crate) struct AppSourceArgs {
-    /// Source to read: an archive file, or a directory (with `--dir-mode`).
+    /// An archive, a backup, or a folder with --dir-mode.
     #[arg(value_name = "SOURCE")]
     pub(crate) source: PathBuf,
 
-    /// Treat a directory source as a folder of loose files (nested `.zip` opened
-    /// per `--archive-depth`). Required when the source is a directory.
+    /// Read a folder source's files.
     #[arg(long = "dir-mode")]
     pub(crate) dir_mode: bool,
 
-    /// Levels of nested `*.zip` to open when scanning a `--dir-mode` folder.
-    #[arg(long = "archive-depth", value_name = "N", default_value_t = 0)]
+    /// With --dir-mode, open nested .zip files this many levels deep.
+    #[arg(
+        long = "archive-depth",
+        value_name = "N",
+        default_value_t = 0,
+        hide_default_value = true
+    )]
     pub(crate) archive_depth: u32,
 
-    /// How to read the archive's bytes: `auto`, `mmap`, or `ranged`.
-    #[arg(long = "io-mode", value_enum, default_value = "auto")]
+    /// How to read an archive: auto, mmap or ranged (network shares).
+    #[arg(
+        long = "io-mode",
+        value_enum,
+        default_value = "auto",
+        hide_default_value = true,
+        hide_possible_values = true,
+        value_name = "MODE"
+    )]
     pub(crate) io_mode: IoModeArg,
 
-    /// Password for an encrypted iOS backup (else `MFSCAN_BACKUP_PASSWORD`, else
-    /// the acquisition defaults are tried).
+    /// Password for an encrypted backup (or set MFSCAN_BACKUP_PASSWORD).
     #[arg(long = "backup-password", value_name = "PASSWORD")]
     pub(crate) backup_password: Option<String>,
 }
@@ -72,17 +82,16 @@ pub(crate) struct AppGrepArgs {
     #[command(flatten)]
     pub(crate) source: AppSourceArgs,
 
-    /// Optional case-insensitive substring over the bundle id and display name;
-    /// omit to list every installed app.
+    /// Text in the bundle id or name, ignoring case; omit to list every app.
     #[arg(value_name = "PATTERN")]
     pub(crate) pattern: Option<String>,
 
-    /// Output format (`txt` or `json`).
-    #[arg(short = 'f', long, default_value = "txt")]
+    /// Output format: txt or json.
+    #[arg(short = 'f', long, default_value = "txt", hide_default_value = true)]
     pub(crate) format: OutputFormat,
 
     /// Write to this file instead of stdout.
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    #[arg(long = "output", value_name = "FILE")]
     pub(crate) output: Option<PathBuf>,
 }
 
@@ -96,17 +105,16 @@ pub(crate) struct AppPathsArgs {
     #[arg(value_name = "BUNDLE_ID")]
     pub(crate) bundle_id: String,
 
-    /// Do not include shared App Group containers (list only the app's own data
-    /// and its extension/widget containers).
+    /// Leave out shared App Group containers.
     #[arg(long = "no-groups")]
     pub(crate) no_groups: bool,
 
-    /// Output format (`txt` or `json`).
-    #[arg(short = 'f', long, default_value = "txt")]
+    /// Output format: txt or json.
+    #[arg(short = 'f', long, default_value = "txt", hide_default_value = true)]
     pub(crate) format: OutputFormat,
 
     /// Write to this file instead of stdout.
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    #[arg(long = "output", value_name = "FILE")]
     pub(crate) output: Option<PathBuf>,
 }
 
@@ -124,21 +132,19 @@ pub(crate) struct AppExportArgs {
     #[arg(long = "to", value_name = "DIR")]
     pub(crate) to: PathBuf,
 
-    /// Do not include shared App Group containers in the export.
+    /// Leave out shared App Group containers.
     #[arg(long = "no-groups")]
     pub(crate) no_groups: bool,
 
-    /// Refuse to export if the selected data exceeds this size (e.g. 500MB, 4G).
-    #[arg(long = "max-size", value_name = "SIZE", value_parser = crate::cmd::cli::common::parse_size, default_value = "1G")]
+    /// Refuse to export more than this (default 1G), e.g. 5G.
+    #[arg(long = "max-size", value_name = "SIZE", value_parser = crate::cmd::cli::common::parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
 
-    /// Skip (and record) any file whose destination path would exceed this many
-    /// characters. Defaults to 260 (Windows MAX_PATH); 0 disables the guard.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = DEFAULT_MAX_PATH_LEN)]
+    /// Skip and record longer paths (default 260, Windows); 0 is off.
+    #[arg(long = "max-path-len", value_name = "N", default_value_t = DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
     pub(crate) max_path_len: usize,
 
-    /// Hash the archive (SHA-256) before and after the run and report whether it
-    /// changed — a slower, court-defensible integrity attestation.
+    /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
 }

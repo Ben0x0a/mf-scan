@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::core::models::Entry;
 use crate::core::source::Source;
+use crate::platform::android::paths::is_backup_member;
 use crate::platform::ios::domains;
 use crate::platform::ios::references::McmReferences;
 
@@ -212,7 +213,13 @@ pub fn detect(source: &dyn Source) -> Platform {
         } else if is_backup_domain(name) {
             backup += 1;
         }
-        if name.contains("/data/data/") || name.contains("/data/user/") {
+        // A leading slash is optional: a rebuilt archive's paths are relative.
+        if name.contains("/data/data/")
+            || name.contains("/data/user/")
+            || name.starts_with("data/data/")
+            || name.starts_with("data/user/")
+            || is_backup_member(name)
+        {
             android += 1;
         }
     }

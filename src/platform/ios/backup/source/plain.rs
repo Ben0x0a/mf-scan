@@ -34,8 +34,8 @@ use anyhow::Result;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{
-    self, BackupStructure, BlobStore, logical_entry, meta_index, name_index,
-    read_directory_records, read_present_files,
+    self, BackupStructure, BlobStore, logical_entry, meta_index, name_index, read_present_files,
+    read_structure,
 };
 use crate::platform::ios::backup::profile::BackupProfile;
 
@@ -80,15 +80,16 @@ impl<'a> PlainBackupSource<'a> {
         let root_prefix = profile.root_prefix.clone();
 
         // Manifest.db is a plain SQLite file for an unencrypted backup.
-        let manifest_db = common::read_entry(inner, &format!("{root_prefix}Manifest.db"))?;
+        let manifest_name = format!("{root_prefix}Manifest.db");
+        let manifest_db = common::read_entry(inner, &manifest_name)?;
 
         let blobs = BlobStore::build(inner, &root_prefix);
         let (records, missing_files) = read_present_files(&manifest_db, &blobs);
-        let structure = read_directory_records(&manifest_db);
+        let structure = read_structure(inner, &manifest_name, &manifest_db);
         let mut entries = Vec::with_capacity(records.len());
         let mut meta = Vec::with_capacity(records.len());
         for r in records {
-            entries.push(logical_entry(&r.name, r.mb.size));
+            entries.push(logical_entry(&r.name, r.mb.size, r.mb.last_modified));
             meta.push(PlainEntry {
                 file_id: r.file_id,
                 digest: r.mb.digest,

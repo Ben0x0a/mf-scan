@@ -1,16 +1,16 @@
 //! Input resolution: turn the operand paths into the sources to scan.
 //!
-//! Defines: [`ResolvedSource`] (a resolved operand: an archive file or a folder,
-//! plus its display label and [`ResolvedKind`]), [`resolve_sources`] (apply
-//! `--dir-mode` to the operands), [`open_archive`] (memory-map an archive
+//! Defines: [`ResolvedSource`] (a resolved operand plus its display label and
+//! [`ResolvedKind`]), [`resolve_sources`] (apply `--dir-mode` to the operands),
+//! [`resolve_file`] (decide what one file is), [`open_archive`] (memory-map an archive
 //! read-only), and [`with_operand_source`] (the single open/dispatch point that
 //! opens an [`Operand`] as a live [`Source`] for a closure).
-//! Used by: `run::grep`, `run::diff` and `run::export` (which open the resolved
-//! sources).
+//! Used by: every `run` orchestrator.
 //! Uses: `memmap2` (read-only mmap), `mf_scan::core::source` (the `Source` trait and the
 //! `ZipSource`/`FolderSource` openers), `anyhow`, the std library.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use std::cell::RefCell;
@@ -18,11 +18,14 @@ use std::cell::RefCell;
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 
-use mf_scan::core::source::Source;
+use mf_scan::core::source::bytes::BytesSource;
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::ranged::RangedZipSource;
 use mf_scan::core::source::tar::TarSource;
 use mf_scan::core::source::zip::ZipSource;
+use mf_scan::core::source::{Container, Source, is_tar_name, sniff_container};
+use mf_scan::ops::rebuild::BackupKind;
+use mf_scan::platform::android::backup::AndroidBackupSource;
 use mf_scan::platform::ios::backup::common::BackupStructure;
 use mf_scan::platform::ios::backup::password::BackupRecord;
 use mf_scan::platform::ios::backup::profile;
@@ -75,27 +78,41 @@ impl BackupOptions {
     }
 }
 
+/// The operand naming standard input, as in `grep`.
+pub(crate) const STDIN_OPERAND: &str = "-";
+/// How standard input is named in results.
+const STDIN_LABEL: &str = "(standard input)";
+
 /// How a resolved operand is opened by `run`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolvedKind {
-    /// A single ZIP archive file — opened as a `ZipSource` over its mmap.
+    /// A ZIP archive — opened as a `ZipSource` over its mmap.
     Archive,
-    /// A single tar archive (plain or `.tar.gz`/`.tgz`) — opened as a `TarSource`.
+    /// A tar archive (plain or `.tar.gz`/`.tgz`) — opened as a `TarSource`.
     Tar,
+    /// An Android `adb backup` — decoded and opened as an `AndroidBackupSource`.
+    AndroidBackup,
+    /// An ordinary file — one loose file, searched as itself.
+    LooseFile,
     /// A directory scanned as a folder of loose files — opened as a `FolderSource`.
     Folder,
+    /// Standard input, read into memory.
+    Stdin,
 }
 
-/// Whether `path` names a tar archive (plain or gzip-compressed), by extension.
-/// The gzip variant is confirmed by content magic when opened; this only routes a
-/// directly-named operand to the tar reader instead of the ZIP reader.
-pub(crate) fn is_tar_path(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    name.ends_with(".tar") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+/// Resolve one file operand, deciding what it is from its content.
+pub(crate) fn resolve_file(path: &Path) -> Result<ResolvedSource> {
+    let kind = match sniff_container(path)? {
+        Container::Zip => ResolvedKind::Archive,
+        Container::Tar => ResolvedKind::Tar,
+        Container::AndroidBackup => ResolvedKind::AndroidBackup,
+        Container::Other => ResolvedKind::LooseFile,
+    };
+    Ok(ResolvedSource {
+        path: path.to_path_buf(),
+        label: path.to_string_lossy().into_owned(),
+        kind,
+    })
 }
 
 /// A resolved operand: what to open, the label shown for it, and how to open it.
@@ -113,12 +130,24 @@ impl ResolvedSource {
         match self.kind {
             ResolvedKind::Archive => Operand::Archive(&self.path),
             ResolvedKind::Tar => Operand::Tar(&self.path),
+            ResolvedKind::AndroidBackup => Operand::AndroidBackup(&self.path),
+            ResolvedKind::LooseFile => Operand::LooseFile(&self.path),
+            ResolvedKind::Stdin => Operand::Stdin,
             ResolvedKind::Folder => Operand::Folder {
                 path: &self.path,
                 archive_depth,
             },
         }
     }
+}
+
+/// The outcome of [`resolve_sources`]: what to open, plus what was left out.
+pub(crate) struct ResolvedSources {
+    pub(crate) sources: Vec<ResolvedSource>,
+    /// Non-archive files `-r` walked past. WHY it is counted: `-r` searches archives
+    /// only, while a `grep` user expects every file under the directory to be read,
+    /// so an uncounted skip would read as a clean negative.
+    pub(crate) loose_skipped: usize,
 }
 
 /// Collects the backup-unlock provenance the open path may record, and emits the
@@ -147,6 +176,10 @@ pub(crate) struct BackupFacts {
     pub(crate) record: Option<BackupRecord>,
     /// The backup's directory and symlink records, when the source was a backup.
     pub(crate) structure: Option<BackupStructure>,
+    /// Which kind of backup it was.
+    pub(crate) kind: Option<BackupKind>,
+    /// Whether its payload was truncated or corrupt, so part of it could not be read.
+    pub(crate) damaged: bool,
 }
 
 impl BackupProvenance {
@@ -167,6 +200,21 @@ impl BackupProvenance {
     /// when the `BackupSource` is built, which happens before the closure runs.
     pub(crate) fn structure(&self) -> Option<BackupStructure> {
         self.facts.borrow().structure.clone()
+    }
+
+    /// Which kind of backup the source was, if it was one.
+    pub(crate) fn kind(&self) -> Option<BackupKind> {
+        self.facts.borrow().kind
+    }
+
+    /// The backup's audit record, if the source was a backup.
+    pub(crate) fn record(&self) -> Option<BackupRecord> {
+        self.facts.borrow().record.clone()
+    }
+
+    /// Whether a backup was damaged, so part of it could not be read.
+    pub(crate) fn damaged(&self) -> bool {
+        self.facts.borrow().damaged
     }
 
     /// Emit the stderr provenance line (if any) and return the record so the caller
@@ -192,11 +240,12 @@ pub(crate) fn open_archive(path: &Path) -> Result<Mmap> {
 
 /// Resolve the operand paths into the sources to scan.
 ///
-/// A file operand always resolves to an archive (a directly named `.zip` is always
-/// expanded). A directory operand needs one of:
+/// A file operand resolves by its content: an archive, an Android backup, or else one
+/// loose file. `-` is standard input. A directory operand needs one of:
 /// - `dir_mode` (`--dir-mode`): scan the directory's files as one folder source;
-/// - `recursive` (`-r`): walk the tree and yield each `*.zip` as its own archive source
-///   (labelled relative to the directory, so output reads like `sub/case.zip/file`).
+/// - `recursive` (`-r`): walk the tree and yield each archive (ZIP or tar) as its own
+///   source (labelled relative to the directory, so output reads like
+///   `sub/case.zip/file`), counting the loose files it does not search.
 ///
 /// The two are mutually exclusive (enforced by the CLI). A directory with neither is
 /// rejected, so the operator always states intent — there is no silent default.
@@ -204,21 +253,18 @@ pub(crate) fn resolve_sources(
     paths: &[PathBuf],
     dir_mode: bool,
     recursive: bool,
-) -> Result<Vec<ResolvedSource>> {
+) -> Result<ResolvedSources> {
     let mut sources = Vec::new();
+    let mut loose_skipped = 0;
     for arg in paths {
-        if !arg.is_dir() {
+        if arg.as_os_str() == STDIN_OPERAND {
             sources.push(ResolvedSource {
                 path: arg.clone(),
-                label: arg.to_string_lossy().into_owned(),
-                // A directly-named `.tar`/`.tar.gz`/`.tgz` opens as a tar; any other
-                // file is treated as a ZIP (the historical default).
-                kind: if is_tar_path(arg) {
-                    ResolvedKind::Tar
-                } else {
-                    ResolvedKind::Archive
-                },
+                label: STDIN_LABEL.to_string(),
+                kind: ResolvedKind::Stdin,
             });
+        } else if !arg.is_dir() {
+            sources.push(resolve_file(arg)?);
         } else if dir_mode {
             sources.push(ResolvedSource {
                 path: arg.clone(),
@@ -227,7 +273,7 @@ pub(crate) fn resolve_sources(
             });
         } else if recursive {
             let mut archives = Vec::new();
-            collect_archives(arg, &mut archives)
+            collect_archives(arg, &mut archives, &mut loose_skipped)
                 .with_context(|| format!("cannot read directory {}", arg.display()))?;
             archives.sort();
             for archive in archives {
@@ -236,28 +282,24 @@ pub(crate) fn resolve_sources(
                     .unwrap_or(&archive)
                     .to_string_lossy()
                     .into_owned();
-                // Classify each harvested file the same way a directly-named one
-                // is, so `-r` and naming the archive give identical treatment.
-                let kind = if is_tar_path(&archive) {
-                    ResolvedKind::Tar
-                } else {
-                    ResolvedKind::Archive
-                };
-                sources.push(ResolvedSource {
-                    path: archive,
-                    label,
-                    kind,
-                });
+                // Classify each harvested file the same way a directly-named one is, so
+                // `-r` and naming the archive give identical treatment.
+                let mut resolved = resolve_file(&archive)?;
+                resolved.label = label;
+                sources.push(resolved);
             }
         } else {
             anyhow::bail!(
                 "{} is a directory; pass --dir-mode to scan its files, or -r to search \
-                 the *.zip files under it",
+                 the archives under it",
                 arg.display()
             );
         }
     }
-    Ok(sources)
+    Ok(ResolvedSources {
+        sources,
+        loose_skipped,
+    })
 }
 
 /// One operand to open as a live [`Source`], independent of how it was resolved.
@@ -274,6 +316,12 @@ pub(crate) enum Operand<'a> {
     Archive(&'a Path),
     /// A single tar archive (plain or gzip-compressed) — opened as a `TarSource`.
     Tar(&'a Path),
+    /// An Android `adb backup` file.
+    AndroidBackup(&'a Path),
+    /// One ordinary file, searched as itself.
+    LooseFile(&'a Path),
+    /// Standard input, read into memory.
+    Stdin,
     /// A directory scanned as a folder of loose files, expanding nested `.zip`
     /// files up to `archive_depth` levels.
     Folder { path: &'a Path, archive_depth: u32 },
@@ -323,6 +371,38 @@ pub(crate) fn with_operand_source<R>(
         Operand::Tar(path) => {
             let source = TarSource::open(path)?;
             with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
+        }
+        Operand::AndroidBackup(path) => {
+            let source = AndroidBackupSource::open(path, backup.password.as_deref())?;
+            let facts = source.facts().clone();
+            if let Some(reason) = &facts.stream_error {
+                eprintln!(
+                    "⚠ backup: {} is damaged ({reason}); files after that point could not be read",
+                    path.display()
+                );
+            }
+            {
+                let mut sink = record.borrow_mut();
+                sink.damaged = facts.stream_error.is_some();
+                sink.kind = Some(BackupKind::Android);
+                sink.structure = Some(source.structure());
+                let files = source.entries().iter().filter(|e| !e.is_dir()).count();
+                sink.record = Some(BackupRecord::new_android(source.provenance(), files, facts));
+            }
+            f(&source, Some(source.raw_bytes()))
+        }
+        Operand::LooseFile(path) => {
+            let source = FolderSource::open_file(path)?;
+            f(&source, None)
+        }
+        Operand::Stdin => {
+            let mut data = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut data)
+                .context("cannot read standard input")?;
+            let source = BytesSource::new(STDIN_LABEL, data);
+            f(&source, None)
         }
         Operand::Folder {
             path,
@@ -412,6 +492,7 @@ fn with_maybe_backup<R>(
                 let mut facts = record.borrow_mut();
                 facts.record = Some(bs.record(&p));
                 facts.structure = Some(bs.structure().clone());
+                facts.kind = Some(BackupKind::Ios);
             }
             f(&bs)
         }
@@ -420,26 +501,33 @@ fn with_maybe_backup<R>(
     }
 }
 
-/// Recursively collect the archives `-r` should scan under `dir` into `out`.
+/// Whether a file's name marks it as an archive for `-r` to harvest.
+fn is_archive_name(path: &Path) -> bool {
+    is_tar_name(path)
+        || path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("ab"))
+}
+
+/// Recursively collect the archives `-r` should scan under `dir` into `out`, counting
+/// every other file in `loose`.
 ///
 /// Both ZIP and tar (`.tar`, `.tar.gz`, `.tgz`) are harvested. WHY tar belongs
 /// here: it is a first-class acquisition container everywhere else in the tool, so
 /// collecting only `*.zip` made `-r` silently skip every tar acquisition in a case
 /// folder — a scope loss the operator had no way to notice.
 ///
-/// Tar membership is decided by [`is_tar_path`], the same predicate that
-/// classifies a directly-named operand, so the two cannot diverge.
-fn collect_archives(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+/// What each harvested file then is, is decided by [`resolve_file`], exactly as for a
+/// directly-named one.
+fn collect_archives(dir: &Path, out: &mut Vec<PathBuf>, loose: &mut usize) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_archives(&path, out)?;
-        } else if is_tar_path(&path)
-            || path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
-        {
+            collect_archives(&path, out, loose)?;
+        } else if is_archive_name(&path) {
             out.push(path);
+        } else {
+            *loose += 1;
         }
     }
     Ok(())
@@ -466,6 +554,7 @@ mod tests {
             "sub/c.tar.gz",
             "sub/d.tgz",
             "e.ZIP",
+            "f.ab",
             "notes.txt",
             "image.jpg",
         ] {
@@ -473,7 +562,9 @@ mod tests {
         }
 
         let mut found = Vec::new();
-        collect_archives(root, &mut found).expect("walks");
+        let mut loose = 0;
+        collect_archives(root, &mut found, &mut loose).expect("walks");
+        assert_eq!(loose, 2, "notes.txt and image.jpg are counted as skipped");
         let mut names: Vec<String> = found
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -482,7 +573,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.ZIP"],
+            vec!["a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.ZIP", "f.ab"],
             "every archive form must be harvested, and nothing else"
         );
     }
@@ -498,6 +589,7 @@ mod tests {
 
         let resolved = resolve_sources(&[root.to_path_buf()], false, true).expect("resolves");
         let kinds: Vec<(String, bool)> = resolved
+            .sources
             .iter()
             .map(|r| {
                 (

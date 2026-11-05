@@ -37,11 +37,12 @@ pub(crate) fn search_with_reporter(
     match_path: bool,
     filter: &EntryFilter,
     decrypt: Option<&DecryptionContext>,
+    show_progress: bool,
 ) -> Result<Findings> {
     let progress = Arc::new(TtyProgress::default());
     let stop = Arc::new(AtomicBool::new(false));
 
-    let reporter = if std::io::stderr().is_terminal() {
+    let reporter = if show_progress && std::io::stderr().is_terminal() {
         let progress = Arc::clone(&progress);
         let stop = Arc::clone(&stop);
         Some(std::thread::spawn(move || {

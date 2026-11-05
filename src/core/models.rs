@@ -41,9 +41,13 @@ pub struct RunInfo {
     pub tool: String,
     /// Tool version (`CARGO_PKG_VERSION`).
     pub version: String,
-    /// The pattern as given on the command line.
+    /// The pattern as given on the command line (several `-e` patterns are joined
+    /// with ` | `, and listed individually in `patterns`).
     pub pattern: String,
-    /// Pattern was treated as a literal string (`-l`), not a regex.
+    /// Each pattern, when `-e` gave more than one. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+    /// Pattern was treated as a literal string (`-F`), not a regex.
     pub literal: bool,
     /// Case-insensitive matching (`-i`).
     pub ignore_case: bool,
@@ -89,6 +93,15 @@ pub struct RunInfo {
     /// recorded so an analyst can audit which group inclusions are authoritative.
     #[serde(default)]
     pub app_group_links: Vec<String>,
+    /// Loose files `-r` found while walking for archives and did NOT search. Omitted
+    /// from JSON when zero, so a run with no such scope loss is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub loose_files_skipped: usize,
+}
+
+/// `skip_serializing_if` predicate: omit a zero count from JSON output.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Default for RunInfo {
@@ -100,6 +113,7 @@ impl Default for RunInfo {
             tool: "mf-scan".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             pattern: String::new(),
+            patterns: Vec::new(),
             literal: false,
             ignore_case: false,
             match_path: false,
@@ -116,6 +130,7 @@ impl Default for RunInfo {
             app: None,
             app_containers: Vec::new(),
             app_group_links: Vec::new(),
+            loose_files_skipped: 0,
         }
     }
 }
@@ -338,6 +353,8 @@ pub struct MatchRecord {
     pub path: String,
     pub file_start: u64,
     pub file_offset: u64,
+    /// The match's 1-based line number within the file, set only with `-n`.
+    pub line_number: Option<u64>,
     /// Absolute byte position of the match in the archive, or `None` when there is
     /// no single archive byte (a loose file, a DEFLATE entry, or decrypted content).
     pub archive_offset: Option<u64>,
@@ -413,6 +430,7 @@ impl MatchRecord {
             path: entry.name.clone(),
             file_start,
             file_offset: hit.offset,
+            line_number: None,
             archive_offset,
             compressed,
             decrypted: false,

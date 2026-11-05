@@ -66,7 +66,7 @@ compiled-in defaults (`exclude_media: true`, no extra path exclusions).
 Because `--fast` (and any preset) can exclude whole subtrees, every run is
 **transparent about what it skipped**: the active skip rules are logged to stderr
 before results, an end-of-run summary reports the scanned/skipped counts and bytes
-per rule, and a scan report sidecar (`mf-scan-report.json` by default) records
+per rule, and a scan report sidecar (`mf-scan-report-<UTC time>.json` by default) records
 the same coverage data. See
 [Scan statistics & the report sidecar](output-and-offsets.md#scan-statistics--the-report-sidecar).
 

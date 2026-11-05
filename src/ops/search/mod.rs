@@ -85,6 +85,9 @@ pub struct Query<'a> {
     pub base64: Option<&'a Regex>,
     /// The decoded value carried onto base64 hits; `None` when `base64` is unset.
     pub decoded: Option<&'a str>,
+    /// Number each match's line (`-n`). Off by default because it means counting the
+    /// newlines before every match.
+    pub line_numbers: bool,
 }
 
 impl<'a> Query<'a> {
@@ -94,6 +97,7 @@ impl<'a> Query<'a> {
             plain: re,
             base64: None,
             decoded: None,
+            line_numbers: false,
         }
     }
 }

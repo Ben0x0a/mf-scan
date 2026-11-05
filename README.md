@@ -45,17 +45,18 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   and Android. App Groups are attributed **authoritatively** from the entitlements
   MobileContainerManager recorded for the app (with a vendor-token heuristic
   fallback where those are unavailable, such as on a backup). See [`app`](#app).
-- **Rebuild an iOS backup** (`mf-scan ios-backup rebuild`): turn an iTunes/Finder
-  backup's flat blob store back into the device's directory tree
-  (`HomeDomain/Library/SMS/sms.db` → `private/var/mobile/Library/SMS/sms.db`),
-  decrypting on the way when the password is known. Paths that had to be invented
-  (a backup records no container GUIDs) and domains with no known mount point are
-  reported, never disguised. `mf-scan ios-backup info` reports what a backup is
-  without writing anything. See [`ios-backup`](docs/ios-backup.md).
+- **Rebuild a backup into one `.zip`** (`mf-scan backup rebuild`): turn an iOS
+  iTunes/Finder backup or an Android `adb backup` (`.ab`) back into the device's
+  directory tree (`HomeDomain/Library/SMS/sms.db` →
+  `private/var/mobile/Library/SMS/sms.db`), decrypting on the way when the password is
+  known. The output is always a ZIP, so long device paths work on Windows, and it keeps
+  the device's timestamps. Paths that had to be invented and domains with no known mount
+  point are reported, never disguised. See [`backup`](docs/backup.md).
+- **List files like `find`** (`mf-scan find`): by name, path, size, date and detected
+  type, with `find`'s own spellings accepted. See [`find`](#find).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
-- **Find base64-encoded values** (`--base64`), **find files by path**
-  (`--match-path`), **decrypt app databases** (`--keyfile`).
+- **Find base64-encoded values** (`--base64`), **decrypt app databases** (`--keyfile`).
 - **Transparent coverage**: every run logs what it skipped and why, prints a
   scanned/skipped summary, and writes a scan-report sidecar.
 - **Export matched (or changed) files out** with a re-ingestable manifest and a
@@ -69,7 +70,7 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 
 ## Install
 
-Requires a Rust toolchain (2024 edition, e.g. Rust 1.95+).
+Requires a Rust toolchain, Rust 1.98 or newer.
 
 ```
 cargo build --release
@@ -94,7 +95,7 @@ mf-scan grep 'secret' ./cases -r
 mf-scan grep 'token' case.zip --path '*.sqlite' --path '*.plist' --inspect
 
 # Machine-readable output to a file
-mf-scan grep 'token' case.zip --format json -o hits.json
+mf-scan grep 'token' case.zip --format json --output hits.json
 
 # Record matched files (with total size), review, then export them out
 mf-scan grep 'token' case.zip --manifest hits.json
@@ -111,38 +112,80 @@ mf-scan app paths case.zip com.whatsapp.WhatsApp
 
 # Export all of an app's data out, one subfolder per container
 mf-scan app export case.zip com.whatsapp.WhatsApp --to ./whatsapp_data
+
+# List files by name and size, as with find
+mf-scan find case.zip -name '*.db' -size +1M
+
+# Rebuild an iOS or Android backup into one .zip of the device's tree
+mf-scan backup rebuild phone.ab --to device.zip
 ```
 
 ---
 
 ## Commands
 
-mf-scan has four subcommands:
+mf-scan has six subcommands. Each one's `-h` lists every option on one line and ends
+with worked examples:
 
 | Command | Purpose |
 |---|---|
-| `grep PATTERN SOURCE...` | Search one or more sources (archives and/or directories); print/record matches; optionally export files. |
-| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep` or `diff`) and copy the listed files out (no search). |
+| `grep PATTERN [SOURCE]...` | Search archives, files, folders, backups or standard input; print/record matches; optionally export files. |
+| `find SOURCE... [tests]` | List files by name, path, size, date and type; optionally export them. |
+| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep`, `find` or `diff`) and copy the listed files out (no search). |
 | `diff A B` | Compare two sources (archives or folders): report added / removed / modified files, optionally what changed inside them, and optionally export the changed files. |
 | `app {grep\|paths\|export}` | Locate and export an application's data (iOS FFS / iOS backup / Android) — by bundle id / package, including widgets/extensions and App Groups. |
+| `backup {info\|rebuild}` | Inspect an iOS or Android backup, or rebuild it into one `.zip` of the device's directory tree. |
+
+### Coming from grep
+
+Most habits carry over. These are the differences:
+
+| In grep | In `mf-scan grep` |
+|---|---|
+| `-r` reads every file under a directory | `-r` searches the **archives** under it and reports how many loose files it skipped. `--dir-mode` reads a directory's files. |
+| `path:text` | `path:0x<byte offset>:text`, because the byte offset is what locates evidence. |
+| `-n` gives `path:line:text` | `-n` gives `path:line:0x<byte offset>:text`. |
+| `-o` prints only the match | `-o` also keeps the location: `path:0x<byte offset>:match`. |
+| `-c` counts matching lines | `-c` counts matches, and lists only files with a match. |
+| `hel\+o` (basic regex) | `hel+o`: the syntax is always extended, and `-E` is accepted but has no effect. |
+| `-f FILE` reads patterns from a file | `-f` is `--format`. |
+
+`-i`, `-F`, `-l`, `-w`, `-e`, `-q` and `^`/`$` at each line work as in grep, and with no
+source, or `-`, it reads standard input. `\A` and `\z` anchor to the start and end of the
+whole file. `-q` runs the whole search rather than stopping at the first match. `-v` and
+`-A`/`-B`/`-C` are not available.
+
+**Exit status:** `0` a match was found, `1` no match, `2` an error, or some files could
+not be read or decrypted (with `-q`, a match still gives `0`, as in grep). `find` exits
+`0` with or without results, as `find` does. `diff`, `app`, `export` and `backup` exit `0`
+on success. All exit `2` on error.
+
+**Results go to stdout; everything else goes to stderr**, so pipes stay clean. Add
+`--no-stats` to skip the coverage summary and `--no-report` to skip the report file.
 
 ### Sources, `--dir-mode`, and `-r`
 
-A **file** operand is always opened as an archive. A **directory** operand needs one
-of these two flags to say how to read it (there is no silent default — a directory
-with neither is rejected; the two are mutually exclusive):
+A **file** operand is identified by its content, then its name: a ZIP, a tar, or an
+Android backup is opened as one, and anything else is searched as one file. A damaged
+file named `.zip` or `.tar` fails rather than being searched as an opaque blob.
+
+A **directory** operand needs one of these two flags to say how to read it (there is no
+silent default — a directory with neither is rejected; the two are mutually exclusive):
 
 - `--dir-mode` — treat the directory as a **folder of interest**: scan the files
   inside it. A nested `.zip` is an opaque file at the default `--archive-depth 0`;
   raise the depth to open nested archives and list the files within them (`1` = one
   level, `N` = `N` levels of nesting).
-- `-r`, `--recursive` — walk the directory tree and treat **every `*.zip`** found as
-  its own archive source (each tagged by its path).
+- `-r`, `--recursive` — walk the directory tree and treat **every archive** found
+  (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.ab`) as its own source, tagged by its path. Loose
+  files are not searched; how many were skipped is reported on stderr and in the scan
+  report.
 
 ### `grep`
 
 ```
-mf-scan grep PATTERN SOURCE... [options]
+mf-scan grep [options] PATTERN [SOURCE]...
+mf-scan grep [options] -e PATTERN... [SOURCE]...
 ```
 
 Grep-style: the **PATTERN comes first**, then the sources. `SOURCE` may be repeated.
@@ -151,23 +194,29 @@ With more than one source, each result is tagged with its origin (see
 
 | Flag | Meaning |
 |---|---|
+| `-e`, `--regexp PATTERN` | Search for this pattern too. Repeatable; each keeps its own inline flags. |
 | `-i`, `--ignore-case` | Case-insensitive matching. |
-| `-l`, `--literal-string` | Treat PATTERN as a literal string, not a regex (alias: `--fixed-strings`). |
+| `-F`, `--fixed-strings` | Treat patterns as literal strings, not regexes (alias: `--literal-string`). |
+| `-w`, `--word-regexp` | Match whole words only: the characters either side of a match must not be word characters. Works around punctuation (`-w -F '+33'`). |
+| `-l`, `--files-with-matches` | List only the files with a match, one per line. Can be combined with `--export`/`--manifest`. |
+| `-o`, `--only-matching` | Show only the matched text (`path:0x<offset>:<match>`), including readable matches inside binary files, up to the 200-byte preview limit. Text output only. |
+| `-n`, `--line-number` | Show each match's 1-based line number before its offset. Also in JSON, and as the last CSV column. |
+| `-q`, `--quiet` | Print nothing and write no report (unless `--report` names one); the exit status is the answer. Files that could not be searched are still reported. |
 | `-E`, `--extended-regexp` | Accepted for grep muscle memory; no-op (the engine is already ERE-like). |
 | `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
 | `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
-| `-r`, `--recursive` | Walk a directory operand for `*.zip` files, each its own source. |
+| `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.ab`), each its own source. Skipped loose files are counted and reported. |
 | `--path GLOB` | Only handle files whose internal path matches the wildcard. Repeatable. |
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |
 | `-t`, `--type TYPE` | Only handle files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
 | `--match-path` | Match the PATTERN against each file's internal path instead of its content. |
-| `--base64` / `--base64-urlsafe` | Also search for the base64 encoding of the pattern (any alignment). Requires `-l`; not with `--match-path`. |
+| `--base64` / `--base64-urlsafe` | Also search for the base64 encoding of the pattern (any alignment). Requires `-F`; not with `--match-path`. |
 | `--exclude-media` | Skip image/video/audio files (searched by default). |
 | `--fast` | Speed preset: exclude media + a customisable exclude list. |
 | `--inspect` | Resolve matches inside recognised formats (see [Inspection](#deep-inspection)). |
 | `-c`, `--count` | Print only the match count per file. |
 | `-f`, `--format txt\|json\|csv` | Output format (default `txt`). |
-| `-o`, `--output FILE` | Write results to a file instead of stdout. |
+| `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
 | `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
@@ -175,11 +224,54 @@ With more than one source, each result is tagged with its origin (see
 | `--max-path-len N` | Path-length guard for the export (default `260`, Windows `MAX_PATH`). On Windows an over-limit path is skipped+recorded; elsewhere it is exported but flagged non-portable. `0` disables. See [`app`](#app). |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
 | `--io-mode auto\|mmap\|ranged` | How to read an archive: `auto` (default) memory-maps a local archive but uses **positioned reads** for a remote SMB/NFS source; `ranged` forces positioned reads, `mmap` forces mapping. See [Remote / network sources](#remote--network-sources). |
-| `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: beside `-o`, else `mf-scan-report.json`. |
+| `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: a new timestamped file on every run, beside `--output`, else `mf-scan-report-<UTC time>.json` in the current directory. |
+| `--no-stats` | Skip the end-of-run coverage summary. Files that could not be searched are still reported. |
 | `--keyfile FILE` | Decrypt profile-matched databases using keys from this keychain/keystore dump (repeatable). See [Decryption](#decryption). |
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
-| `--backup-password PASSWORD` | Password to unlock an **encrypted iOS backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
+| `--backup-password PASSWORD` | Password to unlock an **encrypted iOS or Android backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
+
+### `find`
+
+```
+mf-scan find SOURCE... [tests] [options]
+```
+
+Lists a source's files and directories without reading their contents, as the `find`
+command lists a directory. A folder needs no flag: walking it is what `find` does. `find`'s
+own spellings work as typed (`-name`, `-iname`, `-path`, `-ipath`, `-regex`, `-iregex`,
+`-type`, `-size`, `-newermt`, `-maxdepth`, `! -name`, `! -path`, `-ls`, `-print`).
+
+```
+mf-scan find case.zip -name '*.db'
+mf-scan find case.zip --iname 'sms*' --type f --long
+mf-scan find case.zip --type sqlite --size +1M --not-path '*/Caches/*'
+mf-scan find ./extracted --newer 2026-01-01 --older 2026-02-01
+mf-scan find case.zip --path '*com.whatsapp*' --export ./out --max-size 5G
+```
+
+| Test | Meaning |
+|---|---|
+| `--name GLOB` / `--iname GLOB` | The file name matches this wildcard (`*`, `?`); `i` ignores case. |
+| `--path GLOB` / `--ipath GLOB` | The whole path matches, where `*` also crosses `/`. A pattern naming an iOS bundle identifier also matches that app's GUID-named container. |
+| `--regex RE` / `--iregex RE` | The whole path matches this regex, anchored at both ends as in `find`. |
+| `--not-name GLOB` / `--not-path GLOB` | The file name or path does not match. |
+| `--type TYPE` | `f`, `d`, or a detected format or category (`sqlite`, `media`, ...). Only a format reads a file, and then only its header. |
+| `--size SIZE` | `+10M` over, `-1k` under, `4096` exactly. `k`, `M`, `G` are 1024-based; a bare number is **bytes**, not `find`'s 512-byte blocks. |
+| `--newer DATE` / `--older DATE` | Modified after or before this UTC time: `2026-01-31` or `2026-01-31T12:00`. |
+| `--maxdepth N` | Descend at most N levels; top-level names are level 1. |
+
+Different tests must all hold. Repeating a test means either, since there is no `-o`.
+
+A ZIP's ordinary timestamp has no time zone, so date tests read it as UTC; an archive with
+extended timestamps, such as one `backup rebuild` wrote, is exact. Entries with no recorded
+time are excluded by a date test, and how many is reported. Directories are listed whether
+the source records them or they are only implied by their files' paths, which have no time.
+
+`--long` prints type, size, modified time and path, tab-separated. `-f json` and `-f csv`
+give the same fields. `--export` and `--manifest` work as for `grep`, on files only. There
+is no summary and no scan report. It exits `0` with or without results, as `find` does, and
+`2` on error, including when a file could not be read to test `--type`.
 
 ### `export`
 
@@ -187,7 +279,7 @@ With more than one source, each result is tagged with its origin (see
 mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE] [--max-path-len N]
 ```
 
-Re-ingests a manifest written by `grep --manifest` (or `diff --manifest`) and copies
+Re-ingests a manifest written by `grep`, `find` or `diff --manifest` and copies
 the listed files out of the archive — **without searching again**. Honours
 `--max-size` and the `--max-path-len` guard (see [`app`](#app)).
 
@@ -211,7 +303,7 @@ may be an archive or a `--dir-mode` directory.
 | `--path` / `--not-path` | Restrict which files are compared. |
 | `--manifest FILE` / `--export DIR` | Write a manifest of / export the added+modified files from side B, through the same pipeline as `grep` — so `mf-scan export` can re-ingest a diff. |
 | `--archive-depth N` / `--dir-mode` | As for `grep`, applied to each side. |
-| `-f`, `--format` / `-o`, `--output` | Output format / sink. |
+| `-f`, `--format` / `--output FILE` | Output format / sink. |
 
 By default `diff` uses **mtime + size** (fast); add `--exact` when a content-preserving
 timestamp could hide a change. See [docs/diff.md](docs/diff.md) for the full report
@@ -241,7 +333,7 @@ mf-scan app export SOURCE BUNDLE_ID --to DIR [options]   # copy one app's data o
 | `export` | Copies all of the app's data out, **one subfolder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain), and writes `export-report.json` with per-file integrity. Excludes the `.app` bundle (binary, not data). |
 
 Common `app` flags: `--dir-mode`, `--archive-depth N`, `--io-mode`,
-`--backup-password`, `-f/--format txt|json`, `-o/--output FILE`; for `paths`/`export`
+`--backup-password`, `-f/--format txt|json`, `--output FILE`; for `paths`/`export`
 also `--no-groups`; for `export` also `--to DIR`, `--max-size SIZE`,
 `--max-path-len N`, `--verify`.
 
@@ -296,7 +388,8 @@ path:0x<file_offset>[:line]
 
 The offset is hex (like a hex editor). The matched `line` is shown only for
 **textual** files; binary files (SQLite, bplist, …) show just `path:0x<offset>`.
-`--inspect` appends a labelled tag; `--count` prints `path:count` per file. For a
+`--inspect` appends a labelled tag; `--count` prints `path:count` per file; `-l` prints
+just the path; `-o` prints the matched text in place of the line. For a
 folder source, the path reads like `backup.zip/messages.db` once nested archives are
 opened.
 
@@ -479,6 +572,7 @@ no-single-archive-byte cases; CRC-32 export integrity still applies.
 - [docs/output-and-offsets.md](docs/output-and-offsets.md) — output formats, offsets, inspection schema.
 - [docs/inspectors.md](docs/inspectors.md) — supported formats, detection, adding one.
 - [docs/decryption.md](docs/decryption.md) — decrypting databases: architecture, formats, profiles, caveats.
+- [docs/backup.md](docs/backup.md) — rebuilding iOS and Android backups: the archive, timestamps, the path tables.
 - [docs/adr/](docs/adr/) — architecture decision records (decryption; the source/container abstraction).
 - [benchmark/README.md](benchmark/README.md) — I/O-mode benchmark (`mmap` vs `ranged`) and performance findings.
 - Contributing: see [Local checks](docs/architecture.md#local-checks-run-before-pushing-a-tag) and [Releasing](docs/architecture.md#releasing) in the architecture doc — run `./scripts/check.sh` before pushing a tag.

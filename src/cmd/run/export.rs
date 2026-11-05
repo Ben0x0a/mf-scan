@@ -11,8 +11,6 @@ use std::io::BufReader;
 use anyhow::{Context, Result};
 
 use mf_scan::core::source::Source;
-use mf_scan::core::source::tar::TarSource;
-use mf_scan::core::source::zip::ZipSource;
 use mf_scan::report::export::{self, ExportOutcome};
 
 use crate::cmd::cli::ExportArgs;
@@ -20,7 +18,9 @@ use crate::cmd::support::exporting::{
     report_portability_warnings, report_skipped_too_long, write_export_report_file,
 };
 use crate::cmd::support::reporting::{report_verify, sha256_hex};
-use crate::cmd::support::sources::{is_tar_path, open_archive};
+use crate::cmd::support::sources::{
+    BackupOptions, BackupProvenance, IoMode, resolve_file, with_operand_source,
+};
 
 /// Run the `export` subcommand: re-ingest files listed in a manifest.
 pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
@@ -28,26 +28,28 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
         .with_context(|| format!("cannot open manifest {}", args.from_manifest.display()))?;
     let manifest = export::read_manifest(BufReader::new(manifest_file))?;
 
-    // The archive is a tar (plain or `.tar.gz`) or a ZIP, decided by name — the same
-    // routing the search/diff paths use. A tar owns its backing buffer, so it opens
-    // in its own branch; only the ZIP path exposes the raw bytes `--verify` hashes.
-    if is_tar_path(&args.archive) {
-        if args.verify {
-            eprintln!(
-                "note: --verify (whole-archive hash) is not supported for tar sources; skipping it"
-            );
-        }
-        let source = TarSource::open(&args.archive)?;
-        run_manifest_export(&args, &manifest, &source)?;
-    } else {
-        let mmap = open_archive(&args.archive)?;
-        let verify_before = args.verify.then(|| sha256_hex(&mmap));
-        let source = ZipSource::open(&mmap)?;
-        run_manifest_export(&args, &manifest, &source)?;
-        if let Some(before) = verify_before {
-            report_verify(&before, &sha256_hex(&mmap));
-        }
-    }
+    let resolved = resolve_file(&args.archive)?;
+    let backup_opts = BackupOptions::resolve(None);
+    let prov = BackupProvenance::new();
+    with_operand_source(
+        resolved.operand(0),
+        &backup_opts,
+        IoMode::Auto,
+        prov.sink(),
+        |source, raw| {
+            let verify_before = args.verify.then(|| raw.map(sha256_hex)).flatten();
+            run_manifest_export(&args, &manifest, source)?;
+            match (verify_before, raw) {
+                (Some(before), Some(bytes)) => report_verify(&before, &sha256_hex(bytes)),
+                _ if args.verify => {
+                    eprintln!("verify: skipped (this source has no single archive file to hash)")
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    prov.report();
     Ok(())
 }
 

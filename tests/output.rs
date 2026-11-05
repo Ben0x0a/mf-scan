@@ -6,7 +6,7 @@
 //! Uses: `mf_scan::{models, output}`, `serde_json` (to parse JSON back).
 
 use mf_scan::core::models::{Encoding, Inspection, MatchRecord, RunInfo};
-use mf_scan::report::output::{OutputFormat, write_counts, write_results};
+use mf_scan::report::output::{OutputFormat, TxtStyle, write_counts, write_results};
 use mf_scan::report::stats::ScanStats;
 use serde_json::json;
 
@@ -16,6 +16,7 @@ fn run_info() -> RunInfo {
         tool: "mf-scan".into(),
         version: "test".into(),
         pattern: "SECRET".into(),
+        patterns: vec![],
         literal: false,
         ignore_case: false,
         match_path: false,
@@ -32,6 +33,7 @@ fn run_info() -> RunInfo {
         app: None,
         app_containers: vec![],
         app_group_links: vec![],
+        loose_files_skipped: 0,
     }
 }
 
@@ -43,6 +45,7 @@ fn binary_record() -> Vec<MatchRecord> {
         path: "db.sqlite".into(),
         file_start: 0,
         file_offset: 4096, // 0x1000
+        line_number: None,
         archive_offset: Some(4096),
         compressed: false,
         decrypted: false,
@@ -63,6 +66,7 @@ fn sample() -> Vec<MatchRecord> {
             path: "sub/b.log".into(),
             file_start: 100,
             file_offset: 17,
+            line_number: None,
             archive_offset: Some(117),
             compressed: false,
             decrypted: false,
@@ -79,6 +83,7 @@ fn sample() -> Vec<MatchRecord> {
             path: "a.txt".into(),
             file_start: 200,
             file_offset: 12,
+            line_number: None,
             archive_offset: Some(212),
             compressed: false,
             decrypted: false,
@@ -99,7 +104,7 @@ fn render(records: &[MatchRecord], format: OutputFormat, colourise: bool) -> Str
         records,
         format,
         colourise,
-        false,
+        TxtStyle::Line,
         &run_info(),
         &stats,
         &mut buf,
@@ -155,13 +160,13 @@ fn csv_has_header_and_rows() {
     let mut lines = out.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "archive,path,file_start,file_offset,archive_offset,compressed,decrypted,encoding,decoded,format,context,line"
+        "archive,path,file_start,file_offset,archive_offset,compressed,decrypted,encoding,decoded,format,context,line,line_number"
     );
     // Single archive => empty archive column; not decrypted; plain encoding with no
     // decoded value; format/context empty without inspect; offsets are 0x… hex.
     assert_eq!(
         lines.next().unwrap(),
-        ",sub/b.log,0x64,0x11,0x75,false,false,plain,,,,another SECRET line"
+        ",sub/b.log,0x64,0x11,0x75,false,false,plain,,,,another SECRET line,"
     );
 }
 
@@ -173,6 +178,7 @@ fn txt_shows_hex_file_offset_for_compressed() {
         path: "c.bin".into(),
         file_start: 50,
         file_offset: 10,
+        line_number: None,
         archive_offset: Some(50), // blob start for a DEFLATE entry
         compressed: true,
         decrypted: false,
@@ -198,6 +204,7 @@ fn inspected() -> Vec<MatchRecord> {
         path: "a.txt".into(),
         file_start: 0,
         file_offset: 12,
+        line_number: None,
         archive_offset: Some(12),
         compressed: false,
         decrypted: false,

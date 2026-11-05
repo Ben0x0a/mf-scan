@@ -18,21 +18,19 @@ use mf_scan::report::output::OutputFormat;
 /// Arguments for `diff`.
 #[derive(Args)]
 pub(crate) struct DiffArgs {
-    /// Baseline source (side A): an archive file or a directory.
+    /// Baseline: an archive, a file, or a folder with --dir-mode.
     #[arg(value_name = "A")]
     pub(crate) a: PathBuf,
 
-    /// Comparison source (side B): an archive file or a directory.
+    /// Compared against the baseline, in the same forms.
     #[arg(value_name = "B")]
     pub(crate) b: PathBuf,
 
-    /// Compare file *content* with SHA-256 instead of the default mtime+size check.
-    /// Exact but slower; catches content changes that preserve the timestamp.
+    /// Compare content (SHA-256), not just size and time.
     #[arg(long = "exact")]
     pub(crate) exact: bool,
 
-    /// Inspect modified files of supported formats and report what changed inside
-    /// them (SQLite tables/rows, plist/JSON keys, text lines).
+    /// Say what changed inside SQLite, plist, JSON and text files.
     #[arg(long = "inspect")]
     pub(crate) inspect: bool,
 
@@ -42,41 +40,40 @@ pub(crate) struct DiffArgs {
     #[command(flatten)]
     pub(crate) decrypt: DecryptArgs,
 
-    /// Keyfile(s) for side A only (overrides the shared `--keyfile` for A).
-    #[arg(long = "keyfile-a", value_name = "FILE")]
+    // Reserved for decryption-aware diff, which is not implemented; rejected if given.
+    #[arg(long = "keyfile-a", value_name = "FILE", hide = true)]
     pub(crate) keyfile_a: Vec<PathBuf>,
 
-    /// Keyfile(s) for side B only (overrides the shared `--keyfile` for B).
-    #[arg(long = "keyfile-b", value_name = "FILE")]
+    #[arg(long = "keyfile-b", value_name = "FILE", hide = true)]
     pub(crate) keyfile_b: Vec<PathBuf>,
 
-    /// Platform scope for side A only (overrides the shared `--platform` for A).
-    #[arg(long = "platform-a", value_name = "PLATFORM")]
+    #[arg(long = "platform-a", value_name = "PLATFORM", hide = true)]
     pub(crate) platform_a: Option<PlatformArg>,
 
-    /// Platform scope for side B only (overrides the shared `--platform` for B).
-    #[arg(long = "platform-b", value_name = "PLATFORM")]
+    #[arg(long = "platform-b", value_name = "PLATFORM", hide = true)]
     pub(crate) platform_b: Option<PlatformArg>,
 
     #[command(flatten)]
     pub(crate) sink: ExportSink,
 
-    /// Output format.
-    #[arg(short = 'f', long, default_value = "txt")]
+    /// Output format: txt, json or csv.
+    #[arg(short = 'f', long, default_value = "txt", hide_default_value = true)]
     pub(crate) format: OutputFormat,
 
-    /// Write the diff report to this file instead of stdout.
-    #[arg(short = 'o', long = "output")]
+    /// Write the report to this file instead of stdout.
+    #[arg(long = "output", value_name = "FILE")]
     pub(crate) output: Option<PathBuf>,
 
-    /// Treat a directory side as a folder of interest: scan the files inside it
-    /// (nested `.zip` opened per `--archive-depth`). A directory side without it is
-    /// rejected (no silent default).
+    /// Read a folder side's files.
     #[arg(long = "dir-mode")]
     pub(crate) dir_mode: bool,
 
-    /// How many levels of nested `*.zip` (found while scanning a `--dir-mode` folder)
-    /// to open and descend into. 0 = treat nested archives as opaque files.
-    #[arg(long = "archive-depth", value_name = "N", default_value_t = 0)]
+    /// With --dir-mode, open nested .zip files this many levels deep.
+    #[arg(
+        long = "archive-depth",
+        value_name = "N",
+        default_value_t = 0,
+        hide_default_value = true
+    )]
     pub(crate) archive_depth: u32,
 }

@@ -56,6 +56,8 @@ pub(crate) struct MBFile {
     /// decryption (see `ios::backup::source`). `None` when the record carries no
     /// digest (older producers, or a non-file entry).
     pub(crate) digest: Option<Vec<u8>>,
+    /// When the file was last modified on the device (Unix seconds), when recorded.
+    pub(crate) last_modified: Option<u64>,
 }
 
 /// Parse an `MBFile` NSKeyedArchiver blob into its fields.
@@ -112,11 +114,17 @@ pub(crate) fn parse_mbfile(blob: &[u8]) -> Option<MBFile> {
         .and_then(|i| objects.get(i))
         .and_then(data_bytes);
 
+    let last_modified = mbfile
+        .get("LastModified")
+        .and_then(Value::as_signed_integer)
+        .and_then(|secs| u64::try_from(secs).ok());
+
     Some(MBFile {
         protection_class,
         encryption_key,
         size,
         digest,
+        last_modified,
     })
 }
 

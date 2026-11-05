@@ -11,18 +11,19 @@ from it. `mf_scan::<module>` is the library path each folder maps to.
 ```
 src/
   lib.rs        library root (declares the library modules below)
-  main.rs       BINARY entry point: parse Cli, dispatch Grep | Export | Diff | App |
-                IosBackup
+  main.rs       BINARY entry point: parse Cli, dispatch Grep | Find | Export | Diff |
+                App | Backup, map the result to an exit status
 
   cmd/          BINARY ONLY — the CLI front end (declared in main.rs, not lib.rs)
     cli/          clap argument structs, split per subcommand
-      mod.rs        Cli + Command enum
-      grep.rs export.rs diff.rs app.rs   per-subcommand args (app.rs: grep/paths/export)
-      ios_backup.rs per-subcommand args (info / rebuild)
+      mod.rs        Cli + Command enum + parse
+      grep.rs find.rs export.rs diff.rs app.rs backup.rs   per-subcommand args
+                    (find.rs also accepts find's own single-dash spellings)
       common.rs     shared value types + size parser + the flatten arg-groups
                     (FilterArgs / DecryptArgs / ExportSink) reused by grep & diff
-    run/          one orchestrator per command (grep.rs / export.rs / diff.rs / app.rs /
-                  ios_backup.rs)
+      examples.rs   the examples ending each help screen; a test parses every one
+    run/          one orchestrator per command (grep.rs / find.rs / export.rs / diff.rs /
+                  app.rs / backup.rs)
     support/      machinery the commands share — sources (resolve operands), presets,
                   decryption setup, progress reporter, reporting, exporting
 
@@ -30,15 +31,19 @@ src/
     models.rs     data containers: Method, Entry+Location, SearchHit, MatchRecord,
                   Inspection, ContentDiff, RunInfo
     filter.rs     EntryFilter: path globs (--path/--not-path) + --type / media skip
-    util.rs       tiny crate-wide helpers (sha256_hex)
+    util.rs       tiny crate-wide helpers (sha256_hex, the UTC calendar)
     source/       the container abstraction the engine reads through (see ADR 0002)
-      mod.rs        Source trait: entries() + content() + byte_size() + integrity_check()
+      mod.rs        Source trait: entries() + content() + byte_size() + integrity_check();
+                    sniff_container: the one decision on what kind of file an operand is
       zip.rs        ZIP central-directory decoders (shared) + ZipSource (mmap,
                     zero-copy STORED; per-entry CRC-32 for export integrity)
       ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
                     (no whole-file mmap; lazy data-offset resolution; header-first
                     prefix reads). Reuses zip.rs's central-directory decoders.
-      folder.rs     FolderSource: a directory of loose files (+ nested-archive arena)
+      tar.rs        TarSource: plain or gzipped tar; also the payload of an Android backup
+      folder.rs     FolderSource: a directory of loose files (+ nested-archive arena), or
+                    one loose file
+      bytes.rs      BytesSource: one file held in memory (standard input)
       nested.rs     --archive-depth expansion of nested .zip files into the arena
   formats/      file-CONTENT understanding (what is in this file?)
     inspect/      "what does this match mean" inspectors + file-type detection + diff
@@ -51,6 +56,10 @@ src/
                   MobileContainerManager references reader
   decrypt/      database decryption — profiles, keyfile providers, ciphers (see ADR 0001)
   platform/     per-OS artefact parsing (low-level; consumed by apps/)
+    android/      Android-specific layers (see ADR 0005)
+      backup.rs     adb backup (.ab): header, password unlock, streamed decrypt + inflate,
+                    presented as a Source over the tar inside
+      paths.rs      archive member → device path, from AOSP's FullBackup tokens
     ios/          iOS-specific layers
       domains.rs    backup domain grammar + device mount points (ADR 0004) — the ONE
                     definition apps::ios_backup, apps::catalog and apps::ios_ffs
@@ -76,8 +85,10 @@ src/
       scan.rs base64.rs   per-entry byte search + base64 alignment fragments
       classify.rs   the per-entry body of the parallel map (filter→decrypt→search)
     diff/         compare two Sources -> DiffReport (mod.rs) using compare.rs (meta|hash)
-    rebuild.rs    whole iOS backup -> filesystem-like tree: one (prefix,label) root per
-                  domain, fed to report::export::plan_tree (`ios-backup rebuild`)
+    find.rs       list a Source's files by name, size, date and type (the `find` subcommand)
+    rebuild.rs    whole backup -> filesystem-like tree: one (prefix,label) root per iOS
+                  domain or Android token, fed to report::export::plan_tree
+                  (`backup rebuild`)
     apps/         locate & export an app's data across acquisition types (the `app`
                   subcommand). Layered ON TOP of a Source — search stays app-agnostic.
       mod.rs        thin dispatcher: re-exports the surface below
@@ -88,7 +99,9 @@ src/
       android.rs    Android package-under-storage-root resolution
   report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
                 stored-digest integrity; flat `plan` for search hits + tree-preserving
-                `plan_tree` for `app export`; the --max-path-len guard) · diff.rs
+                `plan_tree` for `app export`; the --max-path-len guard) · diff.rs ·
+                zip_writer.rs (STORED ZIP that keeps timestamps) · rebuild_zip.rs (a
+                backup rebuild's one archive, its record and its .sha256)
   preset/       behaviour presets behind one flag; fast.rs is the --fast exclude list
 ```
 

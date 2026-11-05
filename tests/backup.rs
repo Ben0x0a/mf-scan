@@ -129,8 +129,9 @@ fn directory_records_are_separate_from_entries() {
     // …and it must NOT appear among the file entries.
     for dir in &structure.directories {
         assert!(
-            !source.entries().iter().any(|e| &e.name == dir),
-            "directory {dir} leaked into entries()"
+            !source.entries().iter().any(|e| e.name == dir.name),
+            "directory {} leaked into entries()",
+            dir.name
         );
     }
 

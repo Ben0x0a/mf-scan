@@ -283,6 +283,25 @@ pub(super) fn classify_entry(
     // returns earlier), so its presence marks the content as decrypted plaintext.
     let was_decrypted = decryption.is_some();
 
+    // Line numbers, computed in one pass: the hits are sorted by offset, so each count
+    // continues from the last rather than rescanning the file from the start.
+    let line_numbers: Vec<u64> = if query.line_numbers {
+        let (mut line, mut counted) = (1u64, 0usize);
+        hits.iter()
+            .map(|(hit, _)| {
+                let end = (hit.offset as usize).min(content.len());
+                line += content[counted..end]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count() as u64;
+                counted = end;
+                line
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let matches = hits.len();
     let (records, file) = if hits.is_empty() {
         (Vec::new(), None)
@@ -304,9 +323,11 @@ pub(super) fn classify_entry(
         };
         let records = hits
             .into_iter()
-            .map(|(hit, encoding)| {
+            .enumerate()
+            .map(|(index, (hit, encoding))| {
                 let mut record = MatchRecord::new(entry, hit, data_start);
                 record.encoding = encoding;
+                record.line_number = line_numbers.get(index).copied();
                 if encoding == Encoding::Base64 {
                     record.decoded = query.decoded.map(str::to_string);
                 }
@@ -368,6 +389,7 @@ fn match_entry_path(entry: &Entry, re: &Regex) -> (Vec<MatchRecord>, Option<Matc
         path: entry.name.clone(),
         file_start: entry.archive_data_start().unwrap_or(0),
         file_offset: 0,
+        line_number: None,
         archive_offset: entry.archive_data_start(),
         compressed: entry.is_compressed(),
         decrypted: false,

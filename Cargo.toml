@@ -43,9 +43,11 @@ serde_json = "1.0.150"
 serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
+# The spill file for decoding a large Android backup: unnamed and deleted by the OS,
+# on every platform. Already in the build as a test dependency.
+tempfile = "3.27.0"
 
 [dev-dependencies]
 # Used by integration tests to fabricate DEFLATE streams (a normal dependency
 # too, so this adds no compilation — integration-test crates only see dev-deps).
 flate2 = "1.1.9"
-tempfile = "3.27.0"

@@ -16,10 +16,10 @@ use crate::cmd::cli::common::parse_size;
 /// Arguments for `export`.
 #[derive(Args)]
 pub(crate) struct ExportArgs {
-    /// ZIP or tar archive (`.tar`/`.tar.gz`/`.tgz`) to export files from.
+    /// Archive or backup file to export from.
     pub(crate) archive: PathBuf,
 
-    /// Manifest written by a previous `grep --manifest` (or `diff --manifest`).
+    /// Manifest from grep, find or diff --manifest.
     #[arg(long = "from-manifest", value_name = "FILE")]
     pub(crate) from_manifest: PathBuf,
 
@@ -27,18 +27,15 @@ pub(crate) struct ExportArgs {
     #[arg(long = "to", value_name = "DIR")]
     pub(crate) to: PathBuf,
 
-    /// Refuse if the manifest's total size exceeds this (e.g. 200MB, 1G).
-    /// Defaults to 1G as an accident guard; raise it to export more.
-    #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
+    /// Refuse to export more than this (default 1G), e.g. 5G.
+    #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
 
-    /// Skip (and record) any file whose destination path would exceed this many
-    /// characters. Defaults to 260 (Windows MAX_PATH); 0 disables the guard.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN)]
+    /// Skip and record longer paths (default 260, Windows); 0 is off.
+    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
     pub(crate) max_path_len: usize,
 
-    /// Hash the archive (SHA-256) before and after the run and report whether it
-    /// changed — a slower, court-defensible integrity attestation.
+    /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
 }

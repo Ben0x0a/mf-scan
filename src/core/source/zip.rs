@@ -22,6 +22,7 @@ use rayon::prelude::*;
 
 use crate::core::models::{Entry, Location, Method};
 use crate::core::source::{Content, IntegrityCheck, Source};
+use crate::core::util::unix_from_civil;
 
 // --- ZIP record signatures (little-endian on disk) ---------------------------
 // These are fixed by the ZIP specification (APPNOTE.TXT), not operator-tunable,
@@ -35,6 +36,7 @@ pub(crate) const SIG_LFH: u32 = 0x0403_4b50; // Local File Header
 const METHOD_STORED: u16 = 0; // compression method 0 = no compression
 const METHOD_DEFLATE: u16 = 8; // compression method 8 = DEFLATE
 const ZIP64_EXTRA_ID: u16 = 0x0001; // header id of the ZIP64 extended-info field
+const TIMESTAMP_EXTRA_ID: u16 = 0x5455; // Info-ZIP extended timestamp (exact UTC seconds)
 
 /// One decoded Central Directory record, *before* its on-disk data offset is
 /// resolved from the Local File Header.
@@ -290,12 +292,40 @@ fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
             method,
             comp_size,
             uncomp_size,
-            mtime: dos_to_unix(dos_date, dos_time),
+            // The extended timestamp, when present, is exact and in UTC; the DOS field
+            // has 2-second resolution and no time zone.
+            mtime: read_timestamp_extra(cd, extra_start, extra_len)
+                .or_else(|| dos_to_unix(dos_date, dos_time)),
             crc32,
             local_offset,
         }),
         next,
     ))
+}
+
+/// The modification time in an entry's extended-timestamp extra field, if it has one.
+///
+/// HOW: the extra area is a sequence of `(id: u16, size: u16, body)` blocks; this
+/// field's body is a flags byte (bit 0: a modification time follows) and a signed
+/// 32-bit time. A malformed or negative value yields `None`, and the DOS field is used.
+fn read_timestamp_extra(data: &[u8], extra_start: usize, extra_len: usize) -> Option<u64> {
+    let extra = data.get(extra_start..extra_start.checked_add(extra_len)?)?;
+    let mut pos = 0;
+    while let Some(block) = extra.get(pos..pos + 4) {
+        let id = u16::from_le_bytes([block[0], block[1]]);
+        let size = u16::from_le_bytes([block[2], block[3]]) as usize;
+        let body = extra.get(pos + 4..pos + 4 + size)?;
+        if id == TIMESTAMP_EXTRA_ID {
+            let (&flags, rest) = body.split_first()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+            return u64::try_from(i32::from_le_bytes(bytes)).ok();
+        }
+        pos += 4 + size;
+    }
+    None
 }
 
 /// Values recovered from a ZIP64 extended-information extra field.
@@ -385,6 +415,11 @@ fn local_data_offset(data: &[u8], local_offset: u64) -> Result<u64> {
 /// stored comment length is consistent with the distance to end-of-file.
 /// WHY the consistency check: the signature bytes can legitimately appear
 /// inside a comment; the length check rejects those false positives.
+/// Whether `tail`, the end of a file, holds a consistent end-of-central-directory record.
+pub(crate) fn has_end_record(tail: &[u8]) -> bool {
+    find_eocd(tail).is_ok()
+}
+
 fn find_eocd(data: &[u8]) -> Result<usize> {
     const EOCD_MIN: usize = 22;
     ensure!(data.len() >= EOCD_MIN, "file smaller than an EOCD record");
@@ -451,15 +486,7 @@ fn dos_to_unix(date: u16, time: u16) -> Option<u64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    // Days since the Unix epoch via Howard Hinnant's days_from_civil algorithm.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
-    u64::try_from(secs).ok()
+    u64::try_from(unix_from_civil(year, month, day, hour, minute, second)).ok()
 }
 
 // --- Byte access + the Source container --------------------------------------

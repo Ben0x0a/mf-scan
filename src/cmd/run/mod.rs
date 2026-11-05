@@ -13,13 +13,15 @@
 //! the command files stay focused on orchestration.
 
 mod app;
+mod backup;
 mod diff;
 mod export;
+mod find;
 mod grep;
-mod ios_backup;
 
 pub(crate) use app::run_app;
+pub(crate) use backup::run_backup;
 pub(crate) use diff::run_diff;
 pub(crate) use export::run_export;
-pub(crate) use grep::run_grep;
-pub(crate) use ios_backup::run_ios_backup;
+pub(crate) use find::run_find;
+pub(crate) use grep::{EXIT_ERROR, run_grep};

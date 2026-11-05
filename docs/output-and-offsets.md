@@ -182,7 +182,7 @@ any alignment. See `src/ops/search/base64.rs` for the bit-level derivation.
 
 Constraints and behaviour:
 
-- **Requires `-l`** (a literal can be encoded; a regex has no byte form) and is
+- **Requires `-F`** (a literal can be encoded; a regex has no byte form) and is
   **incompatible with `--match-path`** (a path is not base64).
 - Searches **both** plaintext and base64 in one run; plain hits are unaffected.
 - Standard alphabet (`+/`) by default; `--base64-urlsafe` uses the URL-safe one
@@ -208,8 +208,13 @@ look at (important when `--fast` or a preset excludes whole subtrees).
   report (see [json](#json)).
 - **Sidecar file:** a `{ run, stats }` report is written for *every* run,
   regardless of output format. Its path is `--report <FILE>` if given, else
-  `<output>.report.json` beside `-o`, else `mf-scan-report.json` in the current
-  directory. `--no-report` suppresses it.
+  a new timestamped file, so runs never overwrite each other: `<output>.<UTC time>.report.json`
+  beside `--output`, else `mf-scan-report-<UTC time>.json` in the current directory
+  (for example `mf-scan-report-20261105T181403Z.json`). If that default location
+  cannot be written, the run warns and carries on; a path named with `--report` is
+  replaced if it exists, and failing to write it is an error. `--no-report` suppresses it.
+- **`--no-stats`** silences the end-of-run summary. Files that could not be searched
+  are still reported, and the report and JSON `stats` are unaffected.
 
 The `stats` object:
 

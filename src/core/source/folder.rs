@@ -70,6 +70,34 @@ impl FolderSource {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Self { entries, blobs })
     }
+
+    /// A source holding the one loose file at `path`, named by its file name.
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let meta = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Ok(Self {
+            entries: vec![Entry {
+                name,
+                uncompressed_size: meta.len(),
+                mtime: unix_mtime(&meta),
+                location: Location::Loose {
+                    path: path.to_path_buf(),
+                },
+            }],
+            blobs: Vec::new(),
+        })
+    }
+}
+
+/// A file's last-modified time as Unix epoch seconds, best-effort (used by `diff`).
+fn unix_mtime(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 impl Source for FolderSource {
@@ -200,12 +228,7 @@ fn collect(
 
         let meta = child.metadata().ok();
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        // Last-modified as Unix epoch seconds, best-effort (used by `diff`).
-        let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
+        let mtime = meta.as_ref().and_then(unix_mtime);
         entries.push(Entry {
             name,
             uncompressed_size: size,

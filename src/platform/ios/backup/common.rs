@@ -16,14 +16,20 @@
 //! (`MBFile` decode), `crate::core::source` (the `Source` trait), `sha1`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha1::{Digest as _, Sha1};
 
 use crate::core::models::{Entry, Location};
 use crate::core::source::{IntegrityCheck, Source};
-use crate::formats::sqlite::{Value as SqliteValue, read_table as read_sqlite_table};
+use crate::formats::sqlite::{Value as SqliteValue, parse_header, read_table as read_sqlite_table};
 use crate::platform::ios::backup::manifest::{MBFile, parse_mbfile};
+
+/// The zip-path list's column naming each row's member in the archive. The same name as the
+/// Python reconstructor's added column.
+const ZIP_PATH_COLUMN_NAME: &str = "zipPath";
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// The `Files.flags` value marking a regular file.
 const FLAG_REGULAR_FILE: i64 = 1;
@@ -234,20 +240,133 @@ pub(crate) fn read_present_files(
 /// Callers that want to recreate the tree ask for these explicitly.
 #[derive(Debug, Default, Clone)]
 pub struct BackupStructure {
-    /// Logical `domain/relativePath` names of directory records, sorted.
-    pub directories: Vec<String>,
+    /// Directory records, sorted by name.
+    pub directories: Vec<DirectoryRecord>,
     /// Logical names of symlink records, sorted. Reported, never recreated — the
     /// target is not recorded in a form we resolve, and writing a link into an
     /// export is a way to escape it.
     pub symlinks: Vec<String>,
+    /// The `Manifest.db` this was read from, in plaintext; `None` for a backup with no
+    /// such database (Android).
+    pub manifest: Option<ManifestDb>,
+}
+
+/// Remove the AES padding from a just-decrypted `Manifest.db`, when it has some.
+///
+/// HOW: a SQLite file is a whole number of pages, so bytes past the last page that form
+/// valid PKCS7 padding are padding.
+/// WHY the page test, not just valid-looking padding: an unpadded database whose last byte
+/// happens to be `0x01` looks validly padded too, and stripping it would corrupt evidence.
+pub(crate) fn strip_manifest_padding(mut manifest_db: Vec<u8>) -> Vec<u8> {
+    let Some(db) = parse_header(&manifest_db) else {
+        return manifest_db;
+    };
+    let excess = manifest_db.len() % db.page_size;
+    let padded = (1..=16).contains(&excess)
+        && manifest_db[manifest_db.len() - excess..]
+            .iter()
+            .all(|&b| b as usize == excess);
+    if padded {
+        manifest_db.truncate(manifest_db.len() - excess);
+    }
+    manifest_db
+}
+
+/// A backup's `Manifest.db`: decrypted for an encrypted backup, else as stored.
+#[derive(Clone)]
+pub struct ManifestDb {
+    pub bytes: Arc<[u8]>,
+    /// The time the backup's own file records (Unix seconds), when known.
+    pub mtime: Option<u64>,
+}
+
+impl std::fmt::Debug for ManifestDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ManifestDb({} bytes)", self.bytes.len())
+    }
+}
+
+/// A CSV with one row per `Manifest.db` `Files` row, sorted by `fileID`, giving its member
+/// name inside the rebuilt archive: `fileID,domain,relativePath,flags,zipPath`.
+///
+/// `zip_paths` is keyed by logical name (`domain/relativePath`, or `domain` for a domain's
+/// own directory). A row not in the archive (a missing blob, a symlink) has an empty
+/// `zipPath`, so every row is accounted for and none is mistaken for a path.
+///
+/// WHY a CSV rather than a column added to a copy of `Manifest.db`: this crate only reads
+/// SQLite, and adding a column means rewriting b-trees, overflow chains and pointer maps. The
+/// `fileID` joins this to `Manifest.db` just as well, and it opens anywhere. UTF-8 with a BOM
+/// so Excel decodes accented paths.
+pub fn manifest_zip_paths_csv(
+    manifest_db: &[u8],
+    zip_paths: &HashMap<String, String>,
+) -> Result<Vec<u8>> {
+    let columns = ["fileID", "domain", "relativePath", "flags"];
+    let Some(mut rows) = read_sqlite_table(manifest_db, "Files", &columns) else {
+        bail!("cannot read the Files table of Manifest.db");
+    };
+    rows.sort_by(|a, b| as_text(&a[0]).cmp(&as_text(&b[0])));
+
+    let mut writer = csv::Writer::from_writer(UTF8_BOM.to_vec());
+    writer.write_record(columns.iter().chain(&[ZIP_PATH_COLUMN_NAME]))?;
+    for row in &rows {
+        let domain = as_text(&row[1]).unwrap_or_default();
+        let relative = as_text(&row[2]).unwrap_or_default();
+        let name = if relative.is_empty() {
+            domain.to_string()
+        } else {
+            format!("{domain}/{relative}")
+        };
+        let flags = as_int(&row[3]).map(|f| f.to_string()).unwrap_or_default();
+        writer.write_record([
+            as_text(&row[0]).unwrap_or_default(),
+            domain,
+            relative,
+            &flags,
+            zip_paths.get(&name).map_or("", String::as_str),
+        ])?;
+    }
+    writer
+        .into_inner()
+        .context("cannot finish the zip-path list")
+}
+
+/// The directory and symlink rows of `manifest_db`, holding on to the database itself,
+/// whose file in `inner` is `manifest_name`.
+pub(crate) fn read_structure(
+    inner: &dyn Source,
+    manifest_name: &str,
+    manifest_db: &[u8],
+) -> BackupStructure {
+    let mut structure = read_directory_records(manifest_db);
+    let mtime = inner
+        .entries()
+        .iter()
+        .find(|e| e.name == manifest_name)
+        .and_then(|e| e.mtime);
+    structure.manifest = Some(ManifestDb {
+        bytes: Arc::from(manifest_db),
+        mtime,
+    });
+    structure
+}
+
+/// A directory a backup records.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirectoryRecord {
+    /// The logical name.
+    pub name: String,
+    /// When it last changed on the device (Unix seconds), when recorded. Kept because
+    /// a directory's modification time is itself evidence.
+    pub mtime: Option<u64>,
 }
 
 /// Read the directory and symlink rows from `Manifest.db`.
 ///
 /// Independent of [`read_present_files`], which handles regular files, so neither
 /// walk can perturb the other's counters.
-pub(crate) fn read_directory_records(manifest_db: &[u8]) -> BackupStructure {
-    let columns = ["domain", "relativePath", "flags"];
+fn read_directory_records(manifest_db: &[u8]) -> BackupStructure {
+    let columns = ["domain", "relativePath", "flags", "file"];
     let Some(rows) = read_sqlite_table(manifest_db, "Files", &columns) else {
         return BackupStructure::default();
     };
@@ -258,12 +377,21 @@ pub(crate) fn read_directory_records(manifest_db: &[u8]) -> BackupStructure {
         else {
             continue;
         };
-        if rel.is_empty() {
-            continue;
-        }
-        let name = format!("{domain}/{rel}");
+        // An empty relative path is the domain's own root directory, which has its own
+        // record and its own timestamp, like any other directory.
+        let name = if rel.is_empty() {
+            domain.to_string()
+        } else {
+            format!("{domain}/{rel}")
+        };
         match flags {
-            FLAG_DIRECTORY => out.directories.push(name),
+            FLAG_DIRECTORY => {
+                let mtime = match &row[3] {
+                    SqliteValue::Blob(blob) => parse_mbfile(blob).and_then(|m| m.last_modified),
+                    _ => None,
+                };
+                out.directories.push(DirectoryRecord { name, mtime });
+            }
             FLAG_SYMLINK => out.symlinks.push(name),
             _ => {}
         }
@@ -278,11 +406,11 @@ pub(crate) fn read_directory_records(manifest_db: &[u8]) -> BackupStructure {
 /// The `Location::Loose` path is the logical name itself: both sources serve bytes
 /// via `Source::content`, so it is never opened from disk — it only gives the
 /// entry a stable, non-archive identity.
-pub(crate) fn logical_entry(name: &str, size: u64) -> Entry {
+pub(crate) fn logical_entry(name: &str, size: u64, mtime: Option<u64>) -> Entry {
     Entry {
         name: name.to_string(),
         uncompressed_size: size,
-        mtime: None,
+        mtime,
         location: Location::Loose {
             path: std::path::PathBuf::from(name),
         },
@@ -340,5 +468,43 @@ fn as_blob(v: &SqliteValue) -> Option<&[u8]> {
     match v {
         SqliteValue::Blob(b) => Some(b),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod manifest_padding_tests {
+    use super::strip_manifest_padding;
+
+    /// A one-page database: the 16-bit page size in the header is all the check reads.
+    fn database(page_size: u16, last_byte: u8) -> Vec<u8> {
+        let mut db = vec![0u8; page_size as usize];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&page_size.to_be_bytes());
+        *db.last_mut().unwrap() = last_byte;
+        db
+    }
+
+    #[test]
+    fn padding_past_the_last_page_is_removed() {
+        let clean = database(4096, 0);
+        let mut padded = clean.clone();
+        padded.extend_from_slice(&[16u8; 16]);
+        assert_eq!(strip_manifest_padding(padded), clean);
+    }
+
+    /// Ending in 0x01 looks like valid padding, but a whole number of pages has none.
+    #[test]
+    fn a_whole_number_of_pages_is_left_alone() {
+        let db = database(4096, 1);
+        assert_eq!(strip_manifest_padding(db.clone()), db);
+    }
+
+    #[test]
+    fn bytes_that_are_not_padding_are_left_alone() {
+        let mut odd = database(4096, 0);
+        odd.extend_from_slice(&[9u8; 16]);
+        assert_eq!(strip_manifest_padding(odd.clone()), odd);
+        let not_sqlite = vec![16u8; 32];
+        assert_eq!(strip_manifest_padding(not_sqlite.clone()), not_sqlite);
     }
 }

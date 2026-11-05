@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -26,7 +26,9 @@ use mf_scan::ops::search;
 use mf_scan::ops::search::Query;
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
-use mf_scan::report::output::{OutputFormat, write_counts, write_results};
+use mf_scan::report::output::{
+    OutputFormat, TxtStyle, write_counts, write_file_list, write_results,
+};
 use mf_scan::report::stats::ScanStats;
 
 use crate::cmd::cli::{ColourWhen, GrepArgs};
@@ -35,20 +37,48 @@ use crate::cmd::support::exporting::export_if_requested;
 use crate::cmd::support::presets::{apply_preset, load_preset};
 use crate::cmd::support::progress::search_with_reporter;
 use crate::cmd::support::reporting::{
-    emit, log_skip_rules, print_stats_summary, report_verify, sha256_hex,
+    emit, log_skip_rules, print_coverage_gaps, print_stats_summary, report_verify, sha256_hex,
     write_scan_report_if_enabled,
 };
 use crate::cmd::support::sources::{
-    BackupFacts, BackupOptions, BackupProvenance, IoMode, ResolvedSource, resolve_sources,
-    with_operand_source,
+    BackupFacts, BackupOptions, BackupProvenance, IoMode, ResolvedKind, ResolvedSource,
+    ResolvedSources, STDIN_OPERAND, resolve_sources, with_operand_source,
 };
 
-/// Run the `grep` subcommand.
-pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
+/// Exit status: at least one match, and everything selected was searched.
+const EXIT_MATCH: u8 = 0;
+/// Exit status: everything selected was searched, and nothing matched.
+const EXIT_NO_MATCH: u8 = 1;
+/// Exit status: the run failed, or could not search everything it selected.
+pub(crate) const EXIT_ERROR: u8 = 2;
+
+/// The exit status for a finished search, following grep's 0 / 1 / 2 convention.
+///
+/// WHY an unreadable or undecryptable file outranks a match: grep reports an error
+/// whenever it could not read a file, even if it matched elsewhere, and this also
+/// keeps exit 1 meaning something a script can trust — "searched and absent", never
+/// "absent from the part that could be read".
+///
+/// `-q` follows grep too: a match found is all it asks, so it exits 0 regardless.
+fn exit_status(stats: &ScanStats, damaged: bool, quiet: bool) -> u8 {
+    if quiet && stats.total_matches > 0 {
+        EXIT_MATCH
+    } else if stats.unreadable.count > 0 || stats.decrypt_failed.count > 0 || damaged {
+        EXIT_ERROR
+    } else if stats.total_matches > 0 {
+        EXIT_MATCH
+    } else {
+        EXIT_NO_MATCH
+    }
+}
+
+/// Run the `grep` subcommand, returning its exit status (see [`exit_status`]).
+pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
     // -E is a no-op: our regex flavour is already extended. Consume the field
     // so it counts as read while documenting that acceptance is deliberate.
     let _ = cli.extended_regexp;
 
+    normalise_operands(&mut cli)?;
     apply_presets(&mut cli)?;
 
     // The compiled regexes outlive `query`, which borrows them.
@@ -66,10 +96,14 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
 
     // Resolve the operands into sources (archive files and/or folders), each with a
     // display label, applying --dir-mode to any directory operand.
-    let sources = resolve_sources(&cli.archives, cli.dir_mode, cli.recursive)?;
+    let ResolvedSources {
+        sources,
+        loose_skipped,
+    } = resolve_sources(&cli.archives, cli.dir_mode, cli.recursive)?;
     if sources.is_empty() {
         anyhow::bail!(
-            "no sources given — list archive files or directories (with --dir-mode for a directory)"
+            "-r found no archive (.zip, .tar, .tar.gz, .tgz) to search; {loose_skipped} loose \
+             file(s) were not searched — use --dir-mode to search them"
         );
     }
     let multi = sources.len() > 1;
@@ -88,15 +122,25 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
         cli.filter.exclude_media,
     );
 
-    let run = build_run_info(&cli, &sources, built.base64_enabled);
+    let run = RunInfo {
+        loose_files_skipped: loose_skipped,
+        ..build_run_info(&cli, &sources, built.base64_enabled)
+    };
 
     // Announce the active skip rules before any result, so the analyst knows what
     // --fast/presets will exclude up front rather than discovering it afterwards.
-    log_skip_rules(&run);
+    if !cli.quiet {
+        log_skip_rules(&run);
+    }
 
     // Build the decryption context once: keys from --keyfile and/or a keyfile
     // dump found next to each archive. The engine consults it per entry.
-    let archive_paths: Vec<&Path> = sources.iter().map(|s| s.path.as_path()).collect();
+    // Standard input has no folder to look beside.
+    let archive_paths: Vec<&Path> = sources
+        .iter()
+        .filter(|s| s.kind != ResolvedKind::Stdin)
+        .map(|s| s.path.as_path())
+        .collect();
     let decrypt_ctx = build_decryption_context(&cli.decrypt, &archive_paths)?;
 
     // The backup password (flag or env), and a sink the open path fills in when a
@@ -110,9 +154,9 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
     let mut decryptions: Vec<DecryptionRecord> = Vec::new();
     let started = Instant::now();
 
-    if cli.count {
-        // Per-file counts aggregated across sources (path tagged when multi).
-        // Counting needs no inspection, so `deep` is always false here.
+    if cli.count || cli.files_with_matches {
+        // One line per file, aggregated across sources (path tagged when multi).
+        // Neither form shows a match's location inside its file, so `deep` is false.
         let mut counts: Vec<(String, usize)> = Vec::new();
         for src in &sources {
             let ctx = SearchCtx {
@@ -126,7 +170,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, _source, _containers| {
+            with_searched_source(src, ctx, |findings, source, _containers| {
                 for f in &findings.files {
                     let path = if multi {
                         format!("{}/{}", src.label, f.entry.name)
@@ -135,12 +179,22 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                     };
                     counts.push((path, f.offsets.len()));
                 }
+                if !multi {
+                    // --manifest/--export only apply to a single source (guarded
+                    // above), and --count rejects them, so this is -l's export path.
+                    export_if_requested(&cli.sink, source, findings, &run)?;
+                }
                 Ok(())
             })?;
         }
         let pairs: Vec<(&str, usize)> = counts.iter().map(|(p, c)| (p.as_str(), *c)).collect();
         emit(cli.output.as_deref(), |w| {
-            write_counts(&pairs, cli.format, w)
+            if cli.files_with_matches {
+                let paths: Vec<&str> = pairs.iter().map(|(p, _)| *p).collect();
+                write_file_list(&paths, cli.format, w)
+            } else {
+                write_counts(&pairs, cli.format, w)
+            }
         })?;
     } else {
         // Match records aggregated across sources (tagged when multi).
@@ -188,32 +242,76 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<()> {
                 Ok(())
             })?;
         }
-        emit(cli.output.as_deref(), |w| {
-            write_results(
-                &records,
-                cli.format,
-                colourise,
-                cli.match_path,
-                &run,
-                &stats,
-                w,
-            )
-        })?;
+        let style = if cli.match_path {
+            TxtStyle::PathOnly
+        } else if cli.only_matching {
+            TxtStyle::OnlyMatching
+        } else {
+            TxtStyle::Line
+        };
+        if !cli.quiet {
+            emit(cli.output.as_deref(), |w| {
+                write_results(&records, cli.format, colourise, style, &run, &stats, w)
+            })?;
+        }
     }
 
     // The merged stats carry per-source elapsed sums; replace that with the true
     // wall-clock of the whole run (sources are searched sequentially here).
     stats.elapsed = started.elapsed();
-    print_stats_summary(&stats);
+    if cli.no_stats || cli.quiet {
+        print_coverage_gaps(&stats);
+    } else {
+        print_stats_summary(&stats, cli.match_path);
+    }
     report_decryptions(&decryptions);
 
     // Surface the backup-decryption provenance: a loud stderr line at run time
     // (so the use of a DEFAULT password is impossible to miss) and the record in
     // the scan report. WHY here, once: a single backup is unlocked per run; the
     // open path filled the provenance sink during the search.
+    let damaged = backup_prov.damaged();
     let backup_record = backup_prov.report();
-    write_scan_report_if_enabled(&cli, &run, &stats, &decryptions, backup_record.as_ref())?;
+    // -q asks a yes/no question, so it leaves no file behind unless one is named.
+    if !cli.quiet || cli.report.is_some() {
+        write_scan_report_if_enabled(&cli, &run, &stats, &decryptions, backup_record.as_ref())?;
+    }
 
+    Ok(exit_status(&stats, damaged, cli.quiet))
+}
+
+/// Settle which arguments are patterns and which are sources.
+///
+/// With `-e`, the first positional is a source, not a pattern: clap cannot express that,
+/// so it is moved here. All patterns then live in `cli.regexps`. With no source at all
+/// the search reads standard input, as grep does, unless that is a terminal, where it
+/// would only appear to hang.
+fn normalise_operands(cli: &mut GrepArgs) -> Result<()> {
+    match cli.pattern.take() {
+        Some(first) if cli.regexps.is_empty() => cli.regexps.push(first),
+        Some(source) => cli.archives.insert(0, PathBuf::from(source)),
+        None => {}
+    }
+    if cli.archives.is_empty() {
+        if std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "no source given: name an archive, file or folder, or pipe data in (try -h)"
+            );
+        }
+        if !cli.quiet {
+            eprintln!("note: no source given; reading standard input");
+        }
+        cli.archives.push(PathBuf::from(STDIN_OPERAND));
+    }
+    if cli
+        .archives
+        .iter()
+        .filter(|a| a.as_os_str() == STDIN_OPERAND)
+        .count()
+        > 1
+    {
+        anyhow::bail!("standard input can only be named once");
+    }
     Ok(())
 }
 
@@ -254,25 +352,56 @@ impl BuiltQuery {
     /// Compile the plain pattern and, when `--base64` is set, the alternation of
     /// its base64 fragments.
     fn build(cli: &GrepArgs) -> Result<Self> {
-        // -l means "match this exact text", so escape any regex metacharacters.
-        let pattern = if cli.literal_string {
-            regex::escape(&cli.pattern)
-        } else {
-            cli.pattern.clone()
+        // -F means "match this exact text", so escape any regex metacharacters.
+        let parts: Vec<String> = cli
+            .regexps
+            .iter()
+            .map(|p| {
+                if cli.literal_string {
+                    regex::escape(p)
+                } else {
+                    p.clone()
+                }
+            })
+            .collect();
+        // Each -e is grouped, so one pattern's inline flags or alternation stay its own.
+        let pattern = match parts.as_slice() {
+            [only] => only.clone(),
+            many => many
+                .iter()
+                .map(|p| format!("(?:{p})"))
+                .collect::<Vec<_>>()
+                .join("|"),
         };
+        // WHY half boundaries rather than `\\b`: `\\b` needs a word character on the
+        // pattern's side, so `-w '+33'` could never match. These test only the character
+        // outside the match, which is what grep -w means.
+        let pattern = if cli.word_regexp {
+            format!(r"\b{{start-half}}(?:{pattern})\b{{end-half}}")
+        } else {
+            pattern
+        };
+        // WHY multi_line and crlf: the regex crate's default anchors `^`/`$` to the
+        // whole file, so a grep-style `^bye` finds nothing in a multi-line file and
+        // reads as a clean negative — missed evidence. `crlf` extends the line rule
+        // to Windows line endings, where `world$` would otherwise miss too; its cost
+        // is that `.` no longer matches a carriage return. `\A` and `\z` still anchor
+        // to the whole file.
         let plain = RegexBuilder::new(&pattern)
             .case_insensitive(cli.ignore_case)
+            .multi_line(true)
+            .crlf(true)
             .build()
             .context("invalid regular expression")?;
 
         // --base64 also searches for the pattern's base64 encoding. Only a literal
         // can be encoded (a regex has no byte form), and a path is not base64, so the
-        // mode requires -l and is incompatible with --match-path.
+        // mode requires -F and is incompatible with --match-path.
         let base64_enabled = cli.base64 || cli.base64_urlsafe;
         let base64 = if base64_enabled {
             if !cli.literal_string {
                 anyhow::bail!(
-                    "--base64 requires -l/--literal-string (a regex cannot be base64-encoded)"
+                    "--base64 requires -F/--fixed-strings (a regex cannot be base64-encoded)"
                 );
             }
             if cli.match_path {
@@ -280,7 +409,15 @@ impl BuiltQuery {
                     "--base64 cannot be combined with --match-path (a path is not base64)"
                 );
             }
-            let frags = search::base64::fragments(cli.pattern.as_bytes(), cli.base64_urlsafe);
+            // A base64 hit reports the one value it decodes to, and a word boundary means
+            // nothing inside an encoded run.
+            let [value] = cli.regexps.as_slice() else {
+                anyhow::bail!("--base64 takes a single pattern");
+            };
+            if cli.word_regexp {
+                anyhow::bail!("--base64 cannot be combined with -w");
+            }
+            let frags = search::base64::fragments(value.as_bytes(), cli.base64_urlsafe);
             if frags.is_empty() {
                 anyhow::bail!("pattern is too short to search as base64; give a longer literal");
             }
@@ -317,7 +454,11 @@ impl BuiltQuery {
         Query {
             plain: &self.plain,
             base64: self.base64.as_ref(),
-            decoded: self.base64_enabled.then_some(cli.pattern.as_str()),
+            decoded: self
+                .base64_enabled
+                .then(|| cli.regexps.first().map(String::as_str))
+                .flatten(),
+            line_numbers: cli.line_number,
         }
     }
 }
@@ -353,6 +494,21 @@ fn validate_flags(cli: &GrepArgs) -> Result<()> {
         if !cli.filter.file_type.is_empty() {
             anyhow::bail!("--match-path cannot be combined with --type (no content is read)");
         }
+        if cli.only_matching {
+            anyhow::bail!("--match-path cannot be combined with -o (it prints only paths)");
+        }
+        if cli.line_number {
+            anyhow::bail!("--match-path cannot be combined with -n (no content is read)");
+        }
+    }
+    // json/csv already carry the fields a consumer would pick from, so -o only shapes
+    // the txt line; accepting it there would silently do nothing.
+    if cli.only_matching && cli.format != OutputFormat::Txt {
+        anyhow::bail!("-o/--only-matching applies to --format txt only");
+    }
+    // clap rejects these on the command line; a preset can still set `count: true`.
+    if cli.count && (cli.files_with_matches || cli.only_matching) {
+        anyhow::bail!("--count cannot be combined with -l or -o");
     }
     Ok(())
 }
@@ -362,7 +518,12 @@ fn validate_flags(cli: &GrepArgs) -> Result<()> {
 fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bool) -> RunInfo {
     // Search runs are not app-selected; the `app export` path fills the app fields.
     RunInfo {
-        pattern: cli.pattern.clone(),
+        pattern: cli.regexps.join(" | "),
+        patterns: if cli.regexps.len() > 1 {
+            cli.regexps.clone()
+        } else {
+            Vec::new()
+        },
         literal: cli.literal_string,
         ignore_case: cli.ignore_case,
         match_path: cli.match_path,
@@ -445,6 +606,7 @@ fn with_searched_source(
                 ctx.cli.match_path,
                 filter,
                 ctx.decrypt_ctx,
+                !ctx.cli.quiet,
             )?;
             handle(&mut findings, source, &container_map)?;
             ctx.decryptions.append(&mut findings.decryptions);
@@ -516,6 +678,6 @@ fn report_verify_for(verify: bool, before: Option<String>, raw: Option<&[u8]>) {
     }
     match (before, raw) {
         (Some(before), Some(bytes)) => report_verify(&before, &sha256_hex(bytes)),
-        _ => eprintln!("verify: skipped (a folder source has no single archive file to hash)"),
+        _ => eprintln!("verify: skipped (this source has no single archive file to hash)"),
     }
 }

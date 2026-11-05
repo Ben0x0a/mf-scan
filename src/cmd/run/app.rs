@@ -187,6 +187,7 @@ fn open_app_source<R>(
 ) -> Result<R> {
     // `recursive = false`: an app command reads exactly one acquisition.
     let resolved = resolve_sources(std::slice::from_ref(&src.source), src.dir_mode, false)?
+        .sources
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no source to read"))?;

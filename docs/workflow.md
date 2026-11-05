@@ -15,7 +15,7 @@ location only (no content); use `--inspect` to resolve them.
 
 Useful modifiers:
 
-- `-i` case-insensitive, `-l` literal (treat the pattern as plain text).
+- `-i` case-insensitive, `-F` literal (treat the pattern as plain text), `-l` list matching files, `-o` only the matched text.
 - `--colour` to highlight the match (auto on a terminal).
 - `--path '*.db'` to limit the search to certain files (repeatable).
 
@@ -62,18 +62,27 @@ Values are format names (`sqlite`, `jpeg`, `plist`, …) or categories (`media`,
 exactly `--type` excluding the `media` category. An explicit `--type` takes over
 from any media skip, so `--type media` lists media even alongside `--fast`.
 
-### Find files by *path* (`--match-path`)
+### Find files by name, path, size or date (`find`)
 
-To locate files by where they live rather than by content, `--match-path` applies
-the PATTERN to each file's internal path and lists the matches (no bytes read):
+To locate files by what they are rather than what they contain, `mf-scan find` lists
+them as the `find` command would, reading no content:
 
 ```
-# Every file with "banking" anywhere in its path
-mf-scan grep 'banking' acquisition.zip --match-path
+# Every database file
+mf-scan find acquisition.zip -name '*.db'
+
+# Anything over 1 MiB with "banking" in its path, with size and time
+mf-scan find acquisition.zip --ipath '*banking*' --size +1M --long
+
+# Real SQLite files, whatever they are named (reads each file's header)
+mf-scan find acquisition.zip --type sqlite
 
 # Combine with --export to copy them all out
-mf-scan grep 'WhatsApp' acquisition.zip --match-path --export ./whatsapp
+mf-scan find acquisition.zip --path '*WhatsApp*' --export ./whatsapp --max-size 5G
 ```
+
+`grep --match-path` also applies a *regex* to each file's path, within a search's
+filters and report.
 
 ## 3. Understand a match (deep inspection)
 
@@ -91,8 +100,8 @@ filter on programmatically (e.g. all hits in a given SQLite table).
 ## 4. Machine-readable output
 
 ```
-mf-scan grep 'token' acquisition.zip --format json -o hits.json
-mf-scan grep 'token' acquisition.zip --format csv  -o hits.csv
+mf-scan grep 'token' acquisition.zip --format json --output hits.json
+mf-scan grep 'token' acquisition.zip --format csv --output hits.csv
 ```
 
 Pipe-friendly too: when stdout is not a terminal there is no colour and no
@@ -211,7 +220,7 @@ Compare two captures — which files were added, removed, or modified — and, w
 mf-scan diff before.zip after.zip
 
 # Exact (SHA-256) diff, with intra-file detail and a JSON report
-mf-scan diff before.zip after.zip --exact --inspect -f json -o delta.json
+mf-scan diff before.zip after.zip --exact --inspect -f json --output delta.json
 
 # Diff two extracted folders, then export the changed files
 mf-scan diff before/ after/ --dir-mode --export ./delta

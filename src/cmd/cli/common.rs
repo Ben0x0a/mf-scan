@@ -16,7 +16,7 @@ use clap::{Args, ValueEnum};
 /// When to colourise matched text in the output.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum ColourWhen {
-    /// Colourise only when writing txt to a terminal.
+    // Colourise only when writing txt to a terminal.
     Auto,
     Always,
     Never,
@@ -36,12 +36,11 @@ pub(crate) enum PlatformArg {
 /// file would fault page-by-page over the network. `mmap`/`ranged` force one mode.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum IoModeArg {
-    /// Pick automatically: positioned reads for a remote (SMB/NFS) source, mmap
-    /// otherwise.
+    // Positioned reads for a remote (SMB/NFS) source, mmap otherwise.
     Auto,
-    /// Always memory-map the archive (fast for local files).
+    // Always memory-map the archive (fast for local files).
     Mmap,
-    /// Always read with positioned reads (no whole-file map) — for network shares.
+    // Always read with positioned reads (no whole-file map), for network shares.
     Ranged,
 }
 
@@ -69,29 +68,19 @@ impl PlatformArg {
 /// Path and type filtering — which files a command handles. Shared by `grep`/`diff`.
 #[derive(Args, Clone)]
 pub(crate) struct FilterArgs {
-    /// Only handle files whose internal path matches this wildcard (`*`, `?`).
-    /// Repeatable; a file matching any pattern is kept.
-    ///
-    /// A pattern that names an iOS app by bundle identifier also matches that
-    /// app's container, whose directory is named by a GUID and so contains the
-    /// identifier nowhere. Each such resolution is reported on stderr.
+    /// Only paths matching this wildcard, e.g. '*.sqlite' (repeatable).
     #[arg(long = "path", value_name = "GLOB")]
     pub(crate) path: Vec<String>,
 
-    /// Skip files whose internal path matches this wildcard. Repeatable; takes
-    /// precedence over --path.
+    /// Skip paths matching this wildcard (repeatable; beats --path).
     #[arg(long = "not-path", value_name = "GLOB")]
     pub(crate) not_path: Vec<String>,
 
-    /// Only handle files of this type — a format name (e.g. `sqlite`, `jpeg`) or a
-    /// category (e.g. `media`, `database`, `structured`, `text`). The type is
-    /// detected by content header first, then file extension. Repeatable; a file
-    /// matching any value is kept.
+    /// Only this type: sqlite, jpeg, database, media, ... (repeatable).
     #[arg(short = 't', long = "type", value_name = "TYPE")]
     pub(crate) file_type: Vec<String>,
 
-    /// Skip image/video/audio files. They are handled by default; this excludes
-    /// them for speed (they hold no searchable text and dominate acquisition size).
+    /// Skip image, video and audio files, for speed.
     #[arg(long = "exclude-media")]
     pub(crate) exclude_media: bool,
 }
@@ -99,32 +88,23 @@ pub(crate) struct FilterArgs {
 /// Decryption inputs shared by `grep` and `diff` (`diff` adds per-side overrides).
 #[derive(Args, Clone)]
 pub(crate) struct DecryptArgs {
-    /// Keychain/keystore dump file to decrypt databases with (repeatable). Accepts
-    /// iOS keychain *and* Android keystore dumps. When given, each database an
-    /// internal profile recognises is decrypted with a key from the dump before
-    /// being handled. Provenance (which key decrypted which database, and the
-    /// ciphertext/plaintext SHA-256) is written to the report.
+    /// Keychain or keystore dump, to decrypt app databases (repeatable).
     #[arg(long = "keyfile", value_name = "FILE")]
     pub(crate) keyfile: Vec<PathBuf>,
 
-    /// Limit decryption profiles to one platform (`ios` or `android`).
-    #[arg(long = "platform", value_name = "PLATFORM")]
+    /// Use only one platform's decryption profiles: ios or android.
+    #[arg(
+        long = "platform",
+        value_name = "PLATFORM",
+        hide_possible_values = true
+    )]
     pub(crate) platform: Option<PlatformArg>,
 
-    /// Disable database decryption entirely: skip both `--keyfile` and the automatic
-    /// search for a keyfile dump beside the source. By default, when a keyfile dump is
-    /// found next to the source (or given via `--keyfile`), profile-matched databases
-    /// are decrypted before being handled.
+    /// Turn off decryption, even with a dump beside the source.
     #[arg(long = "no-decrypt")]
     pub(crate) no_decrypt: bool,
 
-    /// Password for an encrypted iOS backup. When the source is an encrypted
-    /// iTunes/Finder backup, it is decrypted with this password and searched as
-    /// normal files. If omitted, the env var `MFSCAN_BACKUP_PASSWORD` is used when
-    /// set (forensic hygiene — keeps the password out of shell history / `ps`);
-    /// if neither is given, common acquisition defaults are tried ("1234",
-    /// "123456", "password") and which default unlocked the backup is recorded in
-    /// the scan report.
+    /// Password for an encrypted backup (or set MFSCAN_BACKUP_PASSWORD).
     #[arg(long = "backup-password", value_name = "PASSWORD")]
     pub(crate) backup_password: Option<String>,
 }
@@ -132,23 +112,20 @@ pub(crate) struct DecryptArgs {
 /// Manifest/export sink shared by `grep` and `diff`: persist the selected files.
 #[derive(Args, Clone)]
 pub(crate) struct ExportSink {
-    /// Write a re-ingestable manifest of the selected files (with total size) here.
+    /// List the selected files in a manifest, to review first.
     #[arg(long = "manifest", value_name = "FILE")]
     pub(crate) manifest: Option<PathBuf>,
 
-    /// Also export the selected files into this directory (one-step).
+    /// Copy the selected files here, with integrity hashes.
     #[arg(long = "export", value_name = "DIR")]
     pub(crate) export: Option<PathBuf>,
 
-    /// Refuse exporting if the selected files exceed this size (e.g. 200MB, 1G).
-    /// Defaults to 1G as an accident guard; raise it to export more.
-    #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
+    /// Refuse to export more than this (default 1G), e.g. 5G.
+    #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
 
-    /// Skip (and record) any file whose destination path would exceed this many
-    /// characters. Defaults to 260 (Windows MAX_PATH) so exported evidence stays
-    /// portable to Windows; 0 disables the guard.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN)]
+    /// Skip and record longer paths (default 260, Windows); 0 is off.
+    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
     pub(crate) max_path_len: usize,
 }
 
