@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
 use mf_scan::ops::apps::{AppCatalog, AppContainer, ContainerKind, Platform, SigningRecord};
-use mf_scan::ops::decrypting::SourceDecryptor;
+use mf_scan::ops::decrypting::{DerivedCopy, SourceDecryptor};
 use mf_scan::ops::search::MatchedFile;
 use mf_scan::report::export::{self, ExportOutcome};
 use mf_scan::report::output::OutputFormat;
@@ -144,7 +144,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
             &args.to,
             Some(args.max_size),
             args.max_path_len,
-            decryptor.as_ref().map(|d| d as &dyn export::DerivedCopy),
+            decryptor.as_ref().map(|d| d as &dyn DerivedCopy),
         )? {
             ExportOutcome::Exported {
                 files: n,
@@ -152,6 +152,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                 report,
                 skipped_too_long,
                 portability_warnings,
+                undecrypted,
                 ..
             } => {
                 write_export_report_file(
@@ -160,6 +161,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                     &report,
                     &skipped_too_long,
                     &portability_warnings,
+                    &undecrypted,
                 )?;
                 eprintln!(
                     "exported {n} file(s) ({bytes} bytes) for {} from {} container(s) to {}",
@@ -168,7 +170,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                     args.to.display()
                 );
                 report_group_attribution(&containers);
-                report_decrypted_copies(&report);
+                report_decrypted_copies(&report, &undecrypted);
                 report_integrity(&report);
                 report_skipped_too_long(&skipped_too_long);
                 report_portability_warnings(&portability_warnings);

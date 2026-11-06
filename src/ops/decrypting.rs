@@ -6,7 +6,8 @@
 //! Used by: `ops::search::classify` (decrypt before searching), the exports (a
 //! [`DerivedCopy`] that writes each decrypted database beside its original), and the
 //! `decrypt` command (the archive with decrypted copies added).
-//! Uses: `decrypt` (the context) and `report::export::DerivedCopy`.
+//! Uses: `decrypt` (the context). Also defines [`DerivedCopy`] / [`Derived`], the hook
+//! `report::export` and `report::decrypted_zip` call to make a derived copy.
 //!
 //! WHY a type of its own: the context knows profiles and keys but not the source, and
 //! a database's `-wal` is another entry of that source. Every caller needs the same
@@ -15,7 +16,6 @@
 use crate::core::models::Entry;
 use crate::core::source::Source;
 use crate::decrypt::{Decryption, DecryptionContext, SecretStore, TryOutcome, load_if_dump};
-use crate::report::export::{Derived, DerivedCopy};
 
 /// A decryption context bound to the source whose entries it decrypts.
 pub struct SourceDecryptor<'a> {
@@ -44,14 +44,46 @@ impl<'a> SourceDecryptor<'a> {
             return None;
         }
         let wal_name = format!("{}-wal", entry.name);
-        let wal = self
-            .source
-            .entries()
-            .iter()
-            .find(|e| e.name == wal_name)
-            .and_then(|e| self.source.content(e).ok());
-        self.ctx.try_decrypt(&entry.name, content, wal.as_deref())
+        let wal_entry = self.source.entries().iter().find(|e| e.name == wal_name);
+        // A -wal that exists but cannot be read (a corrupt DEFLATE stream) is not the
+        // same as no -wal: its changes are missing, and the record must say so.
+        let (wal, wal_error) = match wal_entry.map(|e| self.source.content(e)) {
+            None => (None, None),
+            Some(Ok(wal)) => (Some(wal), None),
+            Some(Err(err)) => (None, Some(format!("cannot read {wal_name}: {err:#}"))),
+        };
+        let mut outcome = self.ctx.try_decrypt(&entry.name, content, wal.as_deref())?;
+        if let TryOutcome::Decrypted(d) = &mut outcome {
+            d.wal_error = wal_error;
+        }
+        Some(outcome)
     }
+}
+
+/// Produces a file derived from an exported one, written beside it (a decrypted
+/// copy of an encrypted database, for one).
+///
+/// WHY a trait, defined here: the report layer writes and attests files but does not
+/// know how to decrypt, so the caller supplies the transform and the exporter names
+/// the copy, writes it, hashes it and records it like any other file. It lives in
+/// `ops`, beside its implementation, because `report` already depends on `ops`;
+/// defining it in `report` would make the two layers depend on each other.
+pub trait DerivedCopy: Sync {
+    /// Whether `entry` may have a derived form. A cheap test on the entry alone, so a
+    /// caller walking a whole archive reads only the files it applies to.
+    fn wants(&self, entry: &Entry) -> bool;
+
+    /// The derived bytes for `entry`, whose stored bytes are `content`: `None` when it
+    /// has no derived form, `Some(Err(reason))` when it should have had one but could
+    /// not be produced (a database whose key did not verify).
+    fn derive(&self, entry: &Entry, content: &[u8])
+    -> Option<std::result::Result<Derived, String>>;
+}
+
+/// One derived file: its bytes, and how they were produced (for the report).
+pub struct Derived {
+    pub bytes: Vec<u8>,
+    pub note: String,
 }
 
 impl DerivedCopy for SourceDecryptor<'_> {
@@ -99,8 +131,16 @@ pub struct FoundDump {
 
 /// Words in a file name that mark it as a possible keychain/keystore dump.
 const DUMP_NAME_HINTS: &[&str] = &["keychain", "keystore"];
-/// The largest file read as a possible dump.
-const MAX_DUMP_LEN: u64 = 256 * 1024 * 1024;
+/// The largest file read as a possible dump: no dump is that large, and a matching
+/// name on a large file (an extraction named after its keychain) is not one.
+pub const MAX_DUMP_LEN: u64 = 256 * 1024 * 1024;
+
+/// Whether a file name marks a possible key dump. The one rule for a dump beside
+/// the source and one inside it; content detection then decides.
+pub fn is_dump_name(file_name: &str) -> bool {
+    let name = file_name.to_ascii_lowercase();
+    DUMP_NAME_HINTS.iter().any(|hint| name.contains(hint))
+}
 
 /// Key dumps the source itself carries: every file named `*keychain*` or `*keystore*`
 /// whose content a dump provider recognises (a zip holding one included).

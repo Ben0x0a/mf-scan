@@ -31,12 +31,14 @@ use crate::core::models::RunInfo;
 use crate::core::source::Source;
 use crate::core::source::zip::ZipSource;
 use crate::core::util::{UtcTime, sha256_hex};
-use crate::report::export::{DerivedCopy, decrypted_name};
+use crate::ops::decrypting::DerivedCopy;
+use crate::report::export::decrypted_name;
 use crate::report::rebuild_zip::{PartialFile, check_and_hash, now_unix, sidecar_path};
 use crate::report::zip_writer::ZipWriter;
 
 /// The record of what was decrypted, inside the archive. No device path starts with
-/// `_mf-scan/`, so it cannot collide with a member.
+/// `_mf-scan/`, but an archive an earlier `decrypt` wrote already holds one, so the
+/// record is numbered when the name is taken (`_mf-scan/decryption.json-2`).
 pub const RECORD_MEMBER: &str = "_mf-scan/decryption.json";
 
 /// What the archive needs.
@@ -148,7 +150,7 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
     };
 
     // Then each decrypted database, beside its original.
-    let mut taken: HashSet<&str> = source.entries().iter().map(|e| e.name.as_str()).collect();
+    let taken: HashSet<&str> = source.entries().iter().map(|e| e.name.as_str()).collect();
     let mut names: Vec<String> = Vec::new();
     let mut decrypted = Vec::new();
     let mut failed = Vec::new();
@@ -180,7 +182,7 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
             }
         }
     }
-    taken.clear();
+    let record_member = numbered_free(RECORD_MEMBER.to_string(), &taken, &names);
 
     let now = now_unix();
     let record = Record {
@@ -192,7 +194,7 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
         failed: &failed,
     };
     let bytes = serde_json::to_vec_pretty(&record).context("cannot encode the record")?;
-    zip.add_file(RECORD_MEMBER, Some(now), &bytes)?;
+    zip.add_file(&record_member, Some(now), &bytes)?;
     zip.finish()?;
 
     let expected = original_members + decrypted.len() + 1;
@@ -248,7 +250,11 @@ fn free_name(original: &str, taken: &HashSet<&str>, added: &[String]) -> String 
         Some((dir, base)) => (format!("{dir}/"), base),
         None => (String::new(), original),
     };
-    let first = format!("{dir}{}", decrypted_name(base));
+    numbered_free(format!("{dir}{}", decrypted_name(base)), taken, added)
+}
+
+/// `first`, or `first-2`, `first-3`… : the first name no member has.
+fn numbered_free(first: String, taken: &HashSet<&str>, added: &[String]) -> String {
     let free = |name: &str| !taken.contains(name) && !added.iter().any(|a| a == name);
     if free(&first) {
         return first;
@@ -271,7 +277,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::core::models::Entry;
-    use crate::report::export::Derived;
+    use crate::ops::decrypting::Derived;
 
     /// "Decrypts" any member named `*.enc` by upper-casing it; fails on `bad.enc`.
     struct Upper;

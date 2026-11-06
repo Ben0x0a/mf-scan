@@ -3,7 +3,7 @@
 //! Defines: [`DecryptCmdArgs`] — the source, the optional output archive, and the
 //! shared key flags.
 //! Used by: `cli` (the `Decrypt` variant) and `run::decrypt` (reads the fields).
-//! Uses: `clap` (derive) and the shared `KeyArgs`/`IoModeArg` from `common`.
+//! Uses: `clap` (derive) and the shared `KeySources`/`IoModeArg` from `common`.
 //!
 //! WHY `--to` is a file and there is no folder output: the archive keeps every device
 //! path whole, which a folder tree on Windows cannot (see `report::rebuild_zip`), and
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::cmd::cli::common::{IoModeArg, KeyArgs};
+use crate::cmd::cli::common::{IoModeArg, KeySources};
 
 /// Arguments for `decrypt`.
 #[derive(Args)]
@@ -50,5 +50,5 @@ pub(crate) struct DecryptCmdArgs {
     pub(crate) backup_password: Option<String>,
 
     #[command(flatten, next_help_heading = "Decryption")]
-    pub(crate) keys: KeyArgs,
+    pub(crate) keys: KeySources,
 }

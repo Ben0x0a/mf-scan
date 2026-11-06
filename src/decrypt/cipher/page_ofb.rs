@@ -70,7 +70,10 @@ fn decrypt_db(db: &[u8], key: &KeyMaterial) -> Result<DecryptedDb> {
         bail!("page-aes-ofb needs a 32-byte key, got {} bytes", key.len());
     }
     let page_size = page_size(db)?;
-    let reserve = usize::from(db[20]);
+    let Some(&reserve) = db.get(20) else {
+        bail!("file too short for a SQLite header");
+    };
+    let reserve = usize::from(reserve);
     if reserve != NONCE_LEN {
         bail!(
             "page-aes-ofb expects {NONCE_LEN} reserved bytes per page, the header says {reserve}"
@@ -210,6 +213,17 @@ mod tests {
             .decrypt(&enc, &KeyMaterial::Raw(vec![2u8; KEY_LEN]), &spec())
             .unwrap_err();
         assert!(err.to_string().contains("wrong key"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_header_is_an_error_not_a_panic() {
+        let mut short = vec![0u8; 19];
+        short[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        assert!(
+            PageAesOfb
+                .decrypt(&short, &KeyMaterial::Raw(vec![1u8; KEY_LEN]), &spec())
+                .is_err()
+        );
     }
 
     #[test]

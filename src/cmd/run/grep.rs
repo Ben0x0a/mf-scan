@@ -543,6 +543,7 @@ fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bo
         keyfiles: cli
             .decrypt
             .keys
+            .sources
             .keyfile
             .iter()
             .map(|p| p.display().to_string())
@@ -550,6 +551,7 @@ fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bo
         platform: cli
             .decrypt
             .keys
+            .sources
             .platform
             .map(|p| p.to_platform().as_str().to_string()),
         ..RunInfo::default()

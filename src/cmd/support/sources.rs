@@ -501,12 +501,16 @@ fn with_maybe_backup<R>(
     }
 }
 
+/// Extensions `-r` harvests as archives, besides tars. A Cellebrite `.ufdr` report is
+/// a zip; `.ab` is an Android backup.
+const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "ufdr", "ab"];
+
 /// Whether a file's name marks it as an archive for `-r` to harvest.
 fn is_archive_name(path: &Path) -> bool {
     is_tar_name(path)
         || path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("ab"))
+            .is_some_and(|e| ARCHIVE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 /// Recursively collect the archives `-r` should scan under `dir` into `out`, counting

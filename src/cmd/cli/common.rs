@@ -85,12 +85,12 @@ pub(crate) struct FilterArgs {
     pub(crate) exclude_media: bool,
 }
 
-/// Where database keys come from: the key dump(s), the platform scope, or none.
+/// Where database keys come from: the key dump(s) and the platform scope.
 ///
-/// Its own group so a command that decrypts databases but opens no backup
-/// (`app export` takes the backup password with its source) can reuse it.
+/// Used alone by `decrypt`, for which turning decryption off means nothing, and
+/// inside [`KeyArgs`] by every command that decrypts on the way.
 #[derive(Args, Clone)]
-pub(crate) struct KeyArgs {
+pub(crate) struct KeySources {
     /// Keychain or keystore dump, to decrypt app databases (repeatable).
     #[arg(long = "keyfile", value_name = "FILE")]
     pub(crate) keyfile: Vec<PathBuf>,
@@ -102,6 +102,16 @@ pub(crate) struct KeyArgs {
         hide_possible_values = true
     )]
     pub(crate) platform: Option<PlatformArg>,
+}
+
+/// [`KeySources`] plus `--no-decrypt`, for commands where decryption is a side step.
+///
+/// Its own group so a command that decrypts databases but opens no backup
+/// (`app export` takes the backup password with its source) can reuse it.
+#[derive(Args, Clone)]
+pub(crate) struct KeyArgs {
+    #[command(flatten)]
+    pub(crate) sources: KeySources,
 
     /// Turn off decryption, even with a dump beside the source.
     #[arg(long = "no-decrypt")]

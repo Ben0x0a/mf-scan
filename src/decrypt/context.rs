@@ -60,6 +60,9 @@ pub struct Decryption {
     pub secret_account: Option<String>,
     /// Whether committed frames from the database's `-wal` were applied first.
     pub wal_replayed: bool,
+    /// Set when the database has a `-wal` that could not be read, so its changes
+    /// are missing from the plaintext. Filled in by the caller that fetched it.
+    pub wal_error: Option<String>,
 }
 
 /// The outcome of attempting to decrypt one entry whose path matched a profile.
@@ -181,6 +184,7 @@ impl DecryptionContext {
                             secret_service: secret.service.clone(),
                             secret_account: secret.account.clone(),
                             wal_replayed,
+                            wal_error: None,
                         }));
                     }
                     Err(e) => last_reason = e.to_string(),
@@ -255,6 +259,9 @@ pub enum DecryptionOutcome {
         /// the plaintext includes changes the main file does not yet hold.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         wal_replayed: bool,
+        /// Why the database's `-wal` could not be read, when it could not.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wal_error: Option<String>,
     },
     /// A profile matched but decryption failed.
     Failed { reason: String },
@@ -275,6 +282,7 @@ impl DecryptionRecord {
                 cipher_sha256: sha256_hex(ciphertext),
                 plain_sha256: sha256_hex(&decryption.plaintext),
                 wal_replayed: decryption.wal_replayed,
+                wal_error: decryption.wal_error.clone(),
             },
         }
     }

@@ -337,6 +337,11 @@ fn write_txt(
             if is_textual(matched) {
                 out.push(':');
                 out.push_str(&render_match(matched, colourise));
+                // The preview holds a match whole up to a cap; one the cap cut ends
+                // right before the `…` marker, which is then shown too.
+                if r.line[r.match_in_line.end..] == *crate::ops::search::ELLIPSIS {
+                    out.push('…');
+                }
             }
         } else if is_textual(&r.line) {
             out.push(':');

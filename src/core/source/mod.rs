@@ -26,7 +26,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::core::models::Entry;
-use crate::platform::android::backup::is_android_backup;
 
 pub mod bytes;
 pub mod folder;
@@ -43,6 +42,17 @@ pub enum Container {
     AndroidBackup,
     /// Not a container: an ordinary file, to be searched as itself.
     Other,
+}
+
+/// The first line of an Android `adb backup` (`.ab`) file.
+pub const ANDROID_BACKUP_MAGIC: &[u8] = b"ANDROID BACKUP\n";
+
+/// Whether `head`, the first bytes of a file, are an `.ab` header. Decided by content,
+/// never by file name. Here rather than in `platform::android`, which re-exports it,
+/// because deciding what a container is belongs to this layer and `core` must not
+/// depend on `platform`.
+pub fn is_android_backup(head: &[u8]) -> bool {
+    head.starts_with(ANDROID_BACKUP_MAGIC)
 }
 
 /// Whether `path` is named like a tar archive, plain or gzip-compressed.

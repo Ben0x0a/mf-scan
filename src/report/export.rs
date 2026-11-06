@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::models::{Entry, RunInfo};
 use crate::core::source::Source;
 use crate::core::util::sha256_hex;
+use crate::ops::decrypting::{Derived, DerivedCopy};
 use crate::ops::search::MatchedFile;
 
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
@@ -141,37 +142,23 @@ pub struct ExportedFile {
     pub derived: Option<String>,
 }
 
-/// Produces a file derived from an exported one, written beside it (a decrypted
-/// copy of an encrypted database, for one).
-///
-/// WHY a trait here: the report layer writes and attests files but does not know how
-/// to decrypt. The caller supplies the transform; this module names the copy, writes
-/// it, hashes it and records it like any other exported file.
-pub trait DerivedCopy: Sync {
-    /// Whether `entry` may have a derived form. A cheap test on the entry alone, so a
-    /// caller walking a whole archive reads only the files it applies to.
-    fn wants(&self, entry: &Entry) -> bool;
-
-    /// The derived bytes for `entry`, whose stored bytes are `content`: `None` when it
-    /// has no derived form, `Some(Err(reason))` when it should have had one but could
-    /// not be produced (a database whose key did not verify).
-    fn derive(&self, entry: &Entry, content: &[u8])
-    -> Option<std::result::Result<Derived, String>>;
-}
-
-/// One derived file: its bytes, and how they were produced (for the report).
-pub struct Derived {
-    pub bytes: Vec<u8>,
-    pub note: String,
-}
-
 /// The file name of a decrypted copy: `.decrypted` before the extension, so the copy
 /// keeps the extension tools open it by (`signal.sqlite` → `signal.decrypted.sqlite`).
 /// A name with no extension, or only a leading dot, gets the suffix at the end.
 pub fn decrypted_name(name: &str) -> String {
+    decrypted_name_numbered(name, 1)
+}
+
+/// [`decrypted_name`], numbered after the first: `x.decrypted-2.db` for `n` = 2.
+fn decrypted_name_numbered(name: &str, n: usize) -> String {
+    let tag = if n > 1 {
+        format!(".decrypted-{n}")
+    } else {
+        ".decrypted".to_string()
+    };
     match name.rfind('.') {
-        Some(dot) if dot > 0 => format!("{}.decrypted{}", &name[..dot], &name[dot..]),
-        _ => format!("{name}.decrypted"),
+        Some(dot) if dot > 0 => format!("{}{tag}{}", &name[..dot], &name[dot..]),
+        _ => format!("{name}{tag}"),
     }
 }
 
@@ -238,6 +225,9 @@ pub enum ExportOutcome {
         /// so they will not be extractable if the export is later moved to Windows
         /// (raised only on non-Windows hosts, where the local write succeeds).
         portability_warnings: Vec<SkippedFile>,
+        /// Files that should have had a decrypted copy but did not decrypt (the key
+        /// did not verify), with the reason. The original was still exported.
+        undecrypted: Vec<SkippedFile>,
     },
     Refused {
         total_size: u64,
@@ -323,6 +313,9 @@ struct ExportReport<'a> {
     /// Files written but whose path is too long to move to Windows. Omitted when empty.
     #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
     portability_warnings: &'a [SkippedFile],
+    /// Files whose decrypted copy could not be made. Omitted when empty.
+    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
+    undecrypted: &'a [SkippedFile],
 }
 
 /// Aggregate integrity outcome over all exported files, surfaced at the head of
@@ -377,6 +370,7 @@ pub fn write_export_report(
     files: &[ExportedFile],
     skipped_too_long: &[SkippedFile],
     portability_warnings: &[SkippedFile],
+    undecrypted: &[SkippedFile],
     w: &mut dyn Write,
 ) -> Result<()> {
     let report = ExportReport {
@@ -386,6 +380,7 @@ pub fn write_export_report(
         files,
         skipped_too_long,
         portability_warnings,
+        undecrypted,
     };
     serde_json::to_writer_pretty(&mut *w, &report).context("failed writing export report")?;
     writeln!(w).context("failed writing export report")?;
@@ -452,12 +447,22 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
 /// Items are walked in order and the FIRST claimant keeps the unsuffixed name.
 /// Callers build `items` from entries sorted by name, so the assignment is
 /// reproducible.
+/// A path as a case-insensitive file system compares it: Unicode case folding, so
+/// `Été.jpg` and `été.jpg` clash as they do on APFS and NTFS.
+///
+/// Limit: APFS also ignores the difference between composed and decomposed accents
+/// (`é` as one code point or two); that is not folded here, as it needs Unicode
+/// normalisation tables the project does not carry.
+fn fold_case(path: &str) -> String {
+    path.to_lowercase()
+}
+
 fn disambiguate(items: &mut [ExportItem]) -> Vec<Renamed> {
     let mut claimed: HashSet<String> = HashSet::with_capacity(items.len());
     let mut renamed = Vec::new();
     for item in items.iter_mut() {
         let wanted = item.output_path();
-        if claimed.insert(wanted.to_ascii_lowercase()) {
+        if claimed.insert(fold_case(&wanted)) {
             continue;
         }
         let base = item.name.clone();
@@ -465,7 +470,7 @@ fn disambiguate(items: &mut [ExportItem]) -> Vec<Renamed> {
         loop {
             item.name = format!("{base}~{suffix}");
             let candidate = item.output_path();
-            if claimed.insert(candidate.to_ascii_lowercase()) {
+            if claimed.insert(fold_case(&candidate)) {
                 renamed.push(Renamed {
                     internal_path: item.internal_path.clone(),
                     wanted,
@@ -654,6 +659,10 @@ struct FileExporter<'a> {
     source: &'a dyn Source,
     /// Writes a derived copy (a decrypted database) beside each file that has one.
     derive: Option<&'a dyn DerivedCopy>,
+    /// Every output path taken so far, case-folded: the plan's, then each derived
+    /// copy's, so a derived copy never overwrites a planned file or the reverse.
+    claimed: HashSet<String>,
+    undecrypted: Vec<SkippedFile>,
     /// The full entry list, so a written file's declared sidecars can be fetched.
     by_path: &'a HashMap<&'a str, &'a Entry>,
     dir: &'a Path,
@@ -674,6 +683,8 @@ impl<'a> FileExporter<'a> {
         FileExporter {
             source,
             derive: None,
+            claimed: HashSet::new(),
+            undecrypted: Vec::new(),
             by_path,
             dir,
             max_path_len,
@@ -730,12 +741,24 @@ impl<'a> FileExporter<'a> {
         )?);
 
         // A derived copy (a decrypted database) goes beside the original.
-        // A failure is not recorded here: the search or run summary reports it.
-        let derived = self
+        // A copy that should exist but cannot be made is recorded, never dropped:
+        // `find` and `app export` run no search that would report it otherwise.
+        let derived = match self
             .derive
             .filter(|d| d.wants(entry))
             .and_then(|d| d.derive(entry, &content))
-            .and_then(std::result::Result::ok);
+        {
+            Some(Ok(derived)) => Some(derived),
+            Some(Err(reason)) => {
+                self.undecrypted.push(SkippedFile {
+                    internal_path: internal_path.to_string(),
+                    output_path: output_path.to_string(),
+                    reason,
+                });
+                None
+            }
+            None => None,
+        };
         if let Some(derived) = &derived {
             self.write_derived(internal_path, output_path, dest, derived)?;
         }
@@ -773,15 +796,28 @@ impl<'a> FileExporter<'a> {
         dest: &Path,
         derived: &Derived,
     ) -> Result<()> {
-        let name = dest
-            .file_name()
-            .map(|n| decrypted_name(&n.to_string_lossy()))
-            .unwrap_or_else(|| decrypted_name("unnamed"));
-        let derived_dest = dest.with_file_name(&name);
-        let derived_output = match output_path.rsplit_once('/') {
+        let original = dest.file_name().map_or_else(
+            || "unnamed".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let in_folder = |name: &str| match output_path.rsplit_once('/') {
             Some((folder, _)) => format!("{folder}/{name}"),
-            None => name.clone(),
+            None => name.to_string(),
         };
+        // The first free name: `x.decrypted.db`, then `x.decrypted-2.db`, … taken
+        // neither by a planned file nor by a file already on disk.
+        let (name, derived_output) = (1..)
+            .map(|n| {
+                let name = decrypted_name_numbered(&original, n);
+                let output = in_folder(&name);
+                (name, output)
+            })
+            .find(|(name, output)| {
+                !self.claimed.contains(&fold_case(output)) && !dest.with_file_name(name).exists()
+            })
+            .expect("an unbounded range always yields a free name");
+        self.claimed.insert(fold_case(&derived_output));
+        let derived_dest = dest.with_file_name(&name);
         if let PathCheck::Skip(reason) =
             check_export_path(self.dir, &derived_output, self.max_path_len)
         {
@@ -818,6 +854,7 @@ impl<'a> FileExporter<'a> {
             report: self.report,
             skipped_too_long: self.skipped_too_long,
             portability_warnings: self.portability_warnings,
+            undecrypted: self.undecrypted,
         }
     }
 }
@@ -857,6 +894,11 @@ pub fn export_files(
 
     let mut exporter = FileExporter::new(source, &by_path, dir, max_path_len);
     exporter.derive = derive;
+    exporter.claimed = plan
+        .items
+        .iter()
+        .map(|i| fold_case(&i.output_path()))
+        .collect();
     for (item, file) in plan.items.iter().zip(files) {
         let dest = dir.join(&item.folder).join(&item.name);
         exporter.write_one(&file.entry, &file.entry.name, &item.output_path(), &dest)?;

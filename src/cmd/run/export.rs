@@ -74,6 +74,8 @@ fn run_manifest_export(
             report,
             skipped_too_long,
             portability_warnings,
+            // A manifest re-ingestion writes no decrypted copies.
+            undecrypted: _,
         } => {
             let note = if skipped > 0 {
                 format!("; {skipped} listed file(s) not found in archive")
@@ -88,6 +90,7 @@ fn run_manifest_export(
                 &report,
                 &skipped_too_long,
                 &portability_warnings,
+                &[],
             )?;
             eprintln!(
                 "exported {files} files ({bytes} bytes) to {}{note}",

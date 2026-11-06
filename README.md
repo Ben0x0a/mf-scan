@@ -12,7 +12,7 @@ because acquisition ZIPs usually store entries **uncompressed** (STORED), there 
 nothing to decompress on the hot path. The same engine reads a folder of loose
 files and (with `--archive-depth`) the archives nested inside it.
 
-A Cellebrite `.ufdr` report is read as the zip it is. Its files keep the names the
+A Cellebrite `.ufdr` report is read as the zip it is (`-r` picks it up too). Its files keep the names the
 report gives them (`files/Database/…`), not device paths, and the databases Cellebrite
 decrypted are already there as `*.decrypted`, plain SQLite. A key dump inside it
 (`files/Configuration/<udid>_keychain.plist`) is found and used like one beside it.

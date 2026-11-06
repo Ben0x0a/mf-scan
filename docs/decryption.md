@@ -243,7 +243,11 @@ A decrypted copy is named `.decrypted` before the extension (`signal.sqlite` →
 `signal.decrypted.sqlite`), so tools still open it by type. It already includes the
 committed `-wal` frames, so it is complete on its own. In an export report it is
 recorded with the original's internal path, its own hashes, and a `derived` note
-saying how it was decrypted (profile, key, `-wal replayed`).
+saying how it was decrypted (profile, key, `-wal replayed`). A database that should
+have had a copy but did not decrypt is listed under `undecrypted` in the export report,
+with the reason, and printed on stderr; its original is still exported. A `-wal` that
+exists but cannot be read is never silently skipped: the decryption records
+`wal_error`, and the summary says `-wal NOT applied`.
 
 **`decrypt --to`.** When the source is a plain zip (a full-filesystem acquisition),
 the output begins as a byte-for-byte copy of it. Every original member keeps its

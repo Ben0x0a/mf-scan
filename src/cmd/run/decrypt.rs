@@ -17,12 +17,11 @@ use anyhow::{Result, anyhow, bail};
 
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
-use mf_scan::ops::decrypting::SourceDecryptor;
+use mf_scan::ops::decrypting::{DerivedCopy, SourceDecryptor};
 use mf_scan::report::decrypted_zip::{self, DecryptedZipRequest};
-use mf_scan::report::export::DerivedCopy;
 
 use crate::cmd::cli::decrypt::DecryptCmdArgs;
-use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
+use crate::cmd::support::decryption::{build_from_sources, context_for_source};
 use crate::cmd::support::sources::{
     BackupOptions, BackupProvenance, ResolvedKind, resolve_sources, with_operand_source,
 };
@@ -38,8 +37,8 @@ pub(crate) fn run_decrypt(args: DecryptCmdArgs) -> Result<ExitCode> {
         .next()
         .ok_or_else(|| anyhow!("no source to read"))?;
 
-    let Some(base) = build_decryption_context(&args.keys, &[resolved.path.as_path()])? else {
-        bail!("decryption is off (--no-decrypt) or no decryption profiles are installed");
+    let Some(base) = build_from_sources(&args.keys, &[resolved.path.as_path()])? else {
+        bail!("no decryption profiles are installed (profiles/ beside the binary)");
     };
 
     let run = RunInfo {

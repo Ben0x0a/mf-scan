@@ -68,7 +68,7 @@ use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{BackupStructure, DirectoryRecord};
 use crate::platform::ios::backup::password::{UnlockProvenance, candidates};
 
-const MAGIC: &[u8] = b"ANDROID BACKUP\n";
+const MAGIC: &[u8] = crate::core::source::ANDROID_BACKUP_MAGIC;
 /// The highest archive version AOSP writes (`BACKUP_FILE_VERSION`). A newer one is
 /// refused, as AOSP refuses it: an unknown format change would be misread silently.
 const MAX_VERSION: u32 = 5;
@@ -88,11 +88,7 @@ const SPOOL_LIMIT: usize = 64 * 1024 * 1024;
 const DECODE_CHUNK: usize = 1024 * 1024;
 const INFLATE_BUFFER: usize = 1024 * 1024;
 
-/// Whether `head`, the first bytes of a file, are an `.ab` header. Decided by content,
-/// never by file name.
-pub fn is_android_backup(head: &[u8]) -> bool {
-    head.starts_with(MAGIC)
-}
+pub use crate::core::source::is_android_backup;
 
 /// The parsed text header.
 #[derive(Debug, Clone, PartialEq, Eq)]

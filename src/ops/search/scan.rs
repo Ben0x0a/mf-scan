@@ -33,7 +33,15 @@ const MAX_PREVIEW: usize = 200;
 pub const MAX_HITS_PER_FILE: usize = 100_000;
 
 /// Unicode horizontal ellipsis (U+2026) marking a truncated line edge.
-const ELLIPSIS: &[u8] = "…".as_bytes();
+pub(crate) const ELLIPSIS: &[u8] = "…".as_bytes();
+
+/// The most of one match a preview holds. A preview always contains the whole match
+/// up to this, so `-o` prints it entire, as grep does; a longer match (a `.*` over a
+/// binary with no newlines) is cut here and ends right before the `…` marker.
+/// WHY 4 KiB: every hit keeps its preview until output, up to [`MAX_HITS_PER_FILE`]
+/// of them, so this bounds a file's previews near 400 MB in the worst case. Tokens,
+/// keys and base64 blobs an examiner extracts with `-o` fit well within it.
+const MAX_MATCH_SHOWN: usize = 4 * 1024;
 
 /// The hits found in one haystack, plus whether the per-file cap cut them off.
 pub struct SearchHits {
@@ -91,10 +99,18 @@ fn preview(
     let (win_start, win_end) = if line_end - line_start <= MAX_PREVIEW {
         (line_start, line_end)
     } else {
-        // Keep a little context before the match, then a fixed-width window.
+        // Keep a little context before the match, then a fixed-width window that
+        // always reaches past the match's end (or to the cap): so a match ending
+        // right before a `…` marker is one the cap cut, and no other.
         let lead = (MAX_PREVIEW / 4).min(match_start - line_start);
         let start = match_start - lead;
-        (start, (start + MAX_PREVIEW).min(line_end))
+        let shown_end = match_end.min(match_start + MAX_MATCH_SHOWN);
+        let past_match = if shown_end < match_end {
+            shown_end
+        } else {
+            shown_end + 1
+        };
+        (start, (start + MAX_PREVIEW).max(past_match).min(line_end))
     };
 
     let truncated_left = win_start > line_start;
@@ -147,6 +163,31 @@ fn line_bounds(haystack: &[u8], match_start: usize, match_end: usize) -> (usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long match on a long line is kept whole, not cut at the preview width.
+    #[test]
+    fn a_long_match_is_kept_whole() {
+        let mut hay = vec![b'#'; 1000];
+        hay.extend(std::iter::repeat_n(b'A', 3000));
+        hay.extend(vec![b'#'; 1000]);
+        let hit = &search_bytes(&hay, &Regex::new("A+").unwrap())[0];
+        let shown = &hit.line[hit.match_in_line.clone()];
+        assert_eq!(shown.len(), 3000);
+        assert_eq!(
+            hit.line[hit.match_in_line.end], b'#',
+            "the byte after the match is shown, so the match is not marked as cut"
+        );
+    }
+
+    /// A match longer than the cap is cut there, right before the `…` marker.
+    #[test]
+    fn a_match_over_the_cap_ends_at_the_marker() {
+        let mut hay = vec![b'A'; MAX_MATCH_SHOWN + 500];
+        hay.extend(vec![b'#'; 10]);
+        let hit = &search_bytes(&hay, &Regex::new("A+").unwrap())[0];
+        assert_eq!(hit.match_in_line.len(), MAX_MATCH_SHOWN);
+        assert_eq!(&hit.line[hit.match_in_line.end..], ELLIPSIS);
+    }
 
     /// The per-file cap stops collection and reports truncation (review P2).
     #[test]

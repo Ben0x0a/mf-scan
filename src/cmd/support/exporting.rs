@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
 use mf_scan::decrypt::DecryptionContext;
-use mf_scan::ops::decrypting::SourceDecryptor;
+use mf_scan::ops::decrypting::{DerivedCopy, SourceDecryptor};
 use mf_scan::ops::search::{Findings, MatchedFile};
 use mf_scan::report::export::{
     self, ExportOutcome, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
@@ -84,7 +84,7 @@ pub(crate) fn run_export_sink(
             dir,
             Some(sink.max_size),
             sink.max_path_len,
-            decryptor.as_ref().map(|d| d as &dyn export::DerivedCopy),
+            decryptor.as_ref().map(|d| d as &dyn DerivedCopy),
         )? {
             ExportOutcome::Exported {
                 files: n,
@@ -92,6 +92,7 @@ pub(crate) fn run_export_sink(
                 report,
                 skipped_too_long,
                 portability_warnings,
+                undecrypted,
                 ..
             } => {
                 write_export_report_file(
@@ -100,12 +101,13 @@ pub(crate) fn run_export_sink(
                     &report,
                     &skipped_too_long,
                     &portability_warnings,
+                    &undecrypted,
                 )?;
                 eprintln!(
                     "exported {n} {what} file(s) ({bytes} bytes) to {}",
                     dir.display()
                 );
-                report_decrypted_copies(&report);
+                report_decrypted_copies(&report, &undecrypted);
                 report_integrity(&report);
                 report_skipped_too_long(&skipped_too_long);
                 report_portability_warnings(&portability_warnings);
@@ -122,18 +124,27 @@ pub(crate) fn run_export_sink(
     Ok(())
 }
 
-/// Announce the decrypted copies an export wrote beside their originals.
-pub(crate) fn report_decrypted_copies(report: &[ExportedFile]) {
+/// Announce the decrypted copies an export wrote beside their originals, and loudly
+/// the databases that should have had one but did not decrypt.
+pub(crate) fn report_decrypted_copies(report: &[ExportedFile], undecrypted: &[SkippedFile]) {
     let copies: Vec<&ExportedFile> = report.iter().filter(|f| f.derived.is_some()).collect();
-    if copies.is_empty() {
-        return;
+    if !copies.is_empty() {
+        eprintln!(
+            "decrypted copies written beside their originals: {}",
+            copies.len()
+        );
+        for f in copies {
+            eprintln!("    {}", f.output_path);
+        }
     }
-    eprintln!(
-        "decrypted copies written beside their originals: {}",
-        copies.len()
-    );
-    for f in copies {
-        eprintln!("    {}", f.output_path);
+    if !undecrypted.is_empty() {
+        eprintln!(
+            "⚠ {} database(s) exported encrypted only (no decrypted copy):",
+            undecrypted.len()
+        );
+        for f in undecrypted {
+            eprintln!("    {}: {}", f.output_path, f.reason);
+        }
     }
 }
 
@@ -242,11 +253,19 @@ pub(crate) fn write_export_report_file(
     report: &[export::ExportedFile],
     skipped_too_long: &[SkippedFile],
     portability_warnings: &[SkippedFile],
+    undecrypted: &[SkippedFile],
 ) -> Result<()> {
     let path = dir.join("export-report.json");
     let file = File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
     let mut w = BufWriter::new(file);
-    export::write_export_report(run, report, skipped_too_long, portability_warnings, &mut w)?;
+    export::write_export_report(
+        run,
+        report,
+        skipped_too_long,
+        portability_warnings,
+        undecrypted,
+        &mut w,
+    )?;
     w.flush().context("failed flushing export report")?;
     eprintln!(
         "export report: {} files -> {}",

@@ -22,6 +22,7 @@ mod classify;
 
 pub mod base64;
 mod scan;
+pub(crate) use scan::ELLIPSIS;
 
 pub use scan::{MAX_HITS_PER_FILE, SearchHits, search_bytes, search_bytes_capped};
 

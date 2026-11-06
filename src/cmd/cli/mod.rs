@@ -25,7 +25,7 @@ pub(crate) use app::{
 pub(crate) use backup::{
     BackupArgs, BackupCommand, BackupInfoArgs, BackupRebuildArgs, BackupSourceArgs,
 };
-pub(crate) use common::{ColourWhen, ExportSink, KeyArgs};
+pub(crate) use common::{ColourWhen, ExportSink, KeyArgs, KeySources};
 pub(crate) use decrypt::DecryptCmdArgs;
 pub(crate) use diff::DiffArgs;
 pub(crate) use export::ExportArgs;

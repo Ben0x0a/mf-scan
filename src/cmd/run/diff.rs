@@ -111,10 +111,10 @@ fn reject_unsupported(args: &DiffArgs) -> Result<()> {
 
 /// Whether any decryption material was supplied (shared or per-side).
 fn decryption_requested(args: &DiffArgs) -> bool {
-    !args.decrypt.keys.keyfile.is_empty()
+    !args.decrypt.keys.sources.keyfile.is_empty()
         || !args.keyfile_a.is_empty()
         || !args.keyfile_b.is_empty()
-        || args.decrypt.keys.platform.is_some()
+        || args.decrypt.keys.sources.platform.is_some()
         || args.platform_a.is_some()
         || args.platform_b.is_some()
 }

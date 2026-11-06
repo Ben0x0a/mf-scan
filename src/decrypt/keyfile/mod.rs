@@ -161,13 +161,7 @@ const MAX_WRAPPED_DUMP: u64 = 256 * 1024 * 1024;
 /// guess a format for key material. Use this for a dump the operator named explicitly
 /// (`--keyfile`), where a parse failure should be reported rather than silently ignored.
 pub fn load_dump(content: &[u8]) -> Result<SecretStore> {
-    if let Some(members) = zip_members(content) {
-        let mut store = SecretStore::default();
-        for member in members {
-            if let Some(found) = load_if_dump(&member) {
-                store.merge(found);
-            }
-        }
+    if let Some(store) = load_zipped(content) {
         if store.is_empty() {
             bail!("no member of this zip is a recognised keychain/keystore dump");
         }
@@ -188,35 +182,42 @@ pub fn load_dump(content: &[u8]) -> Result<SecretStore> {
 /// for auto-detection, where most files scanned are *not* keychain dumps and a
 /// non-match is the normal case, not an error.
 pub fn load_if_dump(content: &[u8]) -> Option<SecretStore> {
-    if let Some(members) = zip_members(content) {
-        let mut store = SecretStore::default();
-        for member in members {
-            if let Some(found) = load_if_dump(&member) {
-                store.merge(found);
-            }
-        }
+    if let Some(store) = load_zipped(content) {
         return (!store.is_empty()).then_some(store);
     }
+    load_plain(content)
+}
+
+/// `content` as one dump, without looking inside it.
+fn load_plain(content: &[u8]) -> Option<SecretStore> {
     let provider = provider_for(content)?;
     provider.load(content).ok().map(SecretStore::new)
 }
 
-/// The files inside `content` when it is a zip, else `None`. Members larger than
-/// [`MAX_WRAPPED_DUMP`] are skipped: no dump is that large, and reading one would
-/// only waste memory.
-fn zip_members(content: &[u8]) -> Option<Vec<Vec<u8>>> {
+/// The secrets of every dump directly inside `content`, when it is a zip; `None`
+/// when it is not one.
+///
+/// Members are read one at a time and dropped before the next, and a member is
+/// only ever tried as a dump itself, never opened as a zip in turn. WHY: the zip
+/// is evidence and may be hostile, so neither its total size nor a zip nested in
+/// itself may exhaust memory or the stack. Members larger than
+/// [`MAX_WRAPPED_DUMP`] are skipped: no dump is that large.
+fn load_zipped(content: &[u8]) -> Option<SecretStore> {
     use crate::core::source::Source;
     if !content.starts_with(b"PK\x03\x04") {
         return None;
     }
     let zip = crate::core::source::zip::ZipSource::open(content).ok()?;
-    Some(
-        zip.entries()
-            .iter()
-            .filter(|e| !e.is_dir() && e.uncompressed_size <= MAX_WRAPPED_DUMP)
-            .filter_map(|e| zip.content(e).ok().map(|c| c.to_vec()))
-            .collect(),
-    )
+    let mut store = SecretStore::default();
+    for entry in zip.entries() {
+        if entry.is_dir() || entry.uncompressed_size > MAX_WRAPPED_DUMP {
+            continue;
+        }
+        if let Some(found) = zip.content(entry).ok().and_then(|m| load_plain(&m)) {
+            store.merge(found);
+        }
+    }
+    Some(store)
 }
 
 #[cfg(test)]

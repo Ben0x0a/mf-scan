@@ -2,7 +2,7 @@
 //!
 //! Defines: [`build_decryption_context`] (load the profile registry + keyfile
 //! dumps into a [`DecryptionContext`]) and [`report_decryptions`] (the stderr
-//! audit-trail summary). Takes the shared [`crate::cmd::cli::KeyArgs`] group, so
+//! audit-trail summary). Takes the shared [`crate::cmd::cli::KeyArgs`] / [`crate::cmd::cli::KeySources`] groups, so
 //! both `grep` and `diff` reuse it unchanged.
 //! Used by: `run::grep` (and `run::diff`). Uses: `mf_scan::decrypt` (the library
 //! decryption types) and `crate::cmd::cli`.
@@ -18,9 +18,9 @@ use mf_scan::decrypt::{
 };
 
 use mf_scan::core::source::Source;
-use mf_scan::ops::decrypting::dumps_in_source;
+use mf_scan::ops::decrypting::{MAX_DUMP_LEN, dumps_in_source, is_dump_name};
 
-use crate::cmd::cli::KeyArgs;
+use crate::cmd::cli::{KeyArgs, KeySources};
 
 /// Build the decryption context from `--keyfile` dumps, an auto-detected keyfile
 /// next to the archive, and the profile registry.
@@ -32,12 +32,20 @@ use crate::cmd::cli::KeyArgs;
 /// secrets were found. Messages are loud when the operator named a keyfile explicitly
 /// and quiet for the automatic path (where finding nothing is the normal case).
 pub(crate) fn build_decryption_context(
-    decrypt: &KeyArgs,
+    keys: &KeyArgs,
     archive_paths: &[&Path],
 ) -> Result<Option<DecryptionContext>> {
-    if decrypt.no_decrypt {
+    if keys.no_decrypt {
         return Ok(None);
     }
+    build_from_sources(&keys.sources, archive_paths)
+}
+
+/// [`build_decryption_context`] without the `--no-decrypt` switch, for `decrypt`.
+pub(crate) fn build_from_sources(
+    decrypt: &KeySources,
+    archive_paths: &[&Path],
+) -> Result<Option<DecryptionContext>> {
     let explicit = !decrypt.keyfile.is_empty();
 
     let registry = match find_profiles_dir() {
@@ -133,11 +141,6 @@ fn unique_parents<'a>(archive_paths: &[&'a Path]) -> Vec<&'a Path> {
     dirs
 }
 
-/// Words in a file name that mark it as a possible keychain/keystore dump.
-const DUMP_NAME_HINTS: &[&str] = &["keychain", "keystore"];
-/// The largest file auto-detection reads as a possible dump.
-const MAX_AUTODETECT_DUMP: u64 = 256 * 1024 * 1024;
-
 /// Merge into `secrets` any keychain dump found in `dir`.
 ///
 /// Scans for regular files whose name contains "keychain" or "keystore"
@@ -154,15 +157,11 @@ fn autodetect_in_dir(dir: &Path, secrets: &mut SecretStore) {
         if !path.is_file() {
             continue;
         }
-        let is_candidate = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            let n = n.to_ascii_lowercase();
-            DUMP_NAME_HINTS.iter().any(|hint| n.contains(hint))
-        });
-        // A dump is small; a large file with a matching name (an extraction named
-        // after its keychain, say) is not one, and reading it would waste memory.
-        let small = entry
-            .metadata()
-            .is_ok_and(|m| m.len() <= MAX_AUTODETECT_DUMP);
+        let is_candidate = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_dump_name);
+        let small = entry.metadata().is_ok_and(|m| m.len() <= MAX_DUMP_LEN);
         if !is_candidate || !small {
             continue;
         }
@@ -207,12 +206,17 @@ pub(crate) fn report_decryptions(decryptions: &[DecryptionRecord]) {
                 secret_service,
                 secret_account,
                 wal_replayed,
+                wal_error,
                 ..
             } => {
                 let mark = if *verified { "verified" } else { "UNVERIFIED" };
                 let svc = secret_service.as_deref().unwrap_or("?");
                 let acct = secret_account.as_deref().unwrap_or("?");
-                let wal = if *wal_replayed { ", -wal replayed" } else { "" };
+                let wal = match (wal_error, wal_replayed) {
+                    (Some(err), _) => format!(", -wal NOT applied: {err}"),
+                    (None, true) => ", -wal replayed".to_string(),
+                    (None, false) => String::new(),
+                };
                 eprintln!(
                     "  {} [{}]  {mark}{wal}  (key svc={svc} acct={acct}, src={secret_source})",
                     d.path, d.app
