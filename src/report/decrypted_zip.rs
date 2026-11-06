@@ -1,0 +1,384 @@
+//! Write an acquisition as one ZIP with each decrypted database beside its original.
+//!
+//! Defines: [`DecryptedZipRequest`], [`write`] (the archive and its `.sha256` sidecar),
+//! and [`RECORD_MEMBER`].
+//! Used by: the binary's `decrypt` orchestrator (`cmd::run::decrypt`).
+//! Uses: `report::zip_writer` (the format, including extending an archive verbatim),
+//! `report::export` (the derived-copy hook, the naming rule, the per-file records), and
+//! `report::rebuild_zip` (the fail-closed temporary file, read-back check and sidecar).
+//!
+//! ── Two ways to build it ─────────────────────────────────────────────────────
+//!   • The source is a ZIP on disk (the usual full-filesystem acquisition): the output
+//!     starts as a verbatim copy of it. Every original member keeps its bytes, offset,
+//!     compression and timestamps, and the decrypted copies are appended. Nothing is
+//!     decompressed or recompressed, so a 40 GB acquisition costs one sequential copy.
+//!   • Any other source (a folder, a tar, a backup): every file is written STORED with
+//!     its own timestamp, then the decrypted copies, as `backup rebuild` writes.
+//!
+//! A decrypted copy is named `name.decrypted.ext` in its original's directory, carries
+//! its original's timestamp, and is listed in [`RECORD_MEMBER`] with the hashes of
+//! both files and how it was decrypted. A database whose key did not verify is listed
+//! there too, with the reason, and gets no copy.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+
+use crate::core::models::RunInfo;
+use crate::core::source::Source;
+use crate::core::source::zip::ZipSource;
+use crate::core::util::{UtcTime, sha256_hex};
+use crate::report::export::{DerivedCopy, decrypted_name};
+use crate::report::rebuild_zip::{PartialFile, check_and_hash, now_unix, sidecar_path};
+use crate::report::zip_writer::ZipWriter;
+
+/// The record of what was decrypted, inside the archive. No device path starts with
+/// `_mf-scan/`, so it cannot collide with a member.
+pub const RECORD_MEMBER: &str = "_mf-scan/decryption.json";
+
+/// What the archive needs.
+pub struct DecryptedZipRequest<'a> {
+    pub source: &'a dyn Source,
+    /// The source's ZIP on disk, to extend verbatim; `None` re-packs every file.
+    pub original_zip: Option<&'a Path>,
+    pub derive: &'a dyn DerivedCopy,
+    pub output: &'a Path,
+    /// Replace an archive already at `output`.
+    pub force: bool,
+    pub run: &'a RunInfo,
+}
+
+/// One decrypted copy added to the archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecryptedMember {
+    /// The original (encrypted) member.
+    pub original: String,
+    /// The decrypted copy's member name.
+    pub member: String,
+    pub size: u64,
+    /// SHA-256 of the original's bytes as read from the source.
+    pub original_sha256: String,
+    /// SHA-256 of the decrypted copy, read back from the archive.
+    pub sha256: String,
+    /// How it was decrypted.
+    pub note: String,
+}
+
+/// A database that should have decrypted but did not.
+#[derive(Debug, Clone, Serialize)]
+pub struct UndecryptedMember {
+    pub original: String,
+    pub reason: String,
+}
+
+/// What a finished archive holds.
+pub struct DecryptedZipOutcome {
+    pub decrypted: Vec<DecryptedMember>,
+    pub failed: Vec<UndecryptedMember>,
+    /// Members copied or written from the source.
+    pub original_members: usize,
+    pub archive_sha256: String,
+    pub sidecar: PathBuf,
+}
+
+/// The record written into the archive.
+#[derive(Serialize)]
+struct Record<'a> {
+    run: &'a RunInfo,
+    created_utc: String,
+    /// `extended` (the source ZIP copied verbatim) or `repacked`.
+    layout: &'a str,
+    original_members: usize,
+    decrypted: &'a [DecryptedMember],
+    #[serde(skip_serializing_if = "<[UndecryptedMember]>::is_empty")]
+    failed: &'a [UndecryptedMember],
+}
+
+/// Write the archive described by `request`.
+pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
+    let DecryptedZipRequest {
+        source,
+        original_zip,
+        derive,
+        output,
+        force,
+        run,
+    } = request;
+
+    if output.is_dir() {
+        bail!(
+            "{} is a directory; --to takes a .zip file",
+            output.display()
+        );
+    }
+    if output.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to replace it",
+            output.display()
+        );
+    }
+    if let Some(original) = original_zip
+        && same_file(original, output)
+    {
+        bail!("--to must not be the source archive itself");
+    }
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+
+    let mut partial_name = output.file_name().unwrap_or_default().to_os_string();
+    partial_name.push(format!(".partial-{}", std::process::id()));
+    let partial = PartialFile(output.with_file_name(partial_name));
+
+    // Start with the original members: copied verbatim, or written one by one.
+    let (mut zip, original_members, layout) = match original_zip {
+        Some(original) => {
+            let zip = ZipWriter::extend(original, &partial.0)?;
+            (zip, count_members(original)?, "extended")
+        }
+        None => {
+            let mut zip = ZipWriter::create(&partial.0)?;
+            let n = repack(&mut zip, source)?;
+            (zip, n, "repacked")
+        }
+    };
+
+    // Then each decrypted database, beside its original.
+    let mut taken: HashSet<&str> = source.entries().iter().map(|e| e.name.as_str()).collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut decrypted = Vec::new();
+    let mut failed = Vec::new();
+    for entry in source.entries() {
+        if entry.is_dir() || !derive.wants(entry) {
+            continue;
+        }
+        let content = source
+            .content(entry)
+            .with_context(|| format!("cannot read {}", entry.name))?;
+        match derive.derive(entry, &content) {
+            None => {}
+            Some(Err(reason)) => failed.push(UndecryptedMember {
+                original: entry.name.clone(),
+                reason,
+            }),
+            Some(Ok(copy)) => {
+                let member = free_name(&entry.name, &taken, &names);
+                let written = zip.add_file(&member, entry.mtime, &copy.bytes)?;
+                decrypted.push(DecryptedMember {
+                    original: entry.name.clone(),
+                    member: member.clone(),
+                    size: copy.bytes.len() as u64,
+                    original_sha256: sha256_hex(&content),
+                    sha256: zip.sha256_of(written)?,
+                    note: copy.note,
+                });
+                names.push(member);
+            }
+        }
+    }
+    taken.clear();
+
+    let now = now_unix();
+    let record = Record {
+        run,
+        created_utc: UtcTime::from_unix(now).iso(),
+        layout,
+        original_members,
+        decrypted: &decrypted,
+        failed: &failed,
+    };
+    let bytes = serde_json::to_vec_pretty(&record).context("cannot encode the record")?;
+    zip.add_file(RECORD_MEMBER, Some(now), &bytes)?;
+    zip.finish()?;
+
+    let expected = original_members + decrypted.len() + 1;
+    let archive_sha256 = check_and_hash(&partial.0, expected)?;
+    fs::rename(&partial.0, output)
+        .with_context(|| format!("cannot move the archive to {}", output.display()))?;
+    let sidecar = sidecar_path(output);
+    let file_name = output.file_name().unwrap_or_default().to_string_lossy();
+    // `sha256sum` format, verifiable with `sha256sum -c` or `shasum -a 256 -c`.
+    fs::write(&sidecar, format!("{archive_sha256}  {file_name}\n"))
+        .with_context(|| format!("cannot write {}", sidecar.display()))?;
+
+    Ok(DecryptedZipOutcome {
+        decrypted,
+        failed,
+        original_members,
+        archive_sha256,
+        sidecar,
+    })
+}
+
+/// Write every file and directory of `source` STORED, each with its own timestamp.
+fn repack(zip: &mut ZipWriter, source: &dyn Source) -> Result<usize> {
+    let mut n = 0;
+    for entry in source.entries() {
+        if entry.is_dir() {
+            zip.add_directory(&entry.name, entry.mtime)?;
+        } else {
+            let content = source
+                .content(entry)
+                .with_context(|| format!("cannot read {}", entry.name))?;
+            zip.add_file(&entry.name, entry.mtime, &content)?;
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// How many members the tool's reader sees in the ZIP at `path`: the same count the
+/// read-back check applies to the output, so the two agree by construction.
+fn count_members(path: &Path) -> Result<usize> {
+    let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    // SAFETY: a read-only map, dropped before this function returns.
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("cannot map {}", path.display()))?;
+    Ok(ZipSource::open(&map)?.entries().len())
+}
+
+/// The decrypted copy's member name: `name.decrypted.ext` in the original's directory,
+/// numbered if a member already has that name.
+fn free_name(original: &str, taken: &HashSet<&str>, added: &[String]) -> String {
+    let (dir, base) = match original.rsplit_once('/') {
+        Some((dir, base)) => (format!("{dir}/"), base),
+        None => (String::new(), original),
+    };
+    let first = format!("{dir}{}", decrypted_name(base));
+    let free = |name: &str| !taken.contains(name) && !added.iter().any(|a| a == name);
+    if free(&first) {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("{first}-{n}"))
+        .find(|name| free(name))
+        .expect("an unbounded range always yields a free name")
+}
+
+/// Whether two paths name the same file (both must exist for a `true`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::models::Entry;
+    use crate::report::export::Derived;
+
+    /// "Decrypts" any member named `*.enc` by upper-casing it; fails on `bad.enc`.
+    struct Upper;
+
+    impl DerivedCopy for Upper {
+        fn wants(&self, entry: &Entry) -> bool {
+            entry.name.ends_with(".enc")
+        }
+        fn derive(&self, entry: &Entry, content: &[u8]) -> Option<Result<Derived, String>> {
+            if entry.name.ends_with("bad.enc") {
+                return Some(Err("no key".into()));
+            }
+            Some(Ok(Derived {
+                bytes: content.to_ascii_uppercase(),
+                note: "upper".into(),
+            }))
+        }
+    }
+
+    fn original(path: &Path) {
+        let mut zip = ZipWriter::create(path).unwrap();
+        zip.add_directory("app", Some(1_700_000_000)).unwrap();
+        zip.add_file("app/db.enc", Some(1_700_000_001), b"secret")
+            .unwrap();
+        zip.add_file("app/bad.enc", Some(1_700_000_002), b"x")
+            .unwrap();
+        zip.add_file("app/plain.txt", Some(1_700_000_003), b"hello")
+            .unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn extends_the_original_verbatim_and_adds_decrypted_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("case.zip");
+        original(&src_path);
+        let src_bytes = fs::read(&src_path).unwrap();
+        let source = ZipSource::open(&src_bytes).unwrap();
+        let out = dir.path().join("case.decrypted.zip");
+
+        let outcome = write(DecryptedZipRequest {
+            source: &source,
+            original_zip: Some(&src_path),
+            derive: &Upper,
+            output: &out,
+            force: false,
+            run: &RunInfo::default(),
+        })
+        .unwrap();
+        assert_eq!(outcome.original_members, 4);
+        assert_eq!(outcome.decrypted.len(), 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.decrypted[0].member, "app/db.decrypted.enc");
+
+        let out_bytes = fs::read(&out).unwrap();
+        // The original members are the first bytes of the output, unchanged.
+        let cd = crate::core::source::zip::find_cd_location(&src_bytes, 0).unwrap();
+        let prefix = cd.cd_offset as usize;
+        assert_eq!(&out_bytes[..prefix], &src_bytes[..prefix]);
+
+        let read = ZipSource::open(&out_bytes).unwrap();
+        let names: Vec<&str> = read.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "app/",
+                "app/db.enc",
+                "app/bad.enc",
+                "app/plain.txt",
+                "app/db.decrypted.enc",
+                RECORD_MEMBER
+            ]
+        );
+        let copy = &read.entries()[4];
+        assert_eq!(&*read.content(copy).unwrap(), b"SECRET");
+        assert_eq!(
+            copy.mtime,
+            Some(1_700_000_001),
+            "the copy keeps its original's time"
+        );
+        assert!(sidecar_path(&out).exists());
+    }
+
+    #[test]
+    fn refuses_to_overwrite_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("case.zip");
+        original(&src_path);
+        let src_bytes = fs::read(&src_path).unwrap();
+        let source = ZipSource::open(&src_bytes).unwrap();
+        let err = write(DecryptedZipRequest {
+            source: &source,
+            original_zip: Some(&src_path),
+            derive: &Upper,
+            output: &src_path,
+            force: true,
+            run: &RunInfo::default(),
+        })
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("source archive"), "{err}");
+    }
+
+    #[test]
+    fn a_taken_name_gets_a_number() {
+        let taken: HashSet<&str> = ["a/x.decrypted.db"].into_iter().collect();
+        assert_eq!(free_name("a/x.db", &taken, &[]), "a/x.decrypted.db-2");
+        assert_eq!(free_name("y", &HashSet::new(), &[]), "y.decrypted");
+    }
+}

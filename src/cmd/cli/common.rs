@@ -85,9 +85,12 @@ pub(crate) struct FilterArgs {
     pub(crate) exclude_media: bool,
 }
 
-/// Decryption inputs shared by `grep` and `diff` (`diff` adds per-side overrides).
+/// Where database keys come from: the key dump(s), the platform scope, or none.
+///
+/// Its own group so a command that decrypts databases but opens no backup
+/// (`app export` takes the backup password with its source) can reuse it.
 #[derive(Args, Clone)]
-pub(crate) struct DecryptArgs {
+pub(crate) struct KeyArgs {
     /// Keychain or keystore dump, to decrypt app databases (repeatable).
     #[arg(long = "keyfile", value_name = "FILE")]
     pub(crate) keyfile: Vec<PathBuf>,
@@ -103,6 +106,14 @@ pub(crate) struct DecryptArgs {
     /// Turn off decryption, even with a dump beside the source.
     #[arg(long = "no-decrypt")]
     pub(crate) no_decrypt: bool,
+}
+
+/// Decryption inputs shared by `grep`, `find` and `diff` (`diff` adds per-side
+/// overrides): the database keys, and the password of an encrypted backup.
+#[derive(Args, Clone)]
+pub(crate) struct DecryptArgs {
+    #[command(flatten)]
+    pub(crate) keys: KeyArgs,
 
     /// Password for an encrypted backup (or set MFSCAN_BACKUP_PASSWORD).
     #[arg(long = "backup-password", value_name = "PASSWORD")]

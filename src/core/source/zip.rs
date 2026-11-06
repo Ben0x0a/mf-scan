@@ -132,7 +132,7 @@ pub(crate) struct CdLocation {
 /// translated back into the buffer. The EOCD (and any ZIP64 EOCD record) sit at
 /// the very end, so a tail that reaches them is enough.
 pub(crate) fn find_cd_location(buf: &[u8], base: u64) -> Result<CdLocation> {
-    let eocd = find_eocd(buf).context("could not locate End Of Central Directory record")?;
+    let eocd = find_eocd(buf, base).context("could not locate End Of Central Directory record")?;
 
     let mut cd_offset = read_u32(buf, eocd + 16)? as u64;
     let mut cd_size = read_u32(buf, eocd + 12)? as u64;
@@ -408,6 +408,12 @@ fn local_data_offset(data: &[u8], local_offset: u64) -> Result<u64> {
     Ok(local_offset + 30 + name_len + extra_len)
 }
 
+/// Whether `tail`, the end of a file starting at file offset `base`, holds a
+/// consistent end-of-central-directory record.
+pub(crate) fn has_end_record(tail: &[u8], base: u64) -> bool {
+    find_eocd(tail, base).is_ok()
+}
+
 /// Scan backwards from the file tail for the EOCD signature.
 ///
 /// HOW: the EOCD can be followed by a comment of up to 65535 bytes, so we search
@@ -415,26 +421,63 @@ fn local_data_offset(data: &[u8], local_offset: u64) -> Result<u64> {
 /// stored comment length is consistent with the distance to end-of-file.
 /// WHY the consistency check: the signature bytes can legitimately appear
 /// inside a comment; the length check rejects those false positives.
-/// Whether `tail`, the end of a file, holds a consistent end-of-central-directory record.
-pub(crate) fn has_end_record(tail: &[u8]) -> bool {
-    find_eocd(tail).is_ok()
-}
-
-fn find_eocd(data: &[u8]) -> Result<usize> {
+///
+/// A record whose comment ends before the file does is also accepted when every
+/// byte after it is zero. WHY: some acquisition tools pad a small zip to a block
+/// size (a 64 KiB Android-Keystore dump zip, seen on a real extraction, ends in
+/// 32 KiB of zeros), and `unzip` reads such files. Zeros cannot hide a later
+/// record, and the nearest candidate to the end is taken first, so an exact match
+/// still wins over a padded one.
+///
+/// Failing both, a record followed by other bytes is accepted when the archive's own
+/// structure confirms it: a ZIP64 locator sits right before it, or the central
+/// directory it describes ends exactly where it starts. WHY: a Cellebrite `.ufdr`
+/// report appends a trailer of its own after the record (528 bytes on a real one),
+/// which Python's `zipfile` and 7-Zip accept. A stray signature inside such a
+/// trailer would fail both checks. `base` is the file offset of `data[0]`, needed
+/// to compare the directory's end, an absolute offset, with the record's position.
+fn find_eocd(data: &[u8], base: u64) -> Result<usize> {
     const EOCD_MIN: usize = 22;
     ensure!(data.len() >= EOCD_MIN, "file smaller than an EOCD record");
 
     let max_back = (EOCD_MIN + u16::MAX as usize).min(data.len());
     let start = data.len() - max_back;
-    for pos in (start..=data.len() - EOCD_MIN).rev() {
-        if read_u32(data, pos)? == SIG_EOCD {
-            let comment_len = read_u16(data, pos + 20)? as usize;
-            if pos + EOCD_MIN + comment_len == data.len() {
-                return Ok(pos);
-            }
+    let candidates = || {
+        (start..=data.len() - EOCD_MIN)
+            .rev()
+            .filter(|&pos| read_u32(data, pos).is_ok_and(|sig| sig == SIG_EOCD))
+    };
+    for pos in candidates() {
+        let comment_len = read_u16(data, pos + 20)? as usize;
+        let end = pos + EOCD_MIN + comment_len;
+        let zero_padded = || {
+            data.get(end..)
+                .is_some_and(|rest| rest.iter().all(|&b| b == 0))
+        };
+        if end == data.len() || (end < data.len() && zero_padded()) {
+            return Ok(pos);
+        }
+    }
+    for pos in candidates() {
+        if structurally_confirmed(data, base, pos)? {
+            return Ok(pos);
         }
     }
     bail!("no EOCD signature found in tail of file");
+}
+
+/// Whether the end record at `pos` is confirmed by the structure around it, not
+/// only by its signature (see [`find_eocd`]).
+fn structurally_confirmed(data: &[u8], base: u64, pos: usize) -> Result<bool> {
+    const ZIP64_LOCATOR_LEN: usize = 20;
+    if pos >= ZIP64_LOCATOR_LEN
+        && read_u32(data, pos - ZIP64_LOCATOR_LEN)? == SIG_ZIP64_EOCD_LOCATOR
+    {
+        return Ok(true);
+    }
+    let cd_size = u64::from(read_u32(data, pos + 12)?);
+    let cd_offset = u64::from(read_u32(data, pos + 16)?);
+    Ok(cd_offset.checked_add(cd_size) == Some(base + pos as u64))
 }
 
 // --- Bounds-checked little-endian readers ------------------------------------
@@ -654,7 +697,40 @@ impl Source for ZipSource<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::dos_to_unix;
+    use super::{SIG_EOCD, dos_to_unix, find_eocd};
+
+    /// An empty archive: a bare end-of-central-directory record.
+    fn bare_eocd() -> Vec<u8> {
+        let mut eocd = SIG_EOCD.to_le_bytes().to_vec();
+        eocd.extend_from_slice(&[0u8; 18]);
+        eocd
+    }
+
+    #[test]
+    fn end_record_followed_by_zero_padding_is_found() {
+        let mut data = bare_eocd();
+        assert_eq!(find_eocd(&data, 0).unwrap(), 0);
+        data.extend_from_slice(&[0u8; 4096]);
+        assert_eq!(find_eocd(&data, 0).unwrap(), 0, "zero padding is tolerated");
+    }
+
+    #[test]
+    fn a_trailer_after_a_consistent_end_record_is_accepted() {
+        // An empty archive's record says its (empty) directory ends at offset 0,
+        // which is where the record starts: confirmed, so a trailer may follow.
+        let mut data = bare_eocd();
+        data.extend_from_slice(b"\x00\x00a report tool's trailer");
+        assert_eq!(find_eocd(&data, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_trailer_after_an_unconfirmed_end_record_is_rejected() {
+        // A record whose directory would end elsewhere is a stray signature.
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&bare_eocd());
+        data.extend_from_slice(b"\x00\x00trailing garbage");
+        assert!(find_eocd(&data, 0).is_err());
+    }
 
     /// Pack a DOS date/time the way a ZIP central directory stores them.
     fn dos(y: u16, mo: u16, d: u16, h: u16, mi: u16, s: u16) -> (u16, u16) {

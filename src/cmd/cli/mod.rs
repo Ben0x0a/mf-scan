@@ -3,7 +3,7 @@
 //!
 //! Defines: [`Cli`], the [`Command`] subcommand enum, and [`parse`]; re-exports each
 //! subcommand's argument struct ([`GrepArgs`], [`ExportArgs`], [`DiffArgs`], ...) and the
-//! shared types/groups the orchestration layer reads ([`ColourWhen`], [`DecryptArgs`],
+//! shared types/groups the orchestration layer reads ([`ColourWhen`], [`KeyArgs`],
 //! [`ExportSink`]).
 //! Used by: `main` (parses `Cli`, dispatches `Command`) and `run` (reads the args).
 //! Uses: `clap` (derive) and the submodules below. Shared value types and the
@@ -12,6 +12,7 @@
 mod app;
 mod backup;
 mod common;
+pub(crate) mod decrypt;
 mod diff;
 mod examples;
 mod export;
@@ -24,7 +25,8 @@ pub(crate) use app::{
 pub(crate) use backup::{
     BackupArgs, BackupCommand, BackupInfoArgs, BackupRebuildArgs, BackupSourceArgs,
 };
-pub(crate) use common::{ColourWhen, DecryptArgs, ExportSink};
+pub(crate) use common::{ColourWhen, ExportSink, KeyArgs};
+pub(crate) use decrypt::DecryptCmdArgs;
 pub(crate) use diff::DiffArgs;
 pub(crate) use export::ExportArgs;
 pub(crate) use find::FindArgs;
@@ -69,6 +71,9 @@ pub(crate) enum Command {
     /// Inspect a mobile backup, or rebuild it into one .zip (iOS and Android).
     #[command(after_help = examples::BACKUP)]
     Backup(BackupArgs),
+    /// Decrypt app databases; with --to, write the source plus decrypted copies.
+    #[command(after_help = examples::DECRYPT)]
+    Decrypt(DecryptCmdArgs),
 }
 
 /// Parse the process's arguments, accepting `find`'s own spellings for `mf-scan find`.

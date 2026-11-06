@@ -9,8 +9,9 @@
 //!
 //! Format accepted: a property list holding keychain items as dictionaries that
 //! use the standard iOS keychain (SecItem) attribute short-names — `acct`
-//! (account), `svc` (service), `agrp` (access group), `labl` (label), `pdmn`
-//! (protection class), and `v_Data` (the value/key bytes). This is the
+//! (account), `svce` (service; `svc` also accepted), `agrp` (access group), `labl`
+//! (label), `pdmn` (protection class), and `v_Data` (the value/key bytes). Text
+//! attributes may be strings or UTF-8 data, as the keychain database stores them. This is the
 //! representation that open-source and several commercial tools export (iLEAPP,
 //! GrayKey, and any dump produced via `SecItemCopyMatching`). Items may be a root
 //! array or grouped under class keys (`genp`/`inet`/`keys`/`cert`): the loader
@@ -37,7 +38,10 @@ use super::{KeyfileProvider, Secret};
 
 /// iOS keychain attribute short-names we read off each item dictionary.
 const ACCOUNT_KEY: &str = "acct";
-const SERVICE_KEY: &str = "svc";
+/// The service attribute, as the keychain database itself names it.
+const SERVICE_KEY: &str = "svce";
+/// A shorter spelling some exports use for the service.
+const SERVICE_KEY_SHORT: &str = "svc";
 const ACCESS_GROUP_KEY: &str = "agrp";
 const LABEL_KEY: &str = "labl";
 const PROTECTION_CLASS_KEY: &str = "pdmn";
@@ -114,7 +118,7 @@ fn item_from_dict(dict: &Dictionary) -> Option<Secret> {
     let data = dict.get(VALUE_DATA_KEY)?.as_data()?.to_vec();
     Some(Secret {
         account: string_attr(dict, ACCOUNT_KEY),
-        service: string_attr(dict, SERVICE_KEY),
+        service: string_attr(dict, SERVICE_KEY).or_else(|| string_attr(dict, SERVICE_KEY_SHORT)),
         access_group: string_attr(dict, ACCESS_GROUP_KEY),
         label: string_attr(dict, LABEL_KEY),
         protection_class: string_attr(dict, PROTECTION_CLASS_KEY),
@@ -123,9 +127,18 @@ fn item_from_dict(dict: &Dictionary) -> Option<Secret> {
     })
 }
 
-/// Read dict key `key` as an owned string, when present and string-typed.
+/// Read dict key `key` as an owned string: a string, or UTF-8 data.
+///
+/// WHY data too: the keychain database stores these attributes as blobs, and dumps taken
+/// from it (a full-filesystem extraction's `*_keychain.plist`) keep them as `<data>`.
+/// Reading only strings left every service, account and group empty, so no item could
+/// match a profile.
 fn string_attr(dict: &Dictionary, key: &str) -> Option<String> {
-    dict.get(key)?.as_string().map(str::to_string)
+    match dict.get(key)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Data(bytes) => String::from_utf8(bytes.clone()).ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +243,31 @@ mod tests {
         assert_eq!(secrets[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(secrets[1].service.as_deref(), Some("WhatsApp"));
         assert_eq!(secrets[1].data, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn reads_svce_and_data_typed_attributes() {
+        // The layout of a full-filesystem extraction's keychain dump: the service is
+        // `svce`, and the text attributes are stored as data, not strings.
+        // R1JEQktleUNoYWluU2VydmljZQ== -> "GRDBKeyChainService"
+        // R1JEQkRhdGFiYXNlQ2lwaGVyS2V5U3BlYw== -> "GRDBDatabaseCipherKeySpec"
+        let dump = br#"<plist><dict><key>genp</key><array><dict>
+            <key>svce</key><data>R1JEQktleUNoYWluU2VydmljZQ==</data>
+            <key>acct</key><data>R1JEQkRhdGFiYXNlQ2lwaGVyS2V5U3BlYw==</data>
+            <key>agrp</key><string>U68MSDN6DR.org.whispersystems.signal</string>
+            <key>v_Data</key><data>3q2+7w==</data>
+        </dict></array></dict></plist>"#;
+        let secrets = KeychainPlist.load(dump).unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].service.as_deref(), Some("GRDBKeyChainService"));
+        assert_eq!(
+            secrets[0].account.as_deref(),
+            Some("GRDBDatabaseCipherKeySpec")
+        );
+        assert_eq!(
+            secrets[0].access_group.as_deref(),
+            Some("U68MSDN6DR.org.whispersystems.signal")
+        );
     }
 
     #[test]

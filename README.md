@@ -12,6 +12,11 @@ because acquisition ZIPs usually store entries **uncompressed** (STORED), there 
 nothing to decompress on the hot path. The same engine reads a folder of loose
 files and (with `--archive-depth`) the archives nested inside it.
 
+A Cellebrite `.ufdr` report is read as the zip it is. Its files keep the names the
+report gives them (`files/Database/…`), not device paths, and the databases Cellebrite
+decrypted are already there as `*.decrypted`, plain SQLite. A key dump inside it
+(`files/Configuration/<udid>_keychain.plist`) is found and used like one beside it.
+
 ```
 $ mf-scan grep 'IMSI' acquisition.zip
 private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
@@ -56,7 +61,10 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   type, with `find`'s own spellings accepted. See [`find`](#find).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
-- **Find base64-encoded values** (`--base64`), **decrypt app databases** (`--keyfile`).
+- **Find base64-encoded values** (`--base64`), **decrypt app databases** (`--keyfile`,
+  or a dump found beside the source). `--export` writes each decrypted database beside
+  its original, and `mf-scan decrypt --to OUT.zip` writes the whole acquisition with
+  the decrypted copies added. See [Decryption](#decryption).
 - **Transparent coverage**: every run logs what it skipped and why, prints a
   scanned/skipped summary, and writes a scan-report sidecar.
 - **Export matched (or changed) files out** with a re-ingestable manifest and a
@@ -135,6 +143,7 @@ with worked examples:
 | `diff A B` | Compare two sources (archives or folders): report added / removed / modified files, optionally what changed inside them, and optionally export the changed files. |
 | `app {grep\|paths\|export}` | Locate and export an application's data (iOS FFS / iOS backup / Android) — by bundle id / package, including widgets/extensions and App Groups. |
 | `backup {info\|rebuild}` | Inspect an iOS or Android backup, or rebuild it into one `.zip` of the device's directory tree. |
+| `decrypt SOURCE [--to OUT.zip]` | Decrypt app databases with a keychain/keystore dump; list them, or write the source plus each decrypted copy beside its original as one `.zip`. |
 
 ### Coming from grep
 
@@ -440,28 +449,30 @@ The same inspectors power `diff --inspect`'s intra-file comparison. See
 
 Encrypted app databases inside an acquisition can be decrypted using keys from a
 keychain/keystore dump, then searched and `--inspect`ed as plaintext. By default, when
-a `keychain`-named dump is found **beside the source** (e.g. `case.zip` next to
-`keychain.plist`), profile-matched databases are decrypted automatically; or point at
-one with `--keyfile FILE` (iOS keychain or Android keystore). Use `--no-decrypt` to
-turn it off.
+a `*keychain*` or `*keystore*` dump (zipped or not) is found **beside the source** (e.g.
+`case.zip` next to `keychain.plist`), profile-matched databases are decrypted
+automatically; or point at one with `--keyfile FILE` (iOS keychain plist or Android
+Keystore JSON). Use `--no-decrypt` to turn it off.
 
 ```bash
 mf-scan grep "needle" case.zip                          # auto-detect keyfile beside it
 mf-scan grep "token" case.zip --keyfile keychain.plist --platform ios
+mf-scan find case.zip --path '*grdb/signal.sqlite' --export out/   # + signal.decrypted.sqlite
+mf-scan decrypt case.zip --to case.decrypted.zip        # whole archive + decrypted copies
 ```
 
 Per-app **profiles** (`profiles/{ios,android}/*.yml`) say which database to decrypt,
-how to find its key, and the cipher. Supported ciphers: **SQLCipher** (Signal, Wickr,
-…) and **WhatsApp crypt12/14**. Every decryption is recorded in the scan report with
-the key's provenance and the SHA-256 of the ciphertext and plaintext.
+how to find its key, and the cipher. Supported ciphers: **SQLCipher** (Signal, Session,
+Samsung system apps), the **page-level AES-OFB** of Apple's Find My daemons, and
+**WhatsApp crypt12/14**. Every decryption is recorded in the scan report with the key's
+provenance and the SHA-256 of the ciphertext and plaintext.
 
 > **Scope:** only works on acquisitions whose keychain was *already decrypted* by the
 > acquisition tool (a raw `keychain-2.db` cannot be decrypted offline).
 >
-> **⚠ Validation:** the ciphers are assembled from documented formats and
-> round-trip-tested, but **not yet validated against real `sqlcipher`/WhatsApp
-> output** — see [docs/decryption.md](docs/decryption.md) before relying on a
-> decryption forensically.
+> **Validation:** SQLCipher and the Find My cipher are validated on real iPhone and
+> Samsung extractions; WhatsApp crypt14 is not yet. See
+> [docs/decryption.md](docs/decryption.md) before relying on a decryption forensically.
 
 ---
 

@@ -39,8 +39,8 @@ fn rebuild_fixture(
         })
         .collect();
     let export_plan = export::plan_tree(&files, &plan.roots);
-    let outcome =
-        export::export_files(&export_plan, &source, &files, dir, None, 0).expect("export succeeds");
+    let outcome = export::export_files(&export_plan, &source, &files, dir, None, 0, None)
+        .expect("export succeeds");
     let written = match outcome {
         ExportOutcome::Exported { report, .. } => {
             report.iter().map(|f| f.output_path.clone()).collect()

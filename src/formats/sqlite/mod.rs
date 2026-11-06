@@ -37,4 +37,6 @@ pub(crate) use page::{
 pub(crate) use record::{Col, Value, col_int, col_text, is_blob, parse_cell, serial_type_name};
 pub(crate) use schema::{Table, parse_column_spans, read_schema};
 pub(crate) use table::{read_table, read_table_with_rowid};
+#[cfg(test)]
+pub(crate) use wal::build_wal;
 pub(crate) use wal::checkpoint;

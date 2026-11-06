@@ -7,6 +7,8 @@
 //!   • `apps`   — locate & export an application's data (the `app` subcommand).
 //!   • `find`   — list files by name, size, date and type (the `find` subcommand).
 //!   • `rebuild` — map a backup back to device paths (the `backup rebuild` subcommand).
+//!   • `decrypting` — decrypt one entry of a source, its `-wal` included (shared by
+//!     `grep`, the exports and the `decrypt` subcommand).
 //! Used by: the binary's `cmd::run` orchestrators, and the integration tests.
 //! Uses: `crate::engine` (the shared drive logic these operations build on) plus the
 //! `core` / `formats` / `platform` / `decrypt` capability layers.
@@ -18,6 +20,7 @@
 //! `platform` / `formats`. This keeps each operation focused on its own logic.
 
 pub mod apps;
+pub mod decrypting;
 pub mod diff;
 pub mod find;
 pub mod rebuild;

@@ -18,6 +18,7 @@ use crate::core::source::Source;
 use crate::decrypt::{DecryptionContext, DecryptionRecord, TryOutcome};
 use crate::engine::Progress;
 use crate::formats::inspect;
+use crate::ops::decrypting::SourceDecryptor;
 
 use super::{MatchedFile, Query, search_bytes_capped};
 
@@ -202,7 +203,7 @@ pub(super) fn classify_entry(
     // left untouched and stay on the zero-copy path.
     let mut decryption: Option<DecryptionRecord> = None;
     if let Some(ctx) = decrypt {
-        match ctx.try_decrypt(&entry.name, &content) {
+        match SourceDecryptor::new(ctx, source).decrypt(entry, &content) {
             None => {}
             Some(TryOutcome::Decrypted(decrypted)) => {
                 decryption = Some(DecryptionRecord::decrypted(

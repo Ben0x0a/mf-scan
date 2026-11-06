@@ -82,6 +82,14 @@ decrypts and (where the cipher supports it) cryptographically verifies. A
 profile-matched entry that cannot be decrypted is **recorded as a failure and not
 searched** — its ciphertext holds no meaningful content.
 
+**The `-wal` sidecar.** A targeted database's uncommitted changes live in its
+`-wal`. Its committed frames are applied to the *ciphertext* before decrypting:
+SQLCipher and the Find My cipher write pages to the WAL already encrypted, and the
+WAL's checksums cover those encrypted bytes, so only the encrypted image can be
+replayed and checked. If the replayed image does not decrypt, the main file alone is
+tried, so a damaged WAL never hides the rest. The summary says `-wal replayed`, and
+the report records `wal_replayed: true`.
+
 Matches found in decrypted content are flagged `decrypted` in the output (txt
 `[decrypted]`, a `decrypted` field in JSON/CSV); their offsets are positions in the
 *plaintext*, so the archive byte offset is set to the entry's data start (as for
@@ -94,14 +102,30 @@ DEFLATE).
 Keys come from:
 
 - **A dump beside the archive** — by default, `mf-scan` scans the archive's
-  directory for a `keychain`-named dump (the common forensic layout: `case.zip`
-  next to `keychain.plist`). This is the usual path; no flag needed.
+  directory for a file named `*keychain*` or `*keystore*` (the common forensic
+  layout: `case.zip` next to `keychain.plist`, or an Android extraction next to
+  `<serial>_android_keystore.zip`). A zip is opened and its members tried, so a
+  zipped dump needs no unpacking. This is the usual path; no flag needed.
 - **`--keyfile FILE`** — point at a dump explicitly (repeatable). A parse failure
   here is reported (you named the file); auto-detected non-matches are silent.
 - **`--no-decrypt`** disables both.
 
 Decryption is **on by default** when a dump is present. `--platform ios|android`
 limits which profiles are considered.
+
+Dump formats read:
+
+| Format | Provider | Mapping onto a secret |
+|---|---|---|
+| iOS keychain plist (XML or binary; `genp`/`inet`/`keys`/`cert`) | `keychain-plist` | `svce`/`acct`/`agrp`/`labl`, as strings or data; value `v_Data` |
+| Android-Keystore JSON (keyed by package) | `android-keystore-json` | package → access group, `key_name` → account, `description` → label, `result_type` → service; value `decrypted_data` (hex) |
+
+In the Android dump, only items with `decrypted_data` carry a key (`Key Not Found`
+items are dropped). A profile selects an app's keystore items by
+`access_group: <package>`, the same field that selects an iOS app's keychain items.
+
+A profile may cover a whole folder (`databases/*.db`). A file there that is an
+ordinary SQLite database is searched as it is, not reported as a failed decryption.
 
 ---
 
@@ -149,12 +173,32 @@ Page-based AES-256-CBC with a per-page HMAC. Knobs (defaults follow SQLCipher 4)
 | `hmac` | sha512 | sha1 / sha256 / sha512 (v3 = sha1) |
 | `kdf` | sha512 | KDF PRF hash |
 | `use_hmac` | true | |
-| `plaintext_header_size` | 0 | cleartext prefix before the cipher data (not yet supported if > 0) |
+| `plaintext_header_size` | 0 | bytes of page 1 kept in the clear (`cipher_plaintext_header_size`; Signal and Session iOS use 32) |
 
 Key derivation: `key = PBKDF2(passphrase, file-salt, kdf_iter)`; a raw key is used
 directly (a 48-byte raw key is `key‖salt`, the Signal keyspec form). The HMAC key is
 `PBKDF2(key, salt⊕0x3a, 2)`. Page-1 HMAC verifies the key (a mismatch is treated as
-a *wrong key*); the result's `verified` flag reflects this.
+a *wrong key*); the result's `verified` flag reflects this. Page 1's HMAC covers
+the page from the end of the salt (or of the plaintext header), not from byte 0.
+
+With a plaintext header the file holds no salt, so the key must carry it: a 48-byte
+raw key spec. A 32-byte key or a passphrase is refused with that reason.
+
+### Page-level AES-OFB (`algorithm: page-aes-ofb`)
+
+Used by Apple's Find My daemons (`searchpartyd`, `findmylocated`,
+`findmybeaconingd`). No knobs: the page size and reserve come from the header.
+
+- Header bytes 16 to 23 (page size, versions, reserve = 12) are stored in the clear.
+- Each page's last 12 bytes are a nonce, stored in the clear.
+- The rest of the page is AES-256-OFB, IV = page number (little-endian u32) ‖ nonce.
+- The key is the raw 32-byte value of a keychain item in the daemon's access group;
+  its service names the store (`Observations`, `KeyDatabase` for
+  `ItemSharingKeys.db`, `CloudKitCache` for `CloudStorage_CKRecordCache.db`, …).
+
+Nothing authenticates the pages. The key is checked by page 1, whose first 16 bytes
+must decrypt to `SQLite format 3\0` (a wrong key passes with probability 2⁻¹²⁸), so
+`verified` means the key is right, not that every page is intact.
 
 ### WhatsApp crypt12/14 (`algorithm: whatsapp-crypt`)
 
@@ -187,6 +231,37 @@ Every decryption attempt is recorded:
 
 ---
 
+## Getting decrypted databases out
+
+| Want | Command | Output |
+|---|---|---|
+| decrypted copies in a folder | `find`, `grep` or `app export` with `--export DIR` | each original, its `-wal`/`-shm`, and `name.decrypted.ext` beside it |
+| the whole acquisition with decrypted copies | `mf-scan decrypt SOURCE --to OUT.zip` | one `.zip` and its `.sha256` sidecar |
+| only a list of what decrypts | `mf-scan decrypt SOURCE` | nothing written |
+
+A decrypted copy is named `.decrypted` before the extension (`signal.sqlite` →
+`signal.decrypted.sqlite`), so tools still open it by type. It already includes the
+committed `-wal` frames, so it is complete on its own. In an export report it is
+recorded with the original's internal path, its own hashes, and a `derived` note
+saying how it was decrypted (profile, key, `-wal replayed`).
+
+**`decrypt --to`.** When the source is a plain zip (a full-filesystem acquisition),
+the output begins as a byte-for-byte copy of it. Every original member keeps its
+offset, compression, CRC and timestamps, and its central-directory record is kept
+verbatim, then the decrypted copies are appended. Nothing is decompressed, so a
+20 GB acquisition took 3.5 minutes. Any other source (folder, tar, backup, or a zip
+holding an iOS backup) is re-packed STORED, each file with its own timestamp. Each copy
+takes its original's modification time. `_mf-scan/decryption.json` inside the archive
+lists every copy (both hashes, how it was decrypted) and every database that failed,
+with the reason. The run exits 1 if any targeted database failed.
+
+The decrypted copies' DOS time field is written in UTC, as in `backup rebuild`, and their
+exact UTC time is in the Info-ZIP extended timestamp. An acquisition may have written its
+own DOS fields in local time. The two then differ by the time-zone offset, while the
+extended timestamps agree.
+
+---
+
 ## CLI examples
 
 ```bash
@@ -198,21 +273,35 @@ mf-scan grep "token" case.zip --keyfile keychain.plist --platform ios
 
 # Plain grep, no decryption:
 mf-scan grep "needle" case.zip --no-decrypt
+
+# Export one app's databases with their decrypted copies beside them:
+mf-scan find case.zip --path '*grdb/signal.sqlite' --export out/
+
+# The whole acquisition, plus each decrypted database, as one zip:
+mf-scan decrypt case.zip --to case.decrypted.zip
 ```
 
 ---
 
 ## ⚠ Validation status
 
-The cryptographic assembly is covered by encrypt↔decrypt round-trip, tamper, and
-wrong-key tests, but **neither cipher has been validated against output from the
-real tool** (no `sqlcipher` binary / WhatsApp backup was available during
-development). Before relying on a decryption forensically:
+Every cipher is covered by encrypt↔decrypt round-trip, tamper and wrong-key tests.
+Validation against real evidence, an iPhone full-filesystem extraction (December
+2025) with the acquisition tool's keychain dump:
 
-- **SQLCipher**: generate a database with the real `sqlcipher` CLI (known key +
-  known content) and confirm `mf-scan` recovers it. The page-number is HMAC'd
-  little-endian (the de-facto convention) — a real fixture would confirm that.
-- **WhatsApp crypt14**: confirm against a genuine `.crypt14` + `key` file.
+- **SQLCipher**: validated. Signal (`signal.sqlite` and its encrypted `-wal`) and
+  Session (`Session.sqlite`) decrypt with every page's HMAC verifying, and their
+  message tables read back.
+- **SQLCipher with an Android-Keystore passphrase**: validated on a Samsung Galaxy A53
+  extraction and its keystore dump. Nine Samsung system databases (Rubin, Device
+  Quality Agent, Network Diagnostic, slocation) decrypt with every page HMAC
+  verifying, in all three copies Android keeps (`/data/data`, `/data/user/0`,
+  `/data_mirror`).
+- **Page-level AES-OFB**: validated. All 9 Find My databases decrypt with their
+  `-wal` replayed. An independent Python implementation produced the same SHA-256
+  for each, and SQLite's `PRAGMA integrity_check` returned `ok` on all of them.
+- **WhatsApp crypt14**: not yet validated. Confirm against a genuine `.crypt14` +
+  `key` file.
 
 Known gaps / follow-ups:
 
@@ -223,9 +312,14 @@ Known gaps / follow-ups:
 - **crypt15** (64-digit passphrase) is not implemented.
 - **Cellebrite-specific** keychain exports that differ from the standard SecItem
   plist need a real sample to add a dedicated provider.
-- **Shipped profile identifiers** (e.g. Signal's keychain service/account) are the
-  commonly documented values and carry `⚠ verify` notes — confirm against the
-  build under examination.
+- **Shipped profile identifiers** for Signal, Session and Find My were read from the
+  real keychain above. Older app builds may use other names (Signal used
+  `TSKeyChainService` / `OWSDatabaseCipherKeySpec`), which the profiles do not match.
+- **Android apps whose key the dump lacks.** The A53 dump reports `Key Not Found` for
+  Signal (`org.thoughtcrime.securesms`), so its database cannot be decrypted from it.
+- **EncryptedSharedPreferences.** The Android dump also holds Tink keysets that
+  protect `EncryptedSharedPreferences` XML files. Decrypting those files is not
+  implemented.
 
 ---
 

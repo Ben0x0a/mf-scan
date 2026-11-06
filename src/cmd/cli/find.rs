@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::cmd::cli::common::{ExportSink, IoModeArg};
+use crate::cmd::cli::common::{DecryptArgs, ExportSink, IoModeArg};
 use mf_scan::report::output::OutputFormat;
 
 /// Arguments for `find`.
@@ -122,13 +122,11 @@ pub(crate) struct FindArgs {
     )]
     pub(crate) io_mode: IoModeArg,
 
-    /// Password for an encrypted backup (or set MFSCAN_BACKUP_PASSWORD).
-    #[arg(
-        long = "backup-password",
-        value_name = "PASSWORD",
-        help_heading = "Sources"
-    )]
-    pub(crate) backup_password: Option<String>,
+    /// Keychain/keystore dump and backup password. A dump beside the source is found
+    /// on its own; with `--export`, each database it decrypts is also written
+    /// decrypted, beside the original.
+    #[command(flatten, next_help_heading = "Decryption")]
+    pub(crate) decrypt: DecryptArgs,
 
     #[command(flatten, next_help_heading = "Export")]
     pub(crate) sink: ExportSink,

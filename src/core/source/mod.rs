@@ -101,12 +101,13 @@ pub fn sniff_container(path: &Path) -> Result<Container> {
         .metadata()
         .with_context(|| format!("cannot read {}", path.display()))?
         .len();
-    file.seek(SeekFrom::Start(len.saturating_sub(ZIP_TAIL)))
+    let tail_base = len.saturating_sub(ZIP_TAIL);
+    file.seek(SeekFrom::Start(tail_base))
         .with_context(|| format!("cannot read {}", path.display()))?;
     let mut tail = Vec::new();
     file.read_to_end(&mut tail)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    Ok(if zip::has_end_record(&tail) {
+    Ok(if zip::has_end_record(&tail, tail_base) {
         Container::Zip
     } else {
         Container::Other

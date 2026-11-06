@@ -15,6 +15,8 @@ use anyhow::{Context, Result};
 
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
+use mf_scan::decrypt::DecryptionContext;
+use mf_scan::ops::decrypting::SourceDecryptor;
 use mf_scan::ops::search::{Findings, MatchedFile};
 use mf_scan::report::export::{
     self, ExportOutcome, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
@@ -30,8 +32,9 @@ pub(crate) fn export_if_requested(
     source: &dyn Source,
     findings: &Findings,
     run: &RunInfo,
+    decrypt: Option<&DecryptionContext>,
 ) -> Result<()> {
-    run_export_sink(sink, source, &findings.files, run, "matched")
+    run_export_sink(sink, source, &findings.files, run, "matched", decrypt)
 }
 
 /// Honour an export sink (`--manifest`/`--export`) for a list of files.
@@ -41,12 +44,16 @@ pub(crate) fn export_if_requested(
 /// the export report, and announce each step on stderr. `what` qualifies the
 /// files in the status lines ("matched" / "changed") so the cap/refusal
 /// behaviour can evolve in one place without the wordings drifting.
+///
+/// With `decrypt`, each exported database that decrypts also gets its decrypted copy
+/// written beside it (`name.decrypted.ext`).
 pub(crate) fn run_export_sink(
     sink: &ExportSink,
     source: &dyn Source,
     files: &[MatchedFile],
     run: &RunInfo,
     what: &str,
+    decrypt: Option<&DecryptionContext>,
 ) -> Result<()> {
     if sink.manifest.is_none() && sink.export.is_none() {
         return Ok(());
@@ -69,6 +76,7 @@ pub(crate) fn run_export_sink(
     }
 
     if let Some(dir) = &sink.export {
+        let decryptor = decrypt.map(|ctx| SourceDecryptor::new(ctx, source));
         match export::export_files(
             &plan,
             source,
@@ -76,6 +84,7 @@ pub(crate) fn run_export_sink(
             dir,
             Some(sink.max_size),
             sink.max_path_len,
+            decryptor.as_ref().map(|d| d as &dyn export::DerivedCopy),
         )? {
             ExportOutcome::Exported {
                 files: n,
@@ -96,6 +105,7 @@ pub(crate) fn run_export_sink(
                     "exported {n} {what} file(s) ({bytes} bytes) to {}",
                     dir.display()
                 );
+                report_decrypted_copies(&report);
                 report_integrity(&report);
                 report_skipped_too_long(&skipped_too_long);
                 report_portability_warnings(&portability_warnings);
@@ -110,6 +120,21 @@ pub(crate) fn run_export_sink(
     }
 
     Ok(())
+}
+
+/// Announce the decrypted copies an export wrote beside their originals.
+pub(crate) fn report_decrypted_copies(report: &[ExportedFile]) {
+    let copies: Vec<&ExportedFile> = report.iter().filter(|f| f.derived.is_some()).collect();
+    if copies.is_empty() {
+        return;
+    }
+    eprintln!(
+        "decrypted copies written beside their originals: {}",
+        copies.len()
+    );
+    for f in copies {
+        eprintln!("    {}", f.output_path);
+    }
 }
 
 /// Announce the export's integrity outcome on stderr.

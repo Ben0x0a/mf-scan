@@ -26,6 +26,7 @@ use mf_scan::report::output::OutputFormat;
 
 use crate::cmd::cli::FindArgs;
 use crate::cmd::run::EXIT_ERROR;
+use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
 use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
 use crate::cmd::support::sources::{
@@ -118,7 +119,14 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
         bail!("--export/--manifest require a single source");
     }
 
-    let backup_opts = BackupOptions::resolve(args.backup_password.as_deref());
+    let backup_opts = BackupOptions::resolve(args.decrypt.backup_password.as_deref());
+    // Only an export uses keys: a listing reads no file content.
+    let decrypt_ctx = if wants_export {
+        let paths: Vec<&std::path::Path> = sources.iter().map(|s| s.path.as_path()).collect();
+        build_decryption_context(&args.decrypt.keys, &paths)?
+    } else {
+        None
+    };
     let prov = BackupProvenance::new();
     let run = RunInfo {
         pattern: format!("find {}", query_summary(&args)),
@@ -189,7 +197,15 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
                             offsets: Vec::new(),
                         })
                         .collect();
-                    run_export_sink(&args.sink, source, &files, &run, "found")?;
+                    let source_ctx = context_for_source(decrypt_ctx.as_ref(), source);
+                    run_export_sink(
+                        &args.sink,
+                        source,
+                        &files,
+                        &run,
+                        "found",
+                        source_ctx.as_deref(),
+                    )?;
                 }
                 Ok(())
             },

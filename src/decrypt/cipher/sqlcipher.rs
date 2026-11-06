@@ -22,18 +22,21 @@
 //!     and its embedded salt overrides the file salt (the Signal keyspec form).
 //!   • `hmac_key = PBKDF2-HMAC-<kdf>(key, salt⊕0x3a, 2, 32)`.
 //!
-//! Per page: the HMAC is computed over `page[0 .. cipher+IV] || pgno_le32` and
+//! Per page: the HMAC is computed over `page[start .. cipher+IV] || pgno_le32` and
 //! compared to the stored HMAC; the cipher region is then AES-256-CBC decrypted
-//! with the page IV. Page 1's output is prefixed with the fixed SQLite header.
+//! with the page IV. `start` is 0, except on page 1, where it is the end of the salt
+//! (or of the plaintext header). Page 1's output is prefixed with the fixed SQLite
+//! header, or with the plaintext header when there is one.
 //!
-//! ⚠ Validation status: this is assembled from the documented algorithm and is
-//! covered by an encrypt↔decrypt round-trip plus tamper/wrong-key tests, but it
-//! has **not** yet been checked against a database produced by the real
-//! `sqlcipher` tool (none is available in this environment). A known-answer test
-//! against a real DB is required before relying on it forensically — see the test
-//! module for the exact `sqlcipher` commands to generate the fixture. The page
-//! number is HMAC'd little-endian (the de-facto SQLCipher convention); a real
-//! fixture would confirm that.
+//! Plaintext header (`cipher_plaintext_header_size`): some apps keep page 1's first
+//! bytes in the clear so iOS recognises the file as SQLite. The salt is then not in
+//! the file, so it must come from a 48-byte key spec.
+//!
+//! Validation status: checked against real databases, a Signal iOS and a Session iOS
+//! GRDB database from an iPhone full-filesystem extraction (December 2025), with
+//! every page's HMAC verifying. That confirmed the little-endian page number in the
+//! HMAC, and that page 1's HMAC excludes the salt or plaintext header. Other
+//! parameter sets (SQLCipher 3, SHA-1) are covered only by the round-trip tests.
 
 use aes::Aes256;
 use anyhow::{Result, bail, ensure};
@@ -89,11 +92,14 @@ impl DbDecryptor for SqlCipher {
 /// a caller trying several candidate keys can move on; a mismatch on a later page
 /// is treated as corruption (the key was right) and only lowers `verified`.
 fn decrypt_db(db: &[u8], key_material: &KeyMaterial, p: &SqlCipherParams) -> Result<DecryptedDb> {
-    // A cleartext header before the cipher data is rare and changes page indexing;
-    // reject it explicitly rather than silently decrypt the wrong bytes.
+    // Page 1 starts with bytes that are not encrypted: the salt, or, with
+    // `cipher_plaintext_header_size`, that many bytes of the ordinary SQLite header (so the
+    // OS can recognise the file). Either way the cipher region, and the HMAC, start after.
+    let header = p.plaintext_header_size;
+    let page1_offset = if header > 0 { header } else { SALT_SZ };
     ensure!(
-        p.plaintext_header_size == 0,
-        "sqlcipher plaintext_header_size > 0 is not yet supported"
+        header.is_multiple_of(BLOCK_SZ),
+        "sqlcipher plaintext_header_size {header} is not a multiple of {BLOCK_SZ}"
     );
 
     let page_size = p.page_size;
@@ -110,20 +116,22 @@ fn decrypt_db(db: &[u8], key_material: &KeyMaterial, p: &SqlCipherParams) -> Res
 
     let reserve = reserve_size(p);
     ensure!(
-        page_size > reserve + SALT_SZ,
+        page_size > reserve + page1_offset,
         "page_size {page_size} too small for reserve {reserve}"
     );
-    // `size` is the cipher-region length (also where the IV sits). It and the
-    // page-1 region (minus the salt) must be block-aligned or the params are wrong.
+    // `size` is where the cipher region ends and the IV sits. It and page 1's shorter
+    // region must be block-aligned or the params are wrong.
     let size = page_size - reserve;
     ensure!(
-        size.is_multiple_of(BLOCK_SZ) && (size - SALT_SZ).is_multiple_of(BLOCK_SZ),
+        size.is_multiple_of(BLOCK_SZ) && (size - page1_offset).is_multiple_of(BLOCK_SZ),
         "sqlcipher cipher region is not block-aligned (page_size/hmac mismatch?)"
     );
 
-    // Derive the encryption key (and the effective salt: a 48-byte raw keyspec
-    // carries its own).
-    let (enc_key, salt) = derive_key(key_material, &db[..SALT_SZ], p)?;
+    // Derive the encryption key and the effective salt. A plaintext header takes the
+    // salt's place in the file, so the salt must then come with the key (Signal's 48-byte
+    // keyspec carries it).
+    let file_salt = (header == 0).then(|| &db[..SALT_SZ]);
+    let (enc_key, salt) = derive_key(key_material, file_salt, p)?;
     let hmac_key = p.use_hmac.then(|| derive_hmac_key(&enc_key, &salt, p));
     let hlen = hmac_len(p.hmac);
 
@@ -136,12 +144,17 @@ fn decrypt_db(db: &[u8], key_material: &KeyMaterial, p: &SqlCipherParams) -> Res
         let page = &db[page_idx * page_size..(page_idx + 1) * page_size];
         let iv = &page[size..size + IV_SZ];
 
+        // Where this page's cipher region starts: after the salt or header on page 1.
+        let cipher_off = if pgno == 1 { page1_offset } else { 0 };
+
         if let Some(hk) = &hmac_key {
-            // HMAC covers the cipher region + IV (page[0..size+IV], salt included on
-            // page 1), then the little-endian page number.
+            // HMAC covers the cipher region + IV, then the little-endian page number.
+            // On page 1 it starts where the cipher region does: SQLCipher's codec hands
+            // its page routine the page from that offset, so the salt or plaintext
+            // header is not authenticated.
             let mac_end = size + IV_SZ;
             let stored = &page[mac_end..mac_end + hlen];
-            let ok = hmac_ok(p.hmac, hk, &page[..mac_end], pgno, stored);
+            let ok = hmac_ok(p.hmac, hk, &page[cipher_off..mac_end], pgno, stored);
             if !ok {
                 if pgno == 1 {
                     bail!(
@@ -153,15 +166,19 @@ fn decrypt_db(db: &[u8], key_material: &KeyMaterial, p: &SqlCipherParams) -> Res
             }
         }
 
-        // Cipher region: the whole `size` for later pages; after the salt on page 1.
-        let cipher_off = if pgno == 1 { SALT_SZ } else { 0 };
         let mut buf = page[cipher_off..size].to_vec();
         aes_cbc_decrypt(&enc_key, iv, &mut buf)?;
 
         // Reassemble the plaintext page: [SQLite header on pg 1] + decrypted region
-        // + the original reserve area (IV/HMAC bytes SQLite treats as reserved).
+        // + the original reserve area (IV/HMAC bytes SQLite treats as reserved). A
+        // plaintext header already is the start of the SQLite header; a salt stands in
+        // for its fixed first 16 bytes.
         if pgno == 1 {
-            out.extend_from_slice(SQLITE_HEADER);
+            if header > 0 {
+                out.extend_from_slice(&page[..header]);
+            } else {
+                out.extend_from_slice(SQLITE_HEADER);
+            }
         }
         out.extend_from_slice(&buf);
         out.extend_from_slice(&page[size..page_size]);
@@ -178,17 +195,27 @@ fn decrypt_db(db: &[u8], key_material: &KeyMaterial, p: &SqlCipherParams) -> Res
 ///
 /// A raw key is used directly (32 bytes), or split as `key(32)||salt(16)` for the
 /// 48-byte keyspec form (Signal), whose embedded salt overrides the file salt. A
-/// passphrase is stretched with PBKDF2 over the file salt.
+/// passphrase is stretched with PBKDF2 over the file salt. `file_salt` is `None` when
+/// a plaintext header occupies its place, and then only the 48-byte form can work.
 fn derive_key(
     key_material: &KeyMaterial,
-    file_salt: &[u8],
+    file_salt: Option<&[u8]>,
     p: &SqlCipherParams,
 ) -> Result<([u8; KEY_SZ], Vec<u8>)> {
+    let need_salt = || {
+        file_salt.map(<[u8]>::to_vec).ok_or_else(|| {
+            anyhow::anyhow!(
+                "this database has a plaintext header instead of a salt, so the key must \
+                 carry the salt: a {}-byte raw keyspec",
+                KEY_SZ + SALT_SZ
+            )
+        })
+    };
     match key_material {
         KeyMaterial::Raw(bytes) if bytes.len() == KEY_SZ => {
             let mut key = [0u8; KEY_SZ];
             key.copy_from_slice(bytes);
-            Ok((key, file_salt.to_vec()))
+            Ok((key, need_salt()?))
         }
         KeyMaterial::Raw(bytes) if bytes.len() == KEY_SZ + SALT_SZ => {
             let mut key = [0u8; KEY_SZ];
@@ -201,9 +228,10 @@ fn derive_key(
             bytes.len()
         ),
         KeyMaterial::Passphrase(pass) => {
+            let salt = need_salt()?;
             let mut key = [0u8; KEY_SZ];
-            pbkdf2(p.kdf, pass, file_salt, p.kdf_iter, &mut key);
-            Ok((key, file_salt.to_vec()))
+            pbkdf2(p.kdf, pass, &salt, p.kdf_iter, &mut key);
+            Ok((key, salt))
         }
     }
 }
@@ -349,22 +377,28 @@ pub(crate) fn encrypt_db(
     let size = page_size - reserve;
     let hlen = hmac_len(p.hmac);
     let hmac_key = derive_hmac_key(key, salt, p);
+    // With a plaintext header, page 1 keeps its first bytes in the clear instead of
+    // storing the salt, and the salt travels in the key spec.
+    let header = p.plaintext_header_size;
+    let page1_off = if header > 0 { header } else { SALT_SZ };
     let mut out = Vec::new();
     for (i, page) in pages.iter().enumerate() {
         assert_eq!(page.len(), page_size);
         let pgno = (i + 1) as u32;
         let iv = [0x11u8 ^ (i as u8); IV_SZ]; // deterministic per page for the test
-        let cipher_off = if pgno == 1 { SALT_SZ } else { 0 };
+        let cipher_off = if pgno == 1 { page1_off } else { 0 };
         let ct = aes_cbc_encrypt(key, &iv, &page[cipher_off..size]);
 
         let mut pb = vec![0u8; page_size];
-        if pgno == 1 {
+        if pgno == 1 && header > 0 {
+            pb[..header].copy_from_slice(&page[..header]);
+        } else if pgno == 1 {
             pb[..SALT_SZ].copy_from_slice(salt);
         }
         pb[cipher_off..size].copy_from_slice(&ct);
         pb[size..size + IV_SZ].copy_from_slice(&iv);
         if p.use_hmac {
-            let mac = hmac_compute(p.hmac, &hmac_key, &pb[..size + IV_SZ], pgno);
+            let mac = hmac_compute(p.hmac, &hmac_key, &pb[cipher_off..size + IV_SZ], pgno);
             pb[size + IV_SZ..size + IV_SZ + hlen].copy_from_slice(&mac[..hlen]);
         }
         out.extend_from_slice(&pb);
@@ -477,6 +511,43 @@ mod tests {
         let out = decrypt_db(&blob, &KeyMaterial::Raw(keyspec), &p).unwrap();
         assert!(out.verified);
         assert!(out.plaintext.windows(16).any(|w| w == b"PAGE2-needle-xyz"));
+    }
+
+    #[test]
+    fn plaintext_header_round_trips_with_a_48_byte_keyspec() {
+        // Signal iOS's layout: the first 32 bytes stay in the clear, so the salt
+        // comes from the key spec and page 1's HMAC starts after the header.
+        let mut p = params(true, HashAlgorithm::Sha512, HashAlgorithm::Sha512, 256_000);
+        p.plaintext_header_size = 32;
+        let key = [0x42u8; KEY_SZ];
+        let salt = [0x5au8; SALT_SZ];
+        let mut pages = plaintext_pages(p.page_size);
+        pages[0][16..32].copy_from_slice(b"clear-header-xyz");
+        let blob = encrypt_db(&pages, &key, &salt, &p);
+        assert_eq!(
+            &blob[..32],
+            &pages[0][..32],
+            "the header is stored in the clear"
+        );
+
+        let mut keyspec = key.to_vec();
+        keyspec.extend_from_slice(&salt);
+        let out = decrypt_db(&blob, &KeyMaterial::Raw(keyspec), &p).unwrap();
+        assert!(out.verified);
+        assert_eq!(&out.plaintext[..32], &pages[0][..32]);
+        assert!(out.plaintext.windows(16).any(|w| w == b"PAGE2-needle-xyz"));
+    }
+
+    #[test]
+    fn plaintext_header_needs_the_salt_in_the_key() {
+        // With a clear header there is no salt in the file, so a bare 32-byte key
+        // cannot be used, and must fail with a reason rather than decrypt garbage.
+        let mut p = params(true, HashAlgorithm::Sha512, HashAlgorithm::Sha512, 256_000);
+        p.plaintext_header_size = 32;
+        let key = [0x42u8; KEY_SZ];
+        let blob = encrypt_db(&plaintext_pages(p.page_size), &key, &[0x5au8; SALT_SZ], &p);
+        let err = decrypt_db(&blob, &KeyMaterial::Raw(key.to_vec()), &p).unwrap_err();
+        assert!(err.to_string().contains("48-byte"), "{err}");
     }
 
     #[test]

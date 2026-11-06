@@ -1,0 +1,34 @@
+# Session (iOS, by the Oxen/Loki project) — GRDB database encrypted with SQLCipher 4.
+#
+# Session iOS descends from Signal iOS and keeps its storage scheme: a GRDB SQLite
+# database in its App Group container, keyed by a 48-byte key spec in the keychain.
+#
+# Validated against a real iPhone full-filesystem extraction (December 2025):
+#   • the keychain item has account `GRDBDatabaseCipherKeySpec` and an empty service. The
+#     account alone is shared with Signal, so the access group, which is Session's team ID
+#     and bundle ID, is what selects Session's key.
+#   • its value is the 48-byte key spec: the 32-byte SQLCipher key, then the 16-byte salt.
+#   • the database keeps its first 32 bytes in plaintext, like Signal's, so the salt comes
+#     from the key spec.
+
+name: session-ios
+app: Session
+platform: ios
+description: Session iOS GRDB message database (SQLCipher 4, 32-byte plaintext header).
+
+db:
+  glob: "*/database/Session.sqlite"
+
+key:
+  encoding: raw
+  keychain:
+    account: GRDBDatabaseCipherKeySpec
+    access_group: SUQ8J2PCT7.com.loki-project.loki-messenger
+
+cipher:
+  algorithm: sqlcipher
+  page_size: 4096
+  kdf_iter: 256000
+  hmac: sha512
+  kdf: sha512
+  plaintext_header_size: 32

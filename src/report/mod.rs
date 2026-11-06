@@ -4,11 +4,13 @@
 //! and write the sidecar scan report), [`stats`] (the run's coverage tally),
 //! [`export`] (the file/manifest export engine that copies matched files out),
 //! [`diff`] (render a [`crate::ops::diff::DiffReport`]), [`zip_writer`] (a timestamp-
-//! preserving ZIP writer), and [`rebuild_zip`] (a backup rebuild's one output archive).
+//! preserving ZIP writer), [`rebuild_zip`] (a backup rebuild's one output archive), and
+//! [`decrypted_zip`] (an acquisition with its decrypted databases added).
 //! Used by: the binary's `support::{reporting, exporting}` and `run` commands; the
 //! engine fills [`stats`].
 //! Uses: the submodules below.
 
+pub mod decrypted_zip;
 pub mod diff;
 pub mod export;
 pub mod output;

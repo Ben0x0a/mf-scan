@@ -139,7 +139,7 @@ struct Traceability<'a> {
 }
 
 /// Removes the temporary archive unless it was moved into place.
-struct PartialFile(PathBuf);
+pub(crate) struct PartialFile(pub(crate) PathBuf);
 
 impl Drop for PartialFile {
     fn drop(&mut self) {
@@ -148,7 +148,7 @@ impl Drop for PartialFile {
 }
 
 /// Where the sidecar for `output` goes: `<name>.zip.sha256`.
-fn sidecar_path(output: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(output: &Path) -> PathBuf {
     let mut name = output.file_name().unwrap_or_default().to_os_string();
     name.push(".sha256");
     output.with_file_name(name)
@@ -274,6 +274,7 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
             copy_verified: true,
             stored_integrity,
             mtime_utc: file.entry.mtime.map(|m| UtcTime::from_unix(m).iso()),
+            derived: None,
         });
     }
 
@@ -352,7 +353,7 @@ fn write_manifest_members(
 /// Read the finished archive back with the tool's own reader, confirm it holds what was
 /// written, and hash it. Scoped so the map is gone before the file is moved: Windows
 /// refuses to rename a mapped file.
-fn check_and_hash(path: &Path, expected_members: usize) -> Result<String> {
+pub(crate) fn check_and_hash(path: &Path, expected_members: usize) -> Result<String> {
     let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     // SAFETY: a read-only map of a file this process just finished writing.
     let map = unsafe { memmap2::Mmap::map(&file) }
@@ -365,7 +366,7 @@ fn check_and_hash(path: &Path, expected_members: usize) -> Result<String> {
     Ok(sha256_hex(&map))
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

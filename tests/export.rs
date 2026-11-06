@@ -130,6 +130,7 @@ fn export_writes_files_under_their_folders() {
         dir.path(),
         None,
         0,
+        None,
     )
     .unwrap();
     match outcome {
@@ -176,6 +177,7 @@ fn export_includes_sqlite_sidecars() {
         dir.path(),
         None,
         0,
+        None,
     )
     .unwrap();
     match outcome {
@@ -205,6 +207,7 @@ fn export_report_attests_copy_and_zip_crc() {
         dir.path(),
         None,
         0,
+        None,
     )
     .unwrap();
     let report = match outcome {
@@ -288,6 +291,7 @@ fn export_refuses_when_over_max_size() {
         dir.path(),
         Some(10),
         0,
+        None,
     )
     .unwrap();
     match outcome {

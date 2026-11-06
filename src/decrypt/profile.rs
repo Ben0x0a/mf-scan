@@ -213,7 +213,16 @@ pub enum CipherSpec {
     /// WhatsApp crypt12/14 (AES-256-GCM over a zlib-compressed database, with the
     /// "backup encryption" key derivation and offset-guessed IV).
     WhatsappCrypt(WhatsappCryptParams),
+    /// Each page AES-256-OFB under a nonce in its reserved bytes (Apple's Find My
+    /// daemons). Page size and reserve come from the clear header, so it has no knobs.
+    PageAesOfb(PageAesOfbParams),
 }
+
+/// Page-level AES-OFB knobs: none. The page size and nonce length are read from the
+/// database's clear header bytes. An empty struct (not a unit variant) so the
+/// internally tagged `algorithm` field still deserialises into it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PageAesOfbParams {}
 
 /// WhatsApp crypt12/14 knobs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -257,8 +266,9 @@ pub struct SqlCipherParams {
     /// Whether pages carry an HMAC (default true). When false, no page auth.
     #[serde(default = "default_true")]
     pub use_hmac: bool,
-    /// Bytes of cleartext header before the encrypted region; some apps prepend a
-    /// custom header. 0 for a standard SQLCipher database.
+    /// Bytes of page 1 kept in the clear (SQLCipher's `cipher_plaintext_header_size`;
+    /// 32 for Signal and Session iOS). The salt then comes from a 48-byte key spec.
+    /// 0 for a standard SQLCipher database.
     #[serde(default)]
     pub plaintext_header_size: usize,
 }
@@ -306,7 +316,7 @@ impl Profile {
 }
 
 /// All profiles loaded from the `profiles/` directory.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProfileRegistry {
     profiles: Vec<Profile>,
 }

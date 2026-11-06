@@ -7,14 +7,17 @@
 //! handing the plaintext to the search/inspect pipeline.
 //! Uses: `crate::decrypt::profile::{CipherSpec, KeyMaterial}` and `anyhow`.
 //!
-//! One implementor per scheme — SQLCipher and WhatsApp crypt12/14 so far. Adding a
-//! scheme is adding a `DbDecryptor` and one [`decrypt`] dispatch arm.
+//! One implementor per scheme: SQLCipher, WhatsApp crypt12/14, and the page-level
+//! AES-OFB of Apple's Find My daemons. Adding a scheme is adding a `DbDecryptor` and
+//! one [`decrypt`] dispatch arm.
 
+pub(crate) mod page_ofb;
 pub(crate) mod sqlcipher;
 mod whatsapp;
 
 use anyhow::Result;
 
+pub use page_ofb::PageAesOfb;
 pub use sqlcipher::SqlCipher;
 pub use whatsapp::WhatsappCrypt;
 
@@ -57,5 +60,6 @@ pub fn decrypt(ciphertext: &[u8], key: &KeyMaterial, spec: &CipherSpec) -> Resul
     match spec {
         CipherSpec::Sqlcipher(_) => SqlCipher.decrypt(ciphertext, key, spec),
         CipherSpec::WhatsappCrypt(_) => WhatsappCrypt.decrypt(ciphertext, key, spec),
+        CipherSpec::PageAesOfb(_) => PageAesOfb.decrypt(ciphertext, key, spec),
     }
 }

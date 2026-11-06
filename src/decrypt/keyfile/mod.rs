@@ -16,6 +16,7 @@
 //! rest of the pipeline format- and platform-agnostic — adding a source is adding
 //! one [`KeyfileProvider`], nothing else.
 
+mod android_keystore_json;
 mod keychain_plist;
 
 use anyhow::{Result, bail};
@@ -52,7 +53,7 @@ impl Secret {
 }
 
 /// A collection of secrets, queryable by [`KeychainMatch`] criteria.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SecretStore {
     items: Vec<Secret>,
 }
@@ -81,6 +82,19 @@ impl SecretStore {
     /// Merge another store's items in — e.g. several dump files for one device.
     pub fn merge(&mut self, other: SecretStore) {
         self.items.extend(other.items);
+    }
+
+    /// Merge another store's items in, skipping any already held. WHY: the same
+    /// keychain can be both beside an extraction and inside it (a Cellebrite report
+    /// carries one), and trying each key twice would only cost time.
+    pub fn merge_new(&mut self, other: SecretStore) -> usize {
+        let before = self.items.len();
+        for item in other.items {
+            if !self.items.contains(&item) {
+                self.items.push(item);
+            }
+        }
+        self.items.len() - before
     }
 
     /// Every secret matching `m`: each *set* criterion equals the secret's field.
@@ -126,20 +140,39 @@ pub trait KeyfileProvider: Sync {
 
 /// Every keychain provider, tried in detection order. Add a source by adding its
 /// loader here.
-static PROVIDERS: &[&dyn KeyfileProvider] = &[&keychain_plist::KeychainPlist];
+static PROVIDERS: &[&dyn KeyfileProvider] = &[
+    &keychain_plist::KeychainPlist,
+    &android_keystore_json::AndroidKeystoreJson,
+];
 
 /// The first provider whose `detect` recognises `content`, if any.
 fn provider_for(content: &[u8]) -> Option<&'static dyn KeyfileProvider> {
     PROVIDERS.iter().copied().find(|p| p.detect(content))
 }
 
+/// The largest zip member read when looking for a dump inside a zip.
+const MAX_WRAPPED_DUMP: u64 = 256 * 1024 * 1024;
+
 /// Load a keychain/keystore dump by auto-detecting its format.
 ///
-/// Returns the secrets from the first provider whose `detect` matches. An
-/// unrecognised dump is an error: we will not guess a format for key material.
-/// Use this for a dump the operator named explicitly (`--keyfile`), where a
-/// parse failure should be reported rather than silently ignored.
+/// Returns the secrets from the first provider whose `detect` matches. A zip is opened
+/// and each member it holds is tried, because acquisition tools ship some dumps zipped
+/// (`<serial>_android_keystore.zip`). An unrecognised dump is an error: we will not
+/// guess a format for key material. Use this for a dump the operator named explicitly
+/// (`--keyfile`), where a parse failure should be reported rather than silently ignored.
 pub fn load_dump(content: &[u8]) -> Result<SecretStore> {
+    if let Some(members) = zip_members(content) {
+        let mut store = SecretStore::default();
+        for member in members {
+            if let Some(found) = load_if_dump(&member) {
+                store.merge(found);
+            }
+        }
+        if store.is_empty() {
+            bail!("no member of this zip is a recognised keychain/keystore dump");
+        }
+        return Ok(store);
+    }
     match provider_for(content) {
         Some(provider) => Ok(SecretStore::new(provider.load(content)?)),
         None => {
@@ -148,14 +181,42 @@ pub fn load_dump(content: &[u8]) -> Result<SecretStore> {
     }
 }
 
-/// Load `content` as a keychain dump only if a provider recognises it.
+/// Load `content` as a keychain dump only if a provider recognises it (a zip's
+/// members included).
 ///
 /// `None` when no provider claims it (or it failed to parse) — the quiet variant
 /// for auto-detection, where most files scanned are *not* keychain dumps and a
 /// non-match is the normal case, not an error.
 pub fn load_if_dump(content: &[u8]) -> Option<SecretStore> {
+    if let Some(members) = zip_members(content) {
+        let mut store = SecretStore::default();
+        for member in members {
+            if let Some(found) = load_if_dump(&member) {
+                store.merge(found);
+            }
+        }
+        return (!store.is_empty()).then_some(store);
+    }
     let provider = provider_for(content)?;
     provider.load(content).ok().map(SecretStore::new)
+}
+
+/// The files inside `content` when it is a zip, else `None`. Members larger than
+/// [`MAX_WRAPPED_DUMP`] are skipped: no dump is that large, and reading one would
+/// only waste memory.
+fn zip_members(content: &[u8]) -> Option<Vec<Vec<u8>>> {
+    use crate::core::source::Source;
+    if !content.starts_with(b"PK\x03\x04") {
+        return None;
+    }
+    let zip = crate::core::source::zip::ZipSource::open(content).ok()?;
+    Some(
+        zip.entries()
+            .iter()
+            .filter(|e| !e.is_dir() && e.uncompressed_size <= MAX_WRAPPED_DUMP)
+            .filter_map(|e| zip.content(e).ok().map(|c| c.to_vec()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]

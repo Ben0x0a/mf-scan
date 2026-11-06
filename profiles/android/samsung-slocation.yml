@@ -1,0 +1,29 @@
+# Samsung Location (slocation) (Android system app) — SQLCipher database keyed by the Android Keystore.
+#
+# Validated against a real Samsung Galaxy A53 full-filesystem extraction (December
+# 2025) and its Android-Keystore dump: page 1's HMAC verifies with this key.
+#   • the key is an Android-Keystore "Data Blob" of package `com.samsung.android.location` (description `/data/system/slocation/key.dat`); the database itself sits in `/data/system`. Its decrypted
+#     bytes (64 or 256 of them) are the SQLCipher passphrase, as they are, not text.
+#   • the cipher uses SQLCipher 2's parameters: PBKDF2-HMAC-SHA1 with 4000 rounds,
+#     an HMAC-SHA1 per page, and 4096-byte pages.
+#   • the database's `-se` sidecar starts with the same 16-byte salt as the file.
+
+name: samsung-slocation-android
+app: Samsung Location (slocation)
+platform: android
+description: Samsung Location (slocation) database (SQLCipher, Android-Keystore passphrase).
+
+db:
+  glob: "*/data/system/slocation.db"
+
+key:
+  encoding: passphrase
+  keychain:
+    access_group: com.samsung.android.location
+
+cipher:
+  algorithm: sqlcipher
+  page_size: 4096
+  kdf_iter: 4000
+  hmac: sha1
+  kdf: sha1

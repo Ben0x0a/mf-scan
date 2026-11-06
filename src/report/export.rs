@@ -134,6 +134,45 @@ pub struct ExportedFile {
     /// backup rebuild, so the report states the time each archive member must carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime_utc: Option<String>,
+    /// Set on a file the export derived from `internal_path` rather than copied,
+    /// such as a decrypted database: how it was produced. Its hashes are of the
+    /// derived bytes, so the copy check still attests what landed on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<String>,
+}
+
+/// Produces a file derived from an exported one, written beside it (a decrypted
+/// copy of an encrypted database, for one).
+///
+/// WHY a trait here: the report layer writes and attests files but does not know how
+/// to decrypt. The caller supplies the transform; this module names the copy, writes
+/// it, hashes it and records it like any other exported file.
+pub trait DerivedCopy: Sync {
+    /// Whether `entry` may have a derived form. A cheap test on the entry alone, so a
+    /// caller walking a whole archive reads only the files it applies to.
+    fn wants(&self, entry: &Entry) -> bool;
+
+    /// The derived bytes for `entry`, whose stored bytes are `content`: `None` when it
+    /// has no derived form, `Some(Err(reason))` when it should have had one but could
+    /// not be produced (a database whose key did not verify).
+    fn derive(&self, entry: &Entry, content: &[u8])
+    -> Option<std::result::Result<Derived, String>>;
+}
+
+/// One derived file: its bytes, and how they were produced (for the report).
+pub struct Derived {
+    pub bytes: Vec<u8>,
+    pub note: String,
+}
+
+/// The file name of a decrypted copy: `.decrypted` before the extension, so the copy
+/// keeps the extension tools open it by (`signal.sqlite` → `signal.decrypted.sqlite`).
+/// A name with no extension, or only a leading dot, gets the suffix at the end.
+pub fn decrypted_name(name: &str) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{}.decrypted{}", &name[..dot], &name[dot..]),
+        _ => format!("{name}.decrypted"),
+    }
 }
 
 /// The serialisable form of [`crate::core::source::IntegrityCheck`] for the report.
@@ -613,6 +652,8 @@ pub fn write_manifest(plan: &ExportPlan, run: &RunInfo, w: &mut dyn Write) -> Re
 /// hands the located entry + paths to [`write_one`](Self::write_one).
 struct FileExporter<'a> {
     source: &'a dyn Source,
+    /// Writes a derived copy (a decrypted database) beside each file that has one.
+    derive: Option<&'a dyn DerivedCopy>,
     /// The full entry list, so a written file's declared sidecars can be fetched.
     by_path: &'a HashMap<&'a str, &'a Entry>,
     dir: &'a Path,
@@ -632,6 +673,7 @@ impl<'a> FileExporter<'a> {
     ) -> Self {
         FileExporter {
             source,
+            derive: None,
             by_path,
             dir,
             max_path_len,
@@ -687,8 +729,26 @@ impl<'a> FileExporter<'a> {
             integrity,
         )?);
 
-        // Sidecars to export come from the file's inspector (e.g. SQLite's -wal).
-        let suffixes = crate::formats::inspect::sidecars_for(internal_path, &content);
+        // A derived copy (a decrypted database) goes beside the original.
+        // A failure is not recorded here: the search or run summary reports it.
+        let derived = self
+            .derive
+            .filter(|d| d.wants(entry))
+            .and_then(|d| d.derive(entry, &content))
+            .and_then(std::result::Result::ok);
+        if let Some(derived) = &derived {
+            self.write_derived(internal_path, output_path, dest, derived)?;
+        }
+
+        // Sidecars to export come from the file's inspector (e.g. SQLite's -wal). An
+        // encrypted database is not recognised as SQLite, so its decrypted form names
+        // them instead: its -wal is evidence even though the copy already applied it.
+        let mut suffixes = crate::formats::inspect::sidecars_for(internal_path, &content);
+        if suffixes.is_empty()
+            && let Some(derived) = &derived
+        {
+            suffixes = crate::formats::inspect::sidecars_for(internal_path, &derived.bytes);
+        }
         let mut sidecars = export_sidecars(
             self.source,
             self.by_path,
@@ -699,6 +759,51 @@ impl<'a> FileExporter<'a> {
         )?;
         self.bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
         self.report.append(&mut sidecars);
+        Ok(())
+    }
+
+    /// Write `derived` beside `dest` (the original's destination) and record it.
+    ///
+    /// The same path-length guard as the original applies. The record keeps the
+    /// original's internal path and says, in `derived`, how the bytes were produced.
+    fn write_derived(
+        &mut self,
+        internal_path: &str,
+        output_path: &str,
+        dest: &Path,
+        derived: &Derived,
+    ) -> Result<()> {
+        let name = dest
+            .file_name()
+            .map(|n| decrypted_name(&n.to_string_lossy()))
+            .unwrap_or_else(|| decrypted_name("unnamed"));
+        let derived_dest = dest.with_file_name(&name);
+        let derived_output = match output_path.rsplit_once('/') {
+            Some((folder, _)) => format!("{folder}/{name}"),
+            None => name.clone(),
+        };
+        if let PathCheck::Skip(reason) =
+            check_export_path(self.dir, &derived_output, self.max_path_len)
+        {
+            self.skipped_too_long.push(SkippedFile {
+                internal_path: internal_path.to_string(),
+                output_path: derived_output,
+                reason,
+            });
+            return Ok(());
+        }
+        fs::write(&derived_dest, &derived.bytes)
+            .with_context(|| format!("cannot write {}", derived_dest.display()))?;
+        self.bytes += derived.bytes.len() as u64;
+        let mut record = exported_file(
+            internal_path,
+            &derived_dest,
+            self.dir,
+            &derived.bytes,
+            StoredIntegrity::Unrecorded,
+        )?;
+        record.derived = Some(derived.note.clone());
+        self.report.push(record);
         Ok(())
     }
 
@@ -722,6 +827,9 @@ impl<'a> FileExporter<'a> {
 /// When `max_size` is set and the total exceeds it, nothing is written and
 /// `Refused` is returned — the caller can still have written the manifest, so
 /// the operator can inspect the total and adjust before retrying.
+///
+/// With `derive`, each file that has a derived form (a decrypted database) also gets
+/// that copy written beside it.
 pub fn export_files(
     plan: &ExportPlan,
     source: &dyn Source,
@@ -729,6 +837,7 @@ pub fn export_files(
     dir: &Path,
     max_size: Option<u64>,
     max_path_len: usize,
+    derive: Option<&dyn DerivedCopy>,
 ) -> Result<ExportOutcome> {
     if let Some(cap) = max_size
         && plan.total_size > cap
@@ -747,6 +856,7 @@ pub fn export_files(
         .collect();
 
     let mut exporter = FileExporter::new(source, &by_path, dir, max_path_len);
+    exporter.derive = derive;
     for (item, file) in plan.items.iter().zip(files) {
         let dest = dir.join(&item.folder).join(&item.name);
         exporter.write_one(&file.entry, &file.entry.name, &item.output_path(), &dest)?;
@@ -875,6 +985,7 @@ fn exported_file(
         copy_verified,
         stored_integrity,
         mtime_utc: None,
+        derived: None,
     })
 }
 

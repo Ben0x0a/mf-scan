@@ -168,6 +168,38 @@ fn be32(bytes: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_be_bytes(raw))
 }
 
+/// Build a little-endian-checksum WAL holding `frames` (page number, page bytes), with
+/// a commit on the last frame recording `db_pages` (test helper for other modules).
+#[cfg(test)]
+pub(crate) fn build_wal(page_size: usize, frames: &[(u32, &[u8])], db_pages: u32) -> Vec<u8> {
+    let (salt1, salt2) = (0x1111_2222u32, 0x3333_4444u32);
+    let mut wal = Vec::new();
+    wal.extend_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+    wal.extend_from_slice(&3_007_000u32.to_be_bytes());
+    wal.extend_from_slice(&(page_size as u32).to_be_bytes());
+    wal.extend_from_slice(&0u32.to_be_bytes());
+    wal.extend_from_slice(&salt1.to_be_bytes());
+    wal.extend_from_slice(&salt2.to_be_bytes());
+    let mut sum = accumulate((0, 0), &wal[..24], false).unwrap();
+    wal.extend_from_slice(&sum.0.to_be_bytes());
+    wal.extend_from_slice(&sum.1.to_be_bytes());
+    for (i, (page_no, page)) in frames.iter().enumerate() {
+        assert_eq!(page.len(), page_size);
+        let commit = if i + 1 == frames.len() { db_pages } else { 0 };
+        let mut head = Vec::new();
+        head.extend_from_slice(&page_no.to_be_bytes());
+        head.extend_from_slice(&commit.to_be_bytes());
+        sum = accumulate(sum, &head, false).unwrap();
+        sum = accumulate(sum, page, false).unwrap();
+        for word in [salt1, salt2, sum.0, sum.1] {
+            head.extend_from_slice(&word.to_be_bytes());
+        }
+        wal.extend_from_slice(&head);
+        wal.extend_from_slice(page);
+    }
+    wal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

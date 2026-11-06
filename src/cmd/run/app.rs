@@ -15,6 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
 use mf_scan::ops::apps::{AppCatalog, AppContainer, ContainerKind, Platform, SigningRecord};
+use mf_scan::ops::decrypting::SourceDecryptor;
 use mf_scan::ops::search::MatchedFile;
 use mf_scan::report::export::{self, ExportOutcome};
 use mf_scan::report::output::OutputFormat;
@@ -22,9 +23,10 @@ use mf_scan::report::output::OutputFormat;
 use crate::cmd::cli::{
     AppArgs, AppCommand, AppExportArgs, AppGrepArgs, AppPathsArgs, AppSourceArgs,
 };
+use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
 use crate::cmd::support::exporting::{
-    report_integrity, report_portability_warnings, report_skipped_too_long,
-    write_export_report_file,
+    report_decrypted_copies, report_integrity, report_portability_warnings,
+    report_skipped_too_long, write_export_report_file,
 };
 use crate::cmd::support::reporting::{emit, report_verify, sha256_hex};
 use crate::cmd::support::sources::{
@@ -127,6 +129,14 @@ fn run_export(args: AppExportArgs) -> Result<()> {
         }
         let run = app_run_info(&args.bundle_id, &containers, platform, path);
 
+        // Keys from a dump beside the source (or --keyfile) give each app database
+        // a decrypted copy beside its original.
+        let decrypt_ctx = build_decryption_context(&args.keys, &[args.source.source.as_path()])?;
+        let source_ctx = context_for_source(decrypt_ctx.as_ref(), source);
+        let decryptor = source_ctx
+            .as_deref()
+            .filter(|ctx| ctx.has_secrets())
+            .map(|ctx| SourceDecryptor::new(ctx, source));
         match export::export_files(
             &plan,
             source,
@@ -134,6 +144,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
             &args.to,
             Some(args.max_size),
             args.max_path_len,
+            decryptor.as_ref().map(|d| d as &dyn export::DerivedCopy),
         )? {
             ExportOutcome::Exported {
                 files: n,
@@ -157,6 +168,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                     args.to.display()
                 );
                 report_group_attribution(&containers);
+                report_decrypted_copies(&report);
                 report_integrity(&report);
                 report_skipped_too_long(&skipped_too_long);
                 report_portability_warnings(&portability_warnings);

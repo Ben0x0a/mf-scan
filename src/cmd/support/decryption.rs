@@ -2,11 +2,12 @@
 //!
 //! Defines: [`build_decryption_context`] (load the profile registry + keyfile
 //! dumps into a [`DecryptionContext`]) and [`report_decryptions`] (the stderr
-//! audit-trail summary). Takes the shared [`crate::cmd::cli::DecryptArgs`] group, so
+//! audit-trail summary). Takes the shared [`crate::cmd::cli::KeyArgs`] group, so
 //! both `grep` and `diff` reuse it unchanged.
 //! Used by: `run::grep` (and `run::diff`). Uses: `mf_scan::decrypt` (the library
 //! decryption types) and `crate::cmd::cli`.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,7 +17,10 @@ use mf_scan::decrypt::{
     load_dump, load_if_dump,
 };
 
-use crate::cmd::cli::DecryptArgs;
+use mf_scan::core::source::Source;
+use mf_scan::ops::decrypting::dumps_in_source;
+
+use crate::cmd::cli::KeyArgs;
 
 /// Build the decryption context from `--keyfile` dumps, an auto-detected keyfile
 /// next to the archive, and the profile registry.
@@ -28,7 +32,7 @@ use crate::cmd::cli::DecryptArgs;
 /// secrets were found. Messages are loud when the operator named a keyfile explicitly
 /// and quiet for the automatic path (where finding nothing is the normal case).
 pub(crate) fn build_decryption_context(
-    decrypt: &DecryptArgs,
+    decrypt: &KeyArgs,
     archive_paths: &[&Path],
 ) -> Result<Option<DecryptionContext>> {
     if decrypt.no_decrypt {
@@ -76,15 +80,42 @@ pub(crate) fn build_decryption_context(
         autodetect_in_dir(dir, &mut secrets);
     }
 
-    if secrets.is_empty() {
-        if explicit {
-            eprintln!("decrypt: keyfile dump(s) contained no secrets; nothing to decrypt");
-        }
-        return Ok(None);
+    // No secrets yet is not the end: the source may carry its own dump, which
+    // `context_for_source` adds once it is open. The search drops a context that still
+    // holds no secrets, so this costs nothing when there are none.
+    if secrets.is_empty() && explicit {
+        eprintln!("decrypt: keyfile dump(s) contained no secrets");
     }
 
     let platform = decrypt.platform.map(|p| p.to_platform());
     Ok(Some(DecryptionContext::new(registry, secrets, platform)))
+}
+
+/// The context for one open source: `base`, plus any key dump the source carries
+/// inside it (announced on stderr). Borrowed when the source carries none.
+pub(crate) fn context_for_source<'a>(
+    base: Option<&'a DecryptionContext>,
+    source: &dyn Source,
+) -> Option<Cow<'a, DecryptionContext>> {
+    let base = base?;
+    let found = dumps_in_source(source);
+    if found.is_empty() {
+        return Some(Cow::Borrowed(base));
+    }
+    let mut more = SecretStore::default();
+    for dump in found {
+        eprintln!(
+            "decrypt: key dump inside the source: {} ({} secret(s))",
+            dump.path,
+            dump.secrets.len()
+        );
+        more.merge(dump.secrets);
+    }
+    let (ctx, added) = base.with_more_secrets(more);
+    if added == 0 {
+        eprintln!("decrypt: (its secrets are already loaded)");
+    }
+    Some(Cow::Owned(ctx))
 }
 
 /// The unique parent directories of the given archive paths (each scanned once).
@@ -102,10 +133,16 @@ fn unique_parents<'a>(archive_paths: &[&'a Path]) -> Vec<&'a Path> {
     dirs
 }
 
+/// Words in a file name that mark it as a possible keychain/keystore dump.
+const DUMP_NAME_HINTS: &[&str] = &["keychain", "keystore"];
+/// The largest file auto-detection reads as a possible dump.
+const MAX_AUTODETECT_DUMP: u64 = 256 * 1024 * 1024;
+
 /// Merge into `secrets` any keychain dump found in `dir`.
 ///
-/// Scans for regular files whose name contains "keychain" (case-insensitive) and
-/// that a provider recognises as a dump. A non-match is silent — most files are not
+/// Scans for regular files whose name contains "keychain" or "keystore"
+/// (case-insensitive) and that a provider recognises as a dump, a zip holding one
+/// included (an Android extraction ships `<serial>_android_keystore.zip`). A non-match is silent — most files are not
 /// keychains; only a successful load is announced. Errors reading the directory or
 /// a file are ignored: auto-detection is best-effort and never fails the search.
 fn autodetect_in_dir(dir: &Path, secrets: &mut SecretStore) {
@@ -117,11 +154,16 @@ fn autodetect_in_dir(dir: &Path, secrets: &mut SecretStore) {
         if !path.is_file() {
             continue;
         }
-        let is_candidate = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.to_ascii_lowercase().contains("keychain"));
-        if !is_candidate {
+        let is_candidate = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            let n = n.to_ascii_lowercase();
+            DUMP_NAME_HINTS.iter().any(|hint| n.contains(hint))
+        });
+        // A dump is small; a large file with a matching name (an extraction named
+        // after its keychain, say) is not one, and reading it would waste memory.
+        let small = entry
+            .metadata()
+            .is_ok_and(|m| m.len() <= MAX_AUTODETECT_DUMP);
+        if !is_candidate || !small {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
@@ -129,7 +171,7 @@ fn autodetect_in_dir(dir: &Path, secrets: &mut SecretStore) {
         };
         if let Some(store) = load_if_dump(&bytes) {
             eprintln!(
-                "decrypt: auto-detected keychain {} ({} secret(s))",
+                "decrypt: auto-detected key dump {} ({} secret(s))",
                 path.display(),
                 store.len()
             );
@@ -164,13 +206,15 @@ pub(crate) fn report_decryptions(decryptions: &[DecryptionRecord]) {
                 secret_source,
                 secret_service,
                 secret_account,
+                wal_replayed,
                 ..
             } => {
                 let mark = if *verified { "verified" } else { "UNVERIFIED" };
                 let svc = secret_service.as_deref().unwrap_or("?");
                 let acct = secret_account.as_deref().unwrap_or("?");
+                let wal = if *wal_replayed { ", -wal replayed" } else { "" };
                 eprintln!(
-                    "  {} [{}]  {mark}  (key svc={svc} acct={acct}, src={secret_source})",
+                    "  {} [{}]  {mark}{wal}  (key svc={svc} acct={acct}, src={secret_source})",
                     d.path, d.app
                 );
             }

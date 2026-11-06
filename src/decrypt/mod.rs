@@ -32,6 +32,6 @@ pub mod keyfile;
 pub mod profile;
 
 pub use cipher::{DbDecryptor, DecryptedDb};
-pub use context::{DecryptionContext, DecryptionOutcome, DecryptionRecord, TryOutcome};
+pub use context::{Decryption, DecryptionContext, DecryptionOutcome, DecryptionRecord, TryOutcome};
 pub use keyfile::{KeyfileProvider, Secret, SecretStore, load_dump, load_if_dump};
 pub use profile::{CipherSpec, KeyEncoding, KeyMaterial, Platform, Profile, ProfileRegistry};

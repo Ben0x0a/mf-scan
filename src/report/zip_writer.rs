@@ -1,7 +1,9 @@
 //! A streaming writer for STORED ZIP archives that keeps each member's timestamp.
 //!
-//! Defines: [`ZipWriter`] (add files and directories, read a member back, finish).
-//! Used by: `report::rebuild_zip` (the one archive a backup rebuild writes).
+//! Defines: [`ZipWriter`] (add files and directories, read a member back, finish), and
+//! [`ZipWriter::extend`] (an existing archive, kept verbatim, plus new members).
+//! Used by: `report::rebuild_zip` (the one archive a backup rebuild writes) and
+//! `report::decrypted_zip` (an acquisition with decrypted databases added).
 //! Uses: `crc32fast`, `sha2`, and `core::util` (the UTC calendar); the format follows
 //! PKWARE APPNOTE.TXT, with the extended-timestamp extra field from Info-ZIP's
 //! `extrafld.txt`.
@@ -69,6 +71,8 @@ const ZIP64_COUNT_LIMIT: u64 = u16::MAX as u64;
 
 /// Chunk size for reading a written member back.
 const READ_BACK_CHUNK: usize = 1024 * 1024;
+/// Chunk size for copying an extended archive's members.
+const COPY_CHUNK: usize = 8 * 1024 * 1024;
 
 /// What the central directory needs to know about one written member.
 struct CentralRecord {
@@ -97,6 +101,10 @@ pub struct ZipWriter {
     file: File,
     offset: u64,
     central: Vec<CentralRecord>,
+    /// The central directory of the archive this one extends, written verbatim
+    /// before the new members' records, and how many records it holds.
+    prior_directory: Vec<u8>,
+    prior_count: u64,
     /// Sizes and offsets at or above this use ZIP64. Always [`ZIP64_LIMIT`] outside
     /// tests, which lower it because exercising ZIP64 for real needs a 4 GiB member.
     zip64_limit: u64,
@@ -116,9 +124,46 @@ impl ZipWriter {
             file,
             offset: 0,
             central: Vec::new(),
+            prior_directory: Vec::new(),
+            prior_count: 0,
             zip64_limit: ZIP64_LIMIT,
             zip64_count_limit: ZIP64_COUNT_LIMIT,
         })
+    }
+
+    /// Create the archive at `path` as a copy of the archive at `original`, to which
+    /// new members are then added.
+    ///
+    /// HOW: every byte before the original's central directory (its members, with
+    /// their local headers and data, compressed or not) is copied unchanged, and its
+    /// central-directory records are kept verbatim; new members go after, and
+    /// [`finish`](Self::finish) writes the old records, then the new ones. WHY not
+    /// re-pack: the original members stay bit-identical, at the same offsets, with
+    /// their own timestamps and compression, so the evidence inside is the
+    /// acquisition's own bytes, and nothing is decompressed or recompressed.
+    pub fn extend(original: &Path, path: &Path) -> Result<Self> {
+        let source =
+            File::open(original).with_context(|| format!("cannot open {}", original.display()))?;
+        // SAFETY: the map is read-only and only read while this function runs; as with
+        // every mapped source, a concurrent truncation of the evidence file would be an
+        // operator error outside what the tool can guard against.
+        let map = unsafe { memmap2::Mmap::map(&source) }
+            .with_context(|| format!("cannot map {}", original.display()))?;
+        let cd = crate::core::source::zip::find_cd_location(&map, 0)
+            .with_context(|| format!("{} is not a readable zip", original.display()))?;
+        let cd_start = usize::try_from(cd.cd_offset)?;
+        let cd_end = cd_start
+            .checked_add(usize::try_from(cd.cd_size)?)
+            .filter(|&end| end <= map.len())
+            .context("the original's central directory lies outside the file")?;
+
+        let mut writer = Self::create(path)?;
+        for chunk in map[..cd_start].chunks(COPY_CHUNK) {
+            writer.write_all(chunk)?;
+        }
+        writer.prior_directory = map[cd_start..cd_end].to_vec();
+        writer.prior_count = cd.total_entries;
+        Ok(writer)
     }
 
     /// Add a file holding `data`, modified at `mtime` (Unix seconds, if known).
@@ -244,8 +289,10 @@ impl ZipWriter {
     pub fn finish(mut self) -> Result<()> {
         let cd_offset = self.offset;
         let records = std::mem::take(&mut self.central);
-        let count = records.len() as u64;
-        let mut directory = Vec::new();
+        let count = self.prior_count + records.len() as u64;
+        // An extended archive's own records come first, unchanged: their offsets
+        // still point at its members, which were copied to the same place.
+        let mut directory = std::mem::take(&mut self.prior_directory);
         for record in &records {
             self.push_central_record(&mut directory, record);
         }

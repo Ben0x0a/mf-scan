@@ -32,7 +32,9 @@ use mf_scan::report::output::{
 use mf_scan::report::stats::ScanStats;
 
 use crate::cmd::cli::{ColourWhen, GrepArgs};
-use crate::cmd::support::decryption::{build_decryption_context, report_decryptions};
+use crate::cmd::support::decryption::{
+    build_decryption_context, context_for_source, report_decryptions,
+};
 use crate::cmd::support::exporting::export_if_requested;
 use crate::cmd::support::presets::{apply_preset, load_preset};
 use crate::cmd::support::progress::search_with_reporter;
@@ -141,7 +143,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
         .filter(|s| s.kind != ResolvedKind::Stdin)
         .map(|s| s.path.as_path())
         .collect();
-    let decrypt_ctx = build_decryption_context(&cli.decrypt, &archive_paths)?;
+    let decrypt_ctx = build_decryption_context(&cli.decrypt.keys, &archive_paths)?;
 
     // The backup password (flag or env), and a sink the open path fills in when a
     // source turns out to be an encrypted backup that gets unlocked.
@@ -170,7 +172,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, source, _containers| {
+            with_searched_source(src, ctx, |findings, source, _containers, source_ctx| {
                 for f in &findings.files {
                     let path = if multi {
                         format!("{}/{}", src.label, f.entry.name)
@@ -182,7 +184,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 if !multi {
                     // --manifest/--export only apply to a single source (guarded
                     // above), and --count rejects them, so this is -l's export path.
-                    export_if_requested(&cli.sink, source, findings, &run)?;
+                    export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
                 }
                 Ok(())
             })?;
@@ -211,7 +213,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, source, container_map| {
+            with_searched_source(src, ctx, |findings, source, container_map, source_ctx| {
                 // Every record carries its source's full path (for JSON); multi-source
                 // runs also get the short display label (for txt/csv).
                 let full = src.path.display().to_string();
@@ -236,7 +238,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
 
                 if !multi {
                     // --manifest/--export only apply to a single source (guarded above).
-                    export_if_requested(&cli.sink, source, findings, &run)?;
+                    export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
                 }
                 records.append(&mut findings.records);
                 Ok(())
@@ -540,12 +542,14 @@ fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bo
         base64_urlsafe: cli.base64_urlsafe,
         keyfiles: cli
             .decrypt
+            .keys
             .keyfile
             .iter()
             .map(|p| p.display().to_string())
             .collect(),
         platform: cli
             .decrypt
+            .keys
             .platform
             .map(|p| p.to_platform().as_str().to_string()),
         ..RunInfo::default()
@@ -580,6 +584,7 @@ fn with_searched_source(
         &mut mf_scan::ops::search::Findings,
         &dyn Source,
         &AppContainerMap,
+        Option<&mf_scan::decrypt::DecryptionContext>,
     ) -> Result<()>,
 ) -> Result<()> {
     with_source(
@@ -599,16 +604,18 @@ fn with_searched_source(
             let widened = widen_filter_for_apps(ctx.filter, &container_map, ctx.cli);
             let filter = widened.as_ref().unwrap_or(ctx.filter);
 
+            // Keys a dump inside the source carries join those found beside it.
+            let source_ctx = context_for_source(ctx.decrypt_ctx, source);
             let mut findings = search_with_reporter(
                 source,
                 ctx.query,
                 ctx.deep,
                 ctx.cli.match_path,
                 filter,
-                ctx.decrypt_ctx,
+                source_ctx.as_deref(),
                 !ctx.cli.quiet,
             )?;
-            handle(&mut findings, source, &container_map)?;
+            handle(&mut findings, source, &container_map, source_ctx.as_deref())?;
             ctx.decryptions.append(&mut findings.decryptions);
             ctx.stats.merge(findings.stats);
             report_verify_for(ctx.cli.verify, verify_before, raw);

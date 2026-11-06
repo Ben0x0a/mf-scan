@@ -29,10 +29,12 @@ use serde::Serialize;
 use crate::core::util::sha256_hex;
 use crate::decrypt::cipher;
 use crate::decrypt::keyfile::SecretStore;
-use crate::decrypt::profile::{Platform, Profile, ProfileRegistry};
+use crate::decrypt::profile::{CipherSpec, Platform, Profile, ProfileRegistry};
+use crate::formats::sqlite::checkpoint;
 
 /// Everything the engine needs to decrypt entries: the profile registry, the
 /// secrets, and an optional platform scope.
+#[derive(Clone)]
 pub struct DecryptionContext {
     registry: ProfileRegistry,
     secrets: SecretStore,
@@ -56,6 +58,8 @@ pub struct Decryption {
     pub secret_service: Option<String>,
     /// The secret's account attribute, for provenance.
     pub secret_account: Option<String>,
+    /// Whether committed frames from the database's `-wal` were applied first.
+    pub wal_replayed: bool,
 }
 
 /// The outcome of attempting to decrypt one entry whose path matched a profile.
@@ -85,12 +89,26 @@ impl DecryptionContext {
         }
     }
 
+    /// This context with `more` secrets added (duplicates skipped), and how many
+    /// were new: for a key dump found inside a source.
+    pub fn with_more_secrets(&self, more: SecretStore) -> (Self, usize) {
+        let mut ctx = self.clone();
+        let added = ctx.secrets.merge_new(more);
+        (ctx, added)
+    }
+
     /// Whether the context can decrypt anything (it has at least one secret).
     ///
     /// With no secrets there is no key to try, so the engine can skip the
     /// per-entry matching entirely.
     pub fn has_secrets(&self) -> bool {
         !self.secrets.is_empty()
+    }
+
+    /// Whether a profile targets the entry at `path`, so the caller knows to fetch its
+    /// `-wal` before calling [`try_decrypt`](Self::try_decrypt).
+    pub fn targets(&self, path: &str) -> bool {
+        self.profile_for(path).is_some()
     }
 
     /// The first profile whose database binding matches `path` (within the
@@ -108,8 +126,30 @@ impl DecryptionContext {
     /// profile matched and the result is [`TryOutcome::Decrypted`] or
     /// [`TryOutcome::Failed`]. Each matching secret is tried in turn; the first to
     /// decrypt wins — for an HMAC cipher that is the key that authenticates.
-    pub fn try_decrypt(&self, path: &str, ciphertext: &[u8]) -> Option<TryOutcome> {
+    ///
+    /// `wal` is the database's `-wal` sidecar, if it has one. Its committed frames are
+    /// applied to the ciphertext before decrypting. WHY before: SQLCipher writes pages to
+    /// the WAL already encrypted, and the WAL's checksums cover those encrypted bytes, so
+    /// only the encrypted image can be replayed and checked. If the replayed image does
+    /// not decrypt, the main file alone is tried, so a damaged WAL never hides the rest.
+    pub fn try_decrypt(
+        &self,
+        path: &str,
+        ciphertext: &[u8],
+        wal: Option<&[u8]>,
+    ) -> Option<TryOutcome> {
         let profile = self.profile_for(path)?;
+        // A profile may cover a whole folder (`databases/*.db`) where some files are
+        // not encrypted. Those are searched as they are, not reported as failures.
+        if is_plaintext_sqlite(&profile.cipher, ciphertext) {
+            return None;
+        }
+        let replayed = wal.and_then(|wal| checkpoint(ciphertext, wal));
+        let inputs = replayed
+            .as_deref()
+            .map(|image| (image, true))
+            .into_iter()
+            .chain([(ciphertext, false)]);
 
         let candidates = self.secrets.candidates(&profile.key.keychain);
         if candidates.is_empty() {
@@ -121,27 +161,30 @@ impl DecryptionContext {
         }
 
         let mut last_reason = String::from("no candidate key matched");
-        for secret in candidates {
-            let key_material = match secret.key_material(profile.key.encoding) {
-                Ok(km) => km,
-                Err(e) => {
-                    last_reason = e.to_string();
-                    continue;
+        for (input, wal_replayed) in inputs {
+            for secret in &candidates {
+                let key_material = match secret.key_material(profile.key.encoding) {
+                    Ok(km) => km,
+                    Err(e) => {
+                        last_reason = e.to_string();
+                        continue;
+                    }
+                };
+                match cipher::decrypt(input, &key_material, &profile.cipher) {
+                    Ok(db) => {
+                        return Some(TryOutcome::Decrypted(Decryption {
+                            plaintext: db.plaintext,
+                            verified: db.verified,
+                            profile: profile.name.clone(),
+                            app: profile.app.clone(),
+                            secret_source: secret.source.clone(),
+                            secret_service: secret.service.clone(),
+                            secret_account: secret.account.clone(),
+                            wal_replayed,
+                        }));
+                    }
+                    Err(e) => last_reason = e.to_string(),
                 }
-            };
-            match cipher::decrypt(ciphertext, &key_material, &profile.cipher) {
-                Ok(db) => {
-                    return Some(TryOutcome::Decrypted(Decryption {
-                        plaintext: db.plaintext,
-                        verified: db.verified,
-                        profile: profile.name.clone(),
-                        app: profile.app.clone(),
-                        secret_source: secret.source.clone(),
-                        secret_service: secret.service.clone(),
-                        secret_account: secret.account.clone(),
-                    }));
-                }
-                Err(e) => last_reason = e.to_string(),
             }
         }
         Some(TryOutcome::Failed {
@@ -149,6 +192,27 @@ impl DecryptionContext {
             app: profile.app.clone(),
             reason: format!("no candidate key decrypted the database ({last_reason})"),
         })
+    }
+}
+
+/// Whether `db` is an ordinary, unencrypted SQLite file rather than one `cipher`
+/// produced.
+///
+/// HOW: every supported cipher encrypts the SQLite magic, except SQLCipher with a
+/// plaintext header, which keeps it but reserves bytes at each page's end for its IV
+/// and HMAC (header byte 20). So the magic means plaintext, unless the cipher keeps a
+/// plaintext header and the file reserves bytes.
+fn is_plaintext_sqlite(cipher: &CipherSpec, db: &[u8]) -> bool {
+    const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+    const RESERVE_BYTE: usize = 20;
+    if !db.starts_with(SQLITE_MAGIC) {
+        return false;
+    }
+    match cipher {
+        CipherSpec::Sqlcipher(p) if p.plaintext_header_size > 0 => {
+            db.get(RESERVE_BYTE).is_none_or(|&reserve| reserve == 0)
+        }
+        _ => true,
     }
 }
 
@@ -187,6 +251,10 @@ pub enum DecryptionOutcome {
         cipher_sha256: String,
         /// SHA-256 of the decrypted plaintext.
         plain_sha256: String,
+        /// Whether committed frames from the `-wal` were applied before decrypting, so
+        /// the plaintext includes changes the main file does not yet hold.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        wal_replayed: bool,
     },
     /// A profile matched but decryption failed.
     Failed { reason: String },
@@ -206,6 +274,7 @@ impl DecryptionRecord {
                 secret_account: decryption.secret_account.clone(),
                 cipher_sha256: sha256_hex(ciphertext),
                 plain_sha256: sha256_hex(&decryption.plaintext),
+                wal_replayed: decryption.wal_replayed,
             },
         }
     }
@@ -306,7 +375,10 @@ mod tests {
             None,
         );
         // Path does not match the profile's db glob.
-        assert!(ctx.try_decrypt("some/other/file.txt", b"data").is_none());
+        assert!(
+            ctx.try_decrypt("some/other/file.txt", b"data", None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -319,7 +391,7 @@ mod tests {
         );
         let blob = encrypted_db(&key);
         let outcome = ctx
-            .try_decrypt("App/grdb/signal.sqlite", &blob)
+            .try_decrypt("App/grdb/signal.sqlite", &blob, None)
             .expect("profile should match");
         let TryOutcome::Decrypted(d) = outcome else {
             panic!("expected a successful decryption");
@@ -341,7 +413,7 @@ mod tests {
             None,
         );
         let blob = encrypted_db(&[0x42u8; 32]);
-        match ctx.try_decrypt("App/grdb/signal.sqlite", &blob) {
+        match ctx.try_decrypt("App/grdb/signal.sqlite", &blob, None) {
             Some(TryOutcome::Failed { reason, .. }) => assert!(!reason.is_empty()),
             other => panic!("expected Failed, got something else: {}", other.is_some()),
         }
@@ -360,8 +432,70 @@ mod tests {
             None,
         );
         let blob = encrypted_db(&key);
-        let outcome = ctx.try_decrypt("App/grdb/signal.sqlite", &blob).unwrap();
+        let outcome = ctx
+            .try_decrypt("App/grdb/signal.sqlite", &blob, None)
+            .unwrap();
         assert!(matches!(outcome, TryOutcome::Decrypted(d) if d.verified));
+    }
+
+    /// One encrypted page whose payload is `needle` (page 1 of a SQLCipher image).
+    fn encrypted_page(key: &[u8; 32], needle: &[u8; 15]) -> Vec<u8> {
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[..16].copy_from_slice(b"SQLite format 3\x00");
+        page[100..115].copy_from_slice(needle);
+        let profile = signal_profile();
+        let CipherSpec::Sqlcipher(params) = &profile.cipher else {
+            unreachable!("the test profile uses sqlcipher");
+        };
+        encrypt_db(&[page], key, &[0x55u8; 16], params)
+    }
+
+    #[test]
+    fn wal_frames_are_replayed_before_decrypting() {
+        let key = [0x42u8; 32];
+        let ctx = DecryptionContext::new(
+            ProfileRegistry::new(vec![signal_profile()]),
+            SecretStore::new(vec![secret("Signal", &key)]),
+            None,
+        );
+        let main = encrypted_page(&key, b"FINDME-secret!!");
+        let newer = encrypted_page(&key, b"FROM-THE-WAL!!!");
+        let wal = crate::formats::sqlite::build_wal(PAGE_SIZE, &[(1, &newer)], 1);
+
+        let outcome = ctx
+            .try_decrypt("App/grdb/signal.sqlite", &main, Some(&wal))
+            .unwrap();
+        let TryOutcome::Decrypted(d) = outcome else {
+            panic!("expected a successful decryption");
+        };
+        assert!(d.verified && d.wal_replayed);
+        let re = Regex::new("FROM-THE-WAL!!!").unwrap();
+        assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
+    }
+
+    #[test]
+    fn undecryptable_wal_falls_back_to_the_main_file() {
+        // A WAL whose frame is encrypted under another key replays cleanly (its
+        // checksums are valid) but no longer decrypts; the main file must still be read.
+        let key = [0x42u8; 32];
+        let ctx = DecryptionContext::new(
+            ProfileRegistry::new(vec![signal_profile()]),
+            SecretStore::new(vec![secret("Signal", &key)]),
+            None,
+        );
+        let main = encrypted_page(&key, b"FINDME-secret!!");
+        let foreign = encrypted_page(&[0x99u8; 32], b"FROM-THE-WAL!!!");
+        let wal = crate::formats::sqlite::build_wal(PAGE_SIZE, &[(1, &foreign)], 1);
+
+        let outcome = ctx
+            .try_decrypt("App/grdb/signal.sqlite", &main, Some(&wal))
+            .unwrap();
+        let TryOutcome::Decrypted(d) = outcome else {
+            panic!("expected the main file to decrypt");
+        };
+        assert!(d.verified && !d.wal_replayed);
+        let re = Regex::new("FINDME-secret!!").unwrap();
+        assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
     }
 
     #[test]
@@ -374,7 +508,7 @@ mod tests {
         );
         // The ios profile is out of scope, so the path matches nothing.
         assert!(
-            ctx.try_decrypt("App/grdb/signal.sqlite", &encrypted_db(&key))
+            ctx.try_decrypt("App/grdb/signal.sqlite", &encrypted_db(&key), None)
                 .is_none()
         );
     }

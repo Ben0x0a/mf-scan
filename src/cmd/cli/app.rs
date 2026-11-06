@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use crate::cmd::cli::common::IoModeArg;
+use crate::cmd::cli::common::{IoModeArg, KeyArgs};
 use mf_scan::report::export::DEFAULT_MAX_PATH_LEN;
 use mf_scan::report::output::OutputFormat;
 
@@ -147,4 +147,9 @@ pub(crate) struct AppExportArgs {
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
+
+    /// Keychain/keystore dump: each app database it decrypts is also written
+    /// decrypted, beside the original. A dump beside the source is found on its own.
+    #[command(flatten, next_help_heading = "Decryption")]
+    pub(crate) keys: KeyArgs,
 }

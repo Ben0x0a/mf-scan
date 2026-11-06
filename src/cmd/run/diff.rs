@@ -111,10 +111,10 @@ fn reject_unsupported(args: &DiffArgs) -> Result<()> {
 
 /// Whether any decryption material was supplied (shared or per-side).
 fn decryption_requested(args: &DiffArgs) -> bool {
-    !args.decrypt.keyfile.is_empty()
+    !args.decrypt.keys.keyfile.is_empty()
         || !args.keyfile_a.is_empty()
         || !args.keyfile_b.is_empty()
-        || args.decrypt.platform.is_some()
+        || args.decrypt.keys.platform.is_some()
         || args.platform_a.is_some()
         || args.platform_b.is_some()
 }
@@ -183,7 +183,14 @@ fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> R
         })
         .collect();
 
-    run_export_sink(&args.sink, b_src, &files, &diff_run_info(args), "changed")
+    run_export_sink(
+        &args.sink,
+        b_src,
+        &files,
+        &diff_run_info(args),
+        "changed",
+        None,
+    )
 }
 
 /// Run metadata for the diff manifest/export report — informational provenance

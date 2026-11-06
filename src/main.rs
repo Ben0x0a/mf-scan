@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the chosen subcommand. `grep` and `find` choose their own exit status; the others
+/// Run the chosen subcommand. `grep`, `find` and `decrypt` choose their own exit status; the others
 /// succeed or fail.
 fn dispatch(command: Command) -> Result<ExitCode> {
     let succeeded = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
@@ -48,5 +48,6 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::Diff(args) => succeeded(cmd::run::run_diff(args)),
         Command::App(args) => succeeded(cmd::run::run_app(args)),
         Command::Backup(args) => succeeded(cmd::run::run_backup(args)),
+        Command::Decrypt(args) => cmd::run::run_decrypt(args),
     }
 }

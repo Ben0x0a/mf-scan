@@ -1,0 +1,24 @@
+# Find My, findmylocated (iOS system daemon): SQLite databases with each page AES-256-OFB encrypted.
+#
+# Validated against a real iPhone full-filesystem extraction (December 2025): every
+# `.db` in the daemon's folder decrypted and passed SQLite's integrity check.
+#   • each database has its own 32-byte key, a keychain item in access group
+#     `com.apple.findmy.findmylocated` whose service names the store (e.g. `LocalStorage`). The
+#     profile matches the whole access group; page 1's SQLite magic picks the right key.
+#   • the cipher is described in src/decrypt/cipher/page_ofb.rs.
+
+name: findmy-findmylocated-ios
+app: Find My (findmylocated)
+platform: ios
+description: Find My findmylocated databases (page-level AES-256-OFB, key per store).
+
+db:
+  glob: "*/Library/com.apple.findmy.findmylocated/*.db"
+
+key:
+  encoding: raw
+  keychain:
+    access_group: com.apple.findmy.findmylocated
+
+cipher:
+  algorithm: page-aes-ofb

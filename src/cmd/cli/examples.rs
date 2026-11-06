@@ -77,6 +77,18 @@ Examples:
 Output is always one .zip, so long device paths work on Windows too. It keeps the
 device's timestamps and holds its own report; a .sha256 file is written beside it.";
 
+/// Examples for `decrypt`.
+pub(crate) const DECRYPT: &str = "\
+Examples:
+  mf-scan decrypt case.zip                         # what decrypts? writes nothing
+  mf-scan decrypt case.zip --to case.decrypted.zip # case.zip + decrypted copies
+  mf-scan decrypt case.zip --keyfile keychain.plist --to out.zip
+
+  A keychain/keystore dump beside the source (*keychain*, *keystore*, zipped or
+  not) is found on its own. Each copy is name.decrypted.ext beside its original;
+  _mf-scan/decryption.json lists them with hashes and how each was decrypted.
+  To get decrypted copies in a folder instead: find/grep/app export --export.";
+
 #[cfg(test)]
 mod tests {
     use super::*;

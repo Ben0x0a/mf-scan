@@ -14,6 +14,7 @@
 
 mod app;
 mod backup;
+mod decrypt;
 mod diff;
 mod export;
 mod find;
@@ -21,6 +22,7 @@ mod grep;
 
 pub(crate) use app::run_app;
 pub(crate) use backup::run_backup;
+pub(crate) use decrypt::run_decrypt;
 pub(crate) use diff::run_diff;
 pub(crate) use export::run_export;
 pub(crate) use find::run_find;
