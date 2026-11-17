@@ -26,12 +26,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::core::layout::tree_dir;
 use crate::core::models::Entry;
 use crate::core::source::Source;
 use crate::platform::android::paths;
 use crate::platform::ios::backup::common::BackupStructure;
 use crate::platform::ios::domains;
-use crate::report::export::tree_dir;
 
 /// Output root for domains the grammar does not recognise.
 ///

@@ -1,7 +1,7 @@
 //! iOS backup (iTunes/Finder) app-domain resolution.
 //!
 //! Defines: [`resolve`] — derive each app/extension/group container from the
-//! backup's logical domains, and [`parse_domain`] (the domain → kind + id rule).
+//! backup's logical domains, and `parse_domain` (the domain → kind + id rule).
 //! Used by: `crate::ops::apps` (the platform-agnostic catalog) for the iOS-backup
 //! platform.
 //! Uses: only the [`crate::core::source::Source`] trait — the heavy lifting (decoding

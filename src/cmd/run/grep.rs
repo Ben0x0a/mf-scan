@@ -19,6 +19,7 @@ use regex::bytes::{Regex, RegexBuilder};
 use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
+use mf_scan::core::stats::ScanStats;
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
 use mf_scan::ops::apps::expand_app_globs;
@@ -29,7 +30,6 @@ use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{
     OutputFormat, TxtStyle, write_counts, write_file_list, write_results,
 };
-use mf_scan::report::stats::ScanStats;
 
 use crate::cmd::cli::{ColourWhen, GrepArgs};
 use crate::cmd::support::decryption::{

@@ -7,6 +7,9 @@
 //!   • `source` — the `Source` trait the engine reads through, plus its
 //!     implementations (ZIP mmap, ranged ZIP, folder, nested-archive expansion).
 //!   • `filter` — `EntryFilter`: path-glob and type/media selection.
+//!   • `layout` — where a path lands in a tree export (shared by `ops::rebuild` and
+//!     `report::export`).
+//!   • `stats` — `ScanStats`: the coverage tally a search fills and the reports embed.
 //!   • `util` — tiny crate-wide helpers (`sha256_hex`).
 //! Used by: every other module in the library, and the binary's `cmd` tree.
 //! Uses: external crates only (within the crate it is a leaf).
@@ -16,6 +19,8 @@
 //! the loose data/IO primitives from sitting un-marked beside the feature subsystems.
 
 pub mod filter;
+pub mod layout;
 pub mod models;
 pub mod source;
+pub mod stats;
 pub mod util;

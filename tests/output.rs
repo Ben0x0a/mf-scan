@@ -6,8 +6,8 @@
 //! Uses: `mf_scan::{models, output}`, `serde_json` (to parse JSON back).
 
 use mf_scan::core::models::{Encoding, Inspection, MatchRecord, RunInfo};
+use mf_scan::core::stats::ScanStats;
 use mf_scan::report::output::{OutputFormat, TxtStyle, write_counts, write_results};
-use mf_scan::report::stats::ScanStats;
 use serde_json::json;
 
 /// Minimal run metadata for output tests.

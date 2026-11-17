@@ -2,7 +2,7 @@
 //!
 //! Defines: `ScanStats` (the per-run coverage tally) and its small components
 //! `SkipTally` and `GlobTally`, plus `merge` for aggregating across archives.
-//! Used by: `engine` (fills the counts during the search pass), `run` (prints the
+//! Used by: `ops::search` (fills the counts during the search pass), `run` (prints the
 //! stderr summary and aggregates across sources), `output` (embeds it in the JSON
 //! report).
 //! Uses: `std::collections::BTreeMap` (a stable, sorted type breakdown),

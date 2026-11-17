@@ -137,7 +137,7 @@ pub fn entry_names(entries: &[Entry]) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::export::tree_dir;
+    use crate::core::layout::tree_dir;
 
     fn device_path(name: &str, names: &[&str]) -> String {
         let roots = roots(names.iter().copied());

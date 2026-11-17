@@ -138,7 +138,7 @@ impl McmReferences {
 
     /// Locate and read the database in `source`.
     ///
-    /// HOW: find the entry whose path ends with [`REFERENCES_PATH_SUFFIX`], read
+    /// HOW: find the entry whose path ends with `REFERENCES_PATH_SUFFIX`, read
     /// its bytes, replay any `-wal` sidecar onto them, then join
     /// `code_signing_info`'s row ids to `code_signing_data.cs_info_id` and decode
     /// each blob into a [`SigningRecord`]. Any failure at any step degrades — a

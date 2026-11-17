@@ -28,8 +28,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::core::models::{Encoding, MatchRecord, RunInfo};
+use crate::core::stats::ScanStats;
 use crate::decrypt::DecryptionRecord;
-use crate::report::stats::ScanStats;
 
 // ANSI escapes for match highlighting: bold red on, all attributes off. Bytes
 // are plain ASCII, so they splice into raw line bytes safely.

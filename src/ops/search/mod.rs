@@ -1,7 +1,7 @@
 //! The search operation: scan a `Source` for a pattern → `Findings`.
 //!
 //! Defines: the `grep` operation surface — `Findings`, `MatchedFile`, and the two
-//! entry points [`search_source`] (any [`Source`](crate::core::source::Source)) and
+//! entry points [`search_source`] (any [`Source`]) and
 //! the [`search_with_query`] convenience over raw archive bytes — which search
 //! entries in parallel and return both the per-match records (for output) and the
 //! de-duplicated matched files (for the export step). Also re-exports the byte-search
@@ -34,9 +34,9 @@ use crate::core::filter::EntryFilter;
 use crate::core::models::{Entry, MatchRecord, SearchHit};
 use crate::core::source::Source;
 use crate::core::source::zip::{self, ZipSource};
+use crate::core::stats::ScanStats;
 use crate::decrypt::{DecryptionContext, DecryptionRecord};
 use crate::engine::{Progress, is_selected};
-use crate::report::stats::ScanStats;
 
 use classify::{Class, classify_entry};
 

@@ -2,14 +2,14 @@
 //!
 //! Defines: the logic both [`super::source::EncryptedBackupSource`] and
 //! [`super::source::PlainBackupSource`] need, in one place — locating
-//! a file's on-disk blob ([`blob_names`], [`read_backup_blob`]), reading an entry
-//! by logical name ([`read_entry`]), walking `Manifest.db`'s `Files` table into
-//! present-on-disk records ([`read_present_files`], [`FileRecord`]), building the
-//! logical [`Entry`] ([`logical_entry`]), mapping an entry back to its metadata
-//! ([`name_index`], [`meta_index`]), and the SHA-1 `Digest` attestation
-//! ([`BlobStore::attest`]).
+//! a file's on-disk blob (`blob_names`, `read_backup_blob`), reading an entry
+//! by logical name (`read_entry`), walking `Manifest.db`'s `Files` table into
+//! present-on-disk records (`read_present_files`, `FileRecord`), building the
+//! logical [`Entry`] (`logical_entry`), mapping an entry back to its metadata
+//! (`name_index`, `meta_index`), and the SHA-1 `Digest` attestation
+//! (`BlobStore::attest`).
 //! Used by: `source::encrypted` and `source::plain` — the two sources differ only
-//! in how they turn a [`FileRecord`] into their own per-entry metadata and (for
+//! in how they turn a `FileRecord` into their own per-entry metadata and (for
 //! encrypted) decrypt the bytes; everything structural lives here so they never
 //! drift.
 //! Uses: `crate::formats::sqlite` (the `Manifest.db` reader), `super::manifest`

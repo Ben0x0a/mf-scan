@@ -15,10 +15,10 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 
 use mf_scan::core::models::RunInfo;
+use mf_scan::core::stats::ScanStats;
 use mf_scan::core::util::UtcTime;
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::report::output::write_scan_report;
-use mf_scan::report::stats::ScanStats;
 
 use crate::cmd::cli::GrepArgs;
 

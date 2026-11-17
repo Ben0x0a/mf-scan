@@ -1,6 +1,6 @@
 //! Write a rebuilt backup as one ZIP archive, with its traceability record inside.
 //!
-//! Defines: [`RebuildRequest`] and [`write`] (the archive and its `.sha256` sidecar),
+//! Defines: [`RebuildRequest`] and [`write()`] (the archive and its `.sha256` sidecar),
 //! and [`TRACEABILITY_MEMBER`].
 //! Used by: the binary's `backup rebuild` orchestrator (`cmd::run::backup`).
 //! Uses: `report::zip_writer` (the format), `report::export` (the plan and the per-file

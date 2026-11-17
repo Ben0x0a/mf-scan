@@ -1,6 +1,6 @@
 //! Write an acquisition as one ZIP with each decrypted database beside its original.
 //!
-//! Defines: [`DecryptedZipRequest`], [`write`] (the archive and its `.sha256` sidecar),
+//! Defines: [`DecryptedZipRequest`], [`write()`] (the archive and its `.sha256` sidecar),
 //! and [`RECORD_MEMBER`].
 //! Used by: the binary's `decrypt` orchestrator (`cmd::run::decrypt`).
 //! Uses: `report::zip_writer` (the format, including extending an archive verbatim),

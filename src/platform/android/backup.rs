@@ -42,7 +42,7 @@
 //!
 //! ── Memory ─────────────────────────────────────────────────────────────────────
 //! A compressed or encrypted payload must be decoded before it can be read at random.
-//! Up to [`SPOOL_LIMIT`] it stays in memory; beyond that it spills to an unnamed
+//! Up to `SPOOL_LIMIT` it stays in memory; beyond that it spills to an unnamed
 //! temporary file, which the operating system deletes when the process ends, because
 //! a backup can run to many gigabytes. That file holds decrypted evidence while the
 //! tool runs. Point `TMPDIR` (`TMP` on Windows) at an approved location if that matters.

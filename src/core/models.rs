@@ -216,7 +216,7 @@ pub enum Location {
     /// plain `.tar` the offset is a true file offset (a real carve coordinate); for
     /// a `.tar.gz` it indexes the decompressed stream, so the source reports no
     /// absolute archive offset there — see
-    /// [`crate::core::source::tar::TarSource::archive_data_start`].
+    /// `TarSource::archive_data_start`.
     Tar { data_offset: u64, data_len: u64 },
 }
 
