@@ -9,13 +9,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::manifest::Manifest;
-use super::plan::{ExportPlan, decrypted_name_numbered, fold_case};
-use super::record::{ExportedFile, SkippedFile, StoredIntegrity};
+use super::plan::{ExportPlan, Renamed, decrypted_name_numbered, fold_case};
+use super::record::{ExportNotes, ExportedFile, SkippedFile, StoredIntegrity};
 use crate::core::models::Entry;
 use crate::core::source::Source;
 use crate::core::util::sha256_hex;
@@ -45,17 +46,10 @@ pub enum ExportOutcome {
         skipped: usize,
         /// Each written file with its SHA-256 (main files and sidecars).
         report: Vec<ExportedFile>,
-        /// Files NOT written because the destination path cannot exist on THIS
-        /// platform (a single component over 255, or — on Windows — the absolute
-        /// path over the limit). Recorded, never silently dropped.
-        skipped_too_long: Vec<SkippedFile>,
-        /// Files that WERE written but whose relative output path exceeds the limit,
-        /// so they will not be extractable if the export is later moved to Windows
-        /// (raised only on non-Windows hosts, where the local write succeeds).
-        portability_warnings: Vec<SkippedFile>,
-        /// Files that should have had a decrypted copy but did not decrypt (the key
-        /// did not verify), with the reason. The original was still exported.
-        undecrypted: Vec<SkippedFile>,
+        /// Files skipped or written differently, to report alongside: paths too long
+        /// for this platform (skipped) or for Windows (written, warned), databases
+        /// whose decrypted copy failed, and files written under another name.
+        notes: ExportNotes,
     },
     Refused {
         total_size: u64,
@@ -142,14 +136,12 @@ struct FileExporter<'a> {
     /// Every output path taken so far, case-folded: the plan's, then each derived
     /// copy's, so a derived copy never overwrites a planned file or the reverse.
     claimed: HashSet<String>,
-    undecrypted: Vec<SkippedFile>,
     /// The full entry list, so a written file's declared sidecars can be fetched.
     by_path: &'a HashMap<&'a str, &'a Entry>,
     dir: &'a Path,
     max_path_len: usize,
     report: Vec<ExportedFile>,
-    skipped_too_long: Vec<SkippedFile>,
-    portability_warnings: Vec<SkippedFile>,
+    notes: ExportNotes,
     bytes: u64,
 }
 
@@ -164,13 +156,11 @@ impl<'a> FileExporter<'a> {
             source,
             derive: None,
             claimed: HashSet::new(),
-            undecrypted: Vec::new(),
             by_path,
             dir,
             max_path_len,
             report: Vec::new(),
-            skipped_too_long: Vec::new(),
-            portability_warnings: Vec::new(),
+            notes: ExportNotes::default(),
             bytes: 0,
         }
     }
@@ -189,14 +179,14 @@ impl<'a> FileExporter<'a> {
     ) -> Result<()> {
         match check_export_path(self.dir, output_path, self.max_path_len) {
             PathCheck::Skip(reason) => {
-                self.skipped_too_long.push(SkippedFile {
+                self.notes.skipped_too_long.push(SkippedFile {
                     internal_path: internal_path.to_string(),
                     output_path: output_path.to_string(),
                     reason,
                 });
                 return Ok(());
             }
-            PathCheck::NotPortable(reason) => self.portability_warnings.push(SkippedFile {
+            PathCheck::NotPortable(reason) => self.notes.portability_warnings.push(SkippedFile {
                 internal_path: internal_path.to_string(),
                 output_path: output_path.to_string(),
                 reason,
@@ -209,7 +199,7 @@ impl<'a> FileExporter<'a> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        fs::write(dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
+        let dest = &self.write_new(internal_path, dest, &content)?;
         self.bytes += content.len() as u64;
         let integrity = self.source.integrity_check(entry).into();
         self.report.push(exported_file(
@@ -230,7 +220,7 @@ impl<'a> FileExporter<'a> {
         {
             Some(Ok(derived)) => Some(derived),
             Some(Err(reason)) => {
-                self.undecrypted.push(SkippedFile {
+                self.notes.undecrypted.push(SkippedFile {
                     internal_path: internal_path.to_string(),
                     output_path: output_path.to_string(),
                     reason,
@@ -252,16 +242,65 @@ impl<'a> FileExporter<'a> {
         {
             suffixes = crate::formats::inspect::sidecars_for(internal_path, &derived.bytes);
         }
-        let mut sidecars = export_sidecars(
-            self.source,
-            self.by_path,
-            internal_path,
-            dest,
-            self.dir,
-            suffixes,
-        )?;
-        self.bytes += sidecars.iter().map(|f| f.size).sum::<u64>();
-        self.report.append(&mut sidecars);
+        self.write_sidecars(internal_path, dest, suffixes)
+    }
+
+    /// Write `bytes` to `dest`, read-only, never over an existing file: if the name
+    /// is taken, the file is written as `name~1`, `name~2`, … and the rename is
+    /// recorded. Returns the path actually written.
+    fn write_new(&mut self, internal_path: &str, dest: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        let written = write_read_only(dest, bytes)?;
+        if written != dest {
+            let relative = |p: &Path| {
+                p.strip_prefix(self.dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
+            self.notes.renamed.push(Renamed {
+                internal_path: internal_path.to_string(),
+                wanted: relative(dest),
+                used: relative(&written),
+            });
+        }
+        Ok(written)
+    }
+
+    /// Write a file's declared sidecars into the same folder as `main_dest` (e.g.
+    /// `sms.db` → `sms.db-wal`), each recorded with its hashes.
+    ///
+    /// The `suffixes` come from the file's inspector (see
+    /// [`crate::formats::inspect::sidecars_for`]); each one names a sibling entry to
+    /// fetch if present. For SQLite this keeps the exported database complete:
+    /// uncommitted rows live in the `-wal`.
+    fn write_sidecars(
+        &mut self,
+        internal_path: &str,
+        main_dest: &Path,
+        suffixes: &[&str],
+    ) -> Result<()> {
+        let main_name = main_dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for suffix in suffixes {
+            let sidecar_path = format!("{internal_path}{suffix}");
+            let Some(entry) = self.by_path.get(sidecar_path.as_str()) else {
+                continue;
+            };
+            let content = self.source.content(entry)?;
+            let wanted = main_dest.with_file_name(format!("{main_name}{suffix}"));
+            let dest = self.write_new(&sidecar_path, &wanted, &content)?;
+            let integrity = self.source.integrity_check(entry).into();
+            self.bytes += content.len() as u64;
+            self.report.push(exported_file(
+                &sidecar_path,
+                &dest,
+                self.dir,
+                &content,
+                integrity,
+            )?);
+        }
         Ok(())
     }
 
@@ -292,24 +331,21 @@ impl<'a> FileExporter<'a> {
                 let output = in_folder(&name);
                 (name, output)
             })
-            .find(|(name, output)| {
-                !self.claimed.contains(&fold_case(output)) && !dest.with_file_name(name).exists()
-            })
+            .find(|(_, output)| !self.claimed.contains(&fold_case(output)))
             .expect("an unbounded range always yields a free name");
         self.claimed.insert(fold_case(&derived_output));
         let derived_dest = dest.with_file_name(&name);
         if let PathCheck::Skip(reason) =
             check_export_path(self.dir, &derived_output, self.max_path_len)
         {
-            self.skipped_too_long.push(SkippedFile {
+            self.notes.skipped_too_long.push(SkippedFile {
                 internal_path: internal_path.to_string(),
                 output_path: derived_output,
                 reason,
             });
             return Ok(());
         }
-        fs::write(&derived_dest, &derived.bytes)
-            .with_context(|| format!("cannot write {}", derived_dest.display()))?;
+        let derived_dest = self.write_new(internal_path, &derived_dest, &derived.bytes)?;
         self.bytes += derived.bytes.len() as u64;
         let mut record = exported_file(
             internal_path,
@@ -332,9 +368,7 @@ impl<'a> FileExporter<'a> {
             bytes: self.bytes,
             skipped,
             report: self.report,
-            skipped_too_long: self.skipped_too_long,
-            portability_warnings: self.portability_warnings,
-            undecrypted: self.undecrypted,
+            notes: self.notes,
         }
     }
 }
@@ -426,47 +460,55 @@ pub fn export_from_manifest(
     Ok(exporter.finish(skipped))
 }
 
-/// Export a file's declared sidecars into the same folder as `main_dest` (e.g.
-/// `sms.db` → `sms.db-wal`), returning one [`ExportedFile`] (with hash) per
-/// sidecar written.
+/// Write `bytes` to a new file at `dest` and make it read-only, never replacing an
+/// existing file: when `dest` is taken, the first free `name~1`, `name~2`, … is used.
+/// Returns the path written.
 ///
-/// The `suffixes` come from the file's inspector (see
-/// [`crate::formats::inspect::sidecars_for`]); each one names a sibling entry to fetch if
-/// present. For SQLite this keeps the exported database complete — uncommitted
-/// rows live in the `-wal`.
-fn export_sidecars(
-    source: &dyn Source,
-    by_path: &HashMap<&str, &Entry>,
-    internal_path: &str,
-    main_dest: &Path,
-    dir: &Path,
-    suffixes: &[&str],
-) -> Result<Vec<ExportedFile>> {
-    let main_name = main_dest
+/// WHY "create new" rather than checking first: the operating system then decides
+/// what "taken" means, so a name this file system treats as equal to an existing one
+/// (a case or accent-form variant the export plan could not foresee, or a file left
+/// by an earlier export) is never overwritten. WHY read-only: an exported file is
+/// evidence; `--work-copy` makes an editable copy for analysis.
+pub fn write_read_only(dest: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let file_name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-
-    let mut written = Vec::new();
-    for suffix in suffixes {
-        let sidecar_path = format!("{internal_path}{suffix}");
-        let Some(entry) = by_path.get(sidecar_path.as_str()) else {
-            continue;
+    for n in 0usize.. {
+        let candidate = if n == 0 {
+            dest.to_path_buf()
+        } else {
+            dest.with_file_name(format!("{file_name}~{n}"))
         };
-        let content = source.content(entry)?;
-        let mut dest = main_dest.to_path_buf();
-        dest.set_file_name(format!("{main_name}{suffix}"));
-        fs::write(&dest, &content).with_context(|| format!("cannot write {}", dest.display()))?;
-        let integrity = source.integrity_check(entry).into();
-        written.push(exported_file(
-            &sidecar_path,
-            &dest,
-            dir,
-            &content,
-            integrity,
-        )?);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot create {}", candidate.display()));
+            }
+        };
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", candidate.display()))?;
+        drop(file);
+        set_read_only(&candidate)?;
+        return Ok(candidate);
     }
-    Ok(written)
+    unreachable!("an unbounded range always yields a free name")
+}
+
+/// Make `path` read-only for everyone.
+pub(crate) fn set_read_only(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("cannot make {} read-only", path.display()))
 }
 
 /// Build an [`ExportedFile`] record with full integrity attestation.

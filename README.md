@@ -113,13 +113,16 @@ mf-scan export case.zip --from-manifest hits.json --to ./exported --max-size 500
 mf-scan diff before.zip after.zip --exact --inspect
 
 # List the installed apps in an acquisition (filter by name/id)
-mf-scan app grep case.zip whatsapp
+mf-scan app list whatsapp case.zip
 
 # Show every place one app's data lives (own data + widgets/extensions + groups)
-mf-scan app paths case.zip com.whatsapp.WhatsApp
+mf-scan app paths com.whatsapp.WhatsApp case.zip
 
 # Export all of an app's data out, one subfolder per container
-mf-scan app export case.zip com.whatsapp.WhatsApp --to ./whatsapp_data
+mf-scan app export com.whatsapp.WhatsApp case.zip --to ./whatsapp_data
+
+# Find a name in file contents AND file paths, in one pass
+mf-scan grep --and-paths -i 'banking' case.zip
 
 # List files by name and size, as with find
 mf-scan find case.zip -name '*.db' -size +1M
@@ -219,6 +222,7 @@ With more than one source, each result is tagged with its origin (see
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |
 | `-t`, `--type TYPE` | Only handle files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
 | `--match-path` | Match the PATTERN against each file's internal path instead of its content. |
+| `--and-paths` | Match the PATTERN against contents **and** paths in one pass (grep + find). A path hit prints as the bare path (JSON/CSV: `path_match: true`); a file can have both. |
 | `--base64` / `--base64-urlsafe` | Also search for the base64 encoding of the pattern (any alignment). Requires `-F`; not with `--match-path`. |
 | `--exclude-media` | Skip image/video/audio files (searched by default). |
 | `--fast` | Speed preset: exclude media + a customisable exclude list. |
@@ -228,7 +232,8 @@ With more than one source, each result is tagged with its origin (see
 | `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
-| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
+| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out, **read-only**. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
+| `--work-copy` | With `--export`, also write `DIR.work/`: the same files, writable, each checked identical. |
 | `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
 | `--max-path-len N` | Path-length guard for the export (default `260`, Windows `MAX_PATH`). On Windows an over-limit path is skipped+recorded; elsewhere it is exported but flagged non-portable. `0` disables. See [`app`](#app). |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
@@ -326,18 +331,18 @@ backup, or Android — and resolves an app to **all** of its containers: its own
 its extension/**widget** containers, and its shared **App Groups**.
 
 ```
-mf-scan app grep   SOURCE [PATTERN] [options]     # search the installed-app inventory
-mf-scan app paths  SOURCE BUNDLE_ID [options]     # list every data location of one app
-mf-scan app export SOURCE BUNDLE_ID --to DIR [options]   # copy one app's data out
+mf-scan app list   [PATTERN] SOURCE [options]     # the installed-app inventory
+mf-scan app paths  BUNDLE_ID SOURCE [options]     # list every data location of one app
+mf-scan app export BUNDLE_ID SOURCE --to DIR [options]   # copy one app's data out
 ```
 
-> The **SOURCE comes first** in every `app` verb (the optional `PATTERN` on `grep`
-> forces it). Open a directory source with `--dir-mode`; unlock an encrypted iOS
-> backup with `--backup-password` (or `MFSCAN_BACKUP_PASSWORD`).
+> As with `grep`, the app comes first and the **SOURCE last**. Open a directory
+> source with `--dir-mode`; unlock an encrypted iOS backup with `--backup-password`
+> (or `MFSCAN_BACKUP_PASSWORD`).
 
 | Verb | What it does |
 |---|---|
-| `grep` | Lists one line per installed app: bundle id, display name, container count, total size, signing team. An optional `PATTERN` filters by a substring of the id/name. `--format json` adds the full signing record (team, signer identity/organisation, App Groups, keychain groups). |
+| `list` | Lists one line per installed app: bundle id, display name, size of its own data container, signing team (extensions and groups: see `paths`). An optional `PATTERN` filters by a substring of the id/name. `--format json` adds the full signing record (team, signer identity/organisation, App Groups, keychain groups). |
 | `paths` | Lists every container the app or its dependencies can write to, tagged by kind (`AppData` / `Extension` / `AppGroup` / `Bundle`, or the Android storage root) and — for groups — by how it was attributed (`ContainerManager` vs `VendorHeuristic`). |
 | `export` | Copies all of the app's data out, **one subfolder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain), and writes `export-report.json` with per-file integrity. Excludes the `.app` bundle (binary, not data). |
 
@@ -512,6 +517,15 @@ for an encrypted backup, of the *file content* for an unencrypted one (see
 ---
 
 ## Export integrity
+
+Every exported file is **read-only**, and an export **never overwrites** a file: if a
+name is taken (an earlier export's file, or a name the file system treats as the same,
+such as `Été.jpg` / `été.jpg`, or `é` stored composed / decomposed on macOS), the file is
+written as `name~1` and listed under `renamed` in the report. Name clashes the export
+can foresee are renamed the same way before anything is written, so the result does
+not depend on the host. `--work-copy` adds `DIR.work/`, an identical, writable copy for
+tools that open databases read-write. `backup rebuild` and `decrypt --to` archives and
+their `.sha256` sidecars are read-only too.
 
 `--export` writes `DIR/export-report.json` with an `integrity` summary and, per file,
 **two independent SHA-256 hashes** plus any source-recorded digest check:

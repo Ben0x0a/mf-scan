@@ -20,7 +20,7 @@ use crate::engine::Progress;
 use crate::formats::inspect;
 use crate::ops::decrypting::SourceDecryptor;
 
-use super::{MatchedFile, Query, search_bytes_capped};
+use super::{MatchOn, MatchedFile, Query, search_bytes_capped};
 
 /// Bytes of an entry's content read for header-first type classification (see the
 /// `content_prefix` branch in [`classify_entry`]). File types are identified from
@@ -87,7 +87,7 @@ pub(super) fn classify_entry(
     entry: &Entry,
     query: &Query,
     deep: bool,
-    match_path: bool,
+    match_on: MatchOn,
     filter: &EntryFilter,
     decrypt: Option<&DecryptionContext>,
     progress: &dyn Progress,
@@ -127,7 +127,7 @@ pub(super) fn classify_entry(
 
     // --match-path: the path itself is the haystack; no content is read and the
     // type/media filter does not apply (documented on `match_entry_path`).
-    if match_path {
+    if match_on == MatchOn::Path {
         let (records, file) = match_entry_path(entry, query.plain);
         let matches = records.len();
         progress.inc();
@@ -144,6 +144,40 @@ pub(super) fn classify_entry(
         });
     }
 
+    let mut result =
+        classify_content(source, entry, query, deep, filter, decrypt, progress, bytes)?;
+    // --and-paths: the path is matched too, whatever happened to the content (a
+    // media file skipped by --exclude-media is still found by its name, as with find).
+    if match_on == MatchOn::Both {
+        let (mut path_records, path_file) = match_entry_path(entry, query.plain);
+        if let Some(path_file) = path_file {
+            path_records.append(&mut result.records);
+            result.records = path_records;
+            result.file = Some(match result.file.take() {
+                Some(mut file) => {
+                    file.offsets.insert(0, 0);
+                    file
+                }
+                None => path_file,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// The content half of [`classify_entry`]: read the entry (decrypting it when a
+/// profile targets it), apply the type/media filter, and search it.
+#[allow(clippy::too_many_arguments)]
+fn classify_content(
+    source: &dyn Source,
+    entry: &Entry,
+    query: &Query,
+    deep: bool,
+    filter: &EntryFilter,
+    decrypt: Option<&DecryptionContext>,
+    progress: &dyn Progress,
+    bytes: u64,
+) -> Result<EntryResult> {
     // Header-first classification: for a source where fetching a whole file just
     // to skip it is expensive (a positioned-read remote archive), classify from a
     // cheap header read and skip media/`--type`-excluded files WITHOUT the full
@@ -318,7 +352,17 @@ pub(super) fn classify_entry(
         // this entry's matches instead of once per match.
         let mut inspections = if deep {
             let offs: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
-            inspect::inspect_many(&entry.name, &content, &offs).into_iter()
+            // A `-wal` is not a database; its matches are resolved through the main
+            // database it belongs to, when the source holds it.
+            let main = entry
+                .name
+                .strip_suffix("-wal")
+                .and_then(|main_name| source.entries().iter().find(|e| e.name == main_name))
+                .and_then(|main| source.content(main).ok());
+            match main {
+                Some(main) => inspect::inspect_wal(&main, &content, &offs).into_iter(),
+                None => inspect::inspect_many(&entry.name, &content, &offs).into_iter(),
+            }
         } else {
             Vec::new().into_iter()
         };
@@ -400,6 +444,7 @@ fn match_entry_path(entry: &Entry, re: &Regex) -> (Vec<MatchRecord>, Option<Matc
         encoding: Encoding::Plain,
         decoded: None,
         bundle_id: None,
+        path_match: true,
     };
     let file = MatchedFile {
         entry: entry.clone(),

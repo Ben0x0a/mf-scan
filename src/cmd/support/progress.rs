@@ -22,7 +22,7 @@ use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::source::Source;
 use mf_scan::decrypt::DecryptionContext;
 use mf_scan::engine::Progress;
-use mf_scan::ops::search::{Findings, Query, search_source};
+use mf_scan::ops::search::{Findings, MatchOn, Query, search_source};
 
 /// Run the search, showing a live progress line on stderr when it is a terminal.
 ///
@@ -34,7 +34,7 @@ pub(crate) fn search_with_reporter(
     source: &dyn Source,
     query: &Query,
     deep: bool,
-    match_path: bool,
+    match_on: MatchOn,
     filter: &EntryFilter,
     decrypt: Option<&DecryptionContext>,
     show_progress: bool,
@@ -56,7 +56,7 @@ pub(crate) fn search_with_reporter(
         source,
         query,
         deep,
-        match_path,
+        match_on,
         filter,
         decrypt,
         progress.as_ref(),

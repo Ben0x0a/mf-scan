@@ -24,9 +24,9 @@ use serde_json::json;
 
 use crate::core::models::{ContentDiff, Inspection};
 use crate::formats::sqlite::{
-    Col, Db, TABLE_LEAF, Table, btree_header_offset, col_int, col_text, for_each_leaf_cell,
-    is_blob, pages_of, parse_cell, parse_column_spans, parse_header, read_schema, read_u16,
-    serial_type_name,
+    Col, Db, TABLE_LEAF, Table, btree_header_offset, checkpoint, col_int, col_text,
+    for_each_leaf_cell, is_blob, pages_of, parse_cell, parse_column_spans, parse_header,
+    read_schema, read_u16, serial_type_name,
 };
 
 /// SQLite inspector — recognised by the `SQLite format 3\0` header.
@@ -360,5 +360,122 @@ fn render_cell(content: &[u8], col: &Col) -> String {
             out
         }
         _ => format!("<blob {} bytes>", col.len), // even serial >= 12
+    }
+}
+/// Resolve matches inside a database's `-wal` file to a table, column and row.
+///
+/// HOW: a WAL is a 32-byte header, then frames of a 24-byte header (whose first four
+/// bytes are the page number, big-endian) followed by one page. A match at a WAL
+/// offset is in frame `f`, so it is that page, at the same position, in the database
+/// as it stood with that frame applied: the WAL is replayed on `main` (so the schema
+/// and every other page are current), the frame's own page is laid over it (it may be
+/// an older or uncommitted version of the page), and the usual inspection runs there.
+/// The result says which frame and page it came from. A match in a WAL or frame
+/// header is not in a page, so it gets `None`.
+///
+/// WHY: apps keep their newest rows in the `-wal` (WhatsApp, Signal, iOS system
+/// databases), so a match there is common, and without this it had no table at all.
+pub(crate) fn inspect_wal(main: &[u8], wal: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+    const WAL_HEADER: usize = 32;
+    const FRAME_HEADER: usize = 24;
+    let mut out: Vec<Option<Inspection>> = offsets.iter().map(|_| None).collect();
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let Some(page_size) = wal.get(8..12).map(be32) else {
+        return out;
+    };
+    if !main.starts_with(b"SQLite format 3\x00")
+        || !(512..=65536).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return out;
+    }
+    let frame_len = FRAME_HEADER + page_size;
+    let replayed = checkpoint(main, wal).unwrap_or_else(|| main.to_vec());
+
+    // Group the matches by frame, so each frame's image is built once.
+    let mut by_frame: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &offset) in offsets.iter().enumerate() {
+        if offset < WAL_HEADER || (offset - WAL_HEADER) % frame_len < FRAME_HEADER {
+            continue;
+        }
+        by_frame
+            .entry((offset - WAL_HEADER) / frame_len)
+            .or_default()
+            .push(i);
+    }
+    for (frame, indices) in by_frame {
+        let start = WAL_HEADER + frame * frame_len;
+        let (Some(header), Some(page)) = (
+            wal.get(start..start + 4),
+            wal.get(start + FRAME_HEADER..start + frame_len),
+        ) else {
+            continue;
+        };
+        let page_no = be32(header);
+        if page_no == 0 {
+            continue;
+        }
+        let page_start = (page_no - 1) * page_size;
+        let mut overlaid;
+        let image: &[u8] = if replayed.get(page_start..page_start + page_size) == Some(page) {
+            &replayed
+        } else {
+            overlaid = replayed.clone();
+            if overlaid.len() < page_start + page_size {
+                overlaid.resize(page_start + page_size, 0);
+            }
+            overlaid[page_start..page_start + page_size].copy_from_slice(page);
+            &overlaid
+        };
+        let mapped: Vec<usize> = indices
+            .iter()
+            .map(|&i| page_start + offsets[i] - start - FRAME_HEADER)
+            .collect();
+        let results = <Sqlite as super::Inspector>::inspect_many(&Sqlite, image, &mapped);
+        for (&i, result) in indices.iter().zip(results) {
+            out[i] = result.map(|mut inspection| {
+                inspection.summary = format!(
+                    "-wal frame {}, page {page_no}: {}",
+                    frame + 1,
+                    inspection.summary
+                );
+                if let serde_json::Value::Object(detail) = &mut inspection.detail {
+                    detail.insert("wal_frame".into(), json!(frame + 1));
+                    detail.insert("wal_page".into(), json!(page_no));
+                }
+                inspection
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_match_in_the_wal_resolves_through_the_main_database() {
+        let main = std::fs::read("tests/fixtures/wal_main.sqlite3").unwrap();
+        let wal = std::fs::read("tests/fixtures/wal_main.sqlite3-wal").unwrap();
+        let at = wal
+            .windows(13)
+            .position(|w| w == b"only-in-wal-1")
+            .expect("the fixture's WAL holds the value");
+        let header = 3; // inside the WAL header: not in any page
+        let found = super::inspect_wal(&main, &wal, &[at, header]);
+        let inspection = found[0]
+            .as_ref()
+            .expect("resolved through the main database");
+        assert!(
+            inspection.summary.contains("table: t"),
+            "{}",
+            inspection.summary
+        );
+        assert!(
+            inspection.summary.starts_with("-wal frame "),
+            "{}",
+            inspection.summary
+        );
+        assert_eq!(inspection.detail["wal_page"], 2);
+        assert!(found[1].is_none());
     }
 }

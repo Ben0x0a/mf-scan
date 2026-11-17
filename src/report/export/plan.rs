@@ -8,6 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
+
 use crate::core::layout::{attribute, sanitise_basename, sanitise_segment, split_dir_base};
 use crate::ops::search::MatchedFile;
 
@@ -46,7 +49,7 @@ pub struct ExportPlan {
 }
 
 /// One file whose output path collided with another's and was disambiguated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Renamed {
     /// The path inside the source.
     pub internal_path: String,
@@ -138,14 +141,21 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
     }
 }
 
-/// A path as a case-insensitive file system compares it: Unicode case folding, so
-/// `Été.jpg` and `été.jpg` clash as they do on APFS and NTFS.
+/// A path as a case- and normalisation-insensitive file system compares it.
 ///
-/// Limit: APFS also ignores the difference between composed and decomposed accents
-/// (`é` as one code point or two); that is not folded here, as it needs Unicode
-/// normalisation tables the project does not carry.
+/// Two folds, because a phone's file system (ext4, f2fs) compares names byte for
+/// byte while the export may land on macOS or Windows:
+///   • Unicode case: `Été.jpg` and `été.jpg` are one name on APFS and NTFS;
+///   • accent encoding: `é` stored as one code point (U+00E9, NFC) or as `e` plus a
+///     combining accent (U+0301, NFD) is one name on macOS.
+/// HOW: decompose, lowercase, recompose, so both spellings of an accented letter
+/// reach the same canonical string whatever case or form they started in.
 pub(super) fn fold_case(path: &str) -> String {
-    path.to_lowercase()
+    path.nfd()
+        .collect::<String>()
+        .to_lowercase()
+        .nfc()
+        .collect()
 }
 
 /// Give every item a destination no other item claims, comparing case-INSENSITIVELY.

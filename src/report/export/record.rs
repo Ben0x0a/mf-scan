@@ -11,6 +11,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::plan::Renamed;
 use crate::core::models::RunInfo;
 
 /// A file that was NOT written because its destination path would exceed the
@@ -116,16 +117,27 @@ struct ExportReport<'a> {
     file_count: usize,
     integrity: IntegritySummary,
     files: &'a [ExportedFile],
+    #[serde(flatten)]
+    notes: &'a ExportNotes,
+}
+
+/// What an export has to report besides the files it wrote. Each list is omitted
+/// from the JSON when empty, so a clean export's report stays short.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportNotes {
     /// Files not written because their path could not exist on this platform.
-    /// Omitted from the JSON when empty so a clean export's report is unchanged.
-    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
-    skipped_too_long: &'a [SkippedFile],
-    /// Files written but whose path is too long to move to Windows. Omitted when empty.
-    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
-    portability_warnings: &'a [SkippedFile],
-    /// Files whose decrypted copy could not be made. Omitted when empty.
-    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
-    undecrypted: &'a [SkippedFile],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_too_long: Vec<SkippedFile>,
+    /// Files written but whose path is too long to move to Windows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub portability_warnings: Vec<SkippedFile>,
+    /// Files whose decrypted copy could not be made (the original was exported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undecrypted: Vec<SkippedFile>,
+    /// Files written under another name because theirs was taken on disk: by a file
+    /// of an earlier export, or by one this file system treats as the same name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<Renamed>,
 }
 
 /// Aggregate integrity outcome over all exported files, surfaced at the head of
@@ -178,9 +190,7 @@ impl IntegritySummary {
 pub fn write_export_report(
     run: &RunInfo,
     files: &[ExportedFile],
-    skipped_too_long: &[SkippedFile],
-    portability_warnings: &[SkippedFile],
-    undecrypted: &[SkippedFile],
+    notes: &ExportNotes,
     w: &mut dyn Write,
 ) -> Result<()> {
     let report = ExportReport {
@@ -188,9 +198,7 @@ pub fn write_export_report(
         file_count: files.len(),
         integrity: IntegritySummary::of(files),
         files,
-        skipped_too_long,
-        portability_warnings,
-        undecrypted,
+        notes,
     };
     serde_json::to_writer_pretty(&mut *w, &report).context("failed writing export report")?;
     writeln!(w).context("failed writing export report")?;

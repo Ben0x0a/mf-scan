@@ -1,18 +1,18 @@
 //! Arguments for the `app` subcommand: locate and export an application's data.
 //!
-//! Defines: [`AppArgs`] and its three verbs ([`AppCommand`]) — `grep` (search the
-//! installed-app inventory), `paths` (list every data location of one app), and
-//! `export` (copy one app's data out, kind-labelled). The shared source-opening
-//! options live in [`AppSourceArgs`], flattened into each verb.
+//! Defines: [`AppArgs`] and its three verbs ([`AppCommand`]) — `list` (the
+//! installed-app inventory), `paths` (every data location of one app), and `export`
+//! (copy one app's data out, kind-labelled). The shared source-opening options live
+//! in [`AppSourceArgs`], flattened into each verb.
 //! Used by: `cli` (the `App` variant) and `run::app` (reads the fields).
 //! Uses: `clap` (derive), the shared `IoModeArg` from `common`, and
 //! `mf_scan::report::output::OutputFormat` (the `--format` value) /
 //! `mf_scan::report::export::DEFAULT_MAX_PATH_LEN` (the path-guard default).
 //!
-//! WHY `SOURCE` is the first positional in every verb (rather than the
-//! pattern/bundle-id first, as the top-level `grep` does): `app grep`'s pattern is
-//! optional, and clap cannot place an optional positional before a required one —
-//! so `SOURCE` leads uniformly and the selector follows.
+//! WHY the app comes first and `SOURCE` last in every verb: it is `grep`'s order
+//! (what to look for, then where). `list`'s pattern is optional, and clap cannot
+//! place an optional positional before a required one, so `list` takes one or two
+//! operands and the last is always the source.
 
 use std::path::PathBuf;
 
@@ -32,21 +32,19 @@ pub(crate) struct AppArgs {
 /// The `app` verbs, mirroring the top-level `grep`/`export` where they overlap.
 #[derive(Subcommand)]
 pub(crate) enum AppCommand {
-    /// List the installed apps: bundle id, name and size.
-    Grep(AppGrepArgs),
+    /// List the installed apps: bundle id, name, data size and team.
+    #[command(override_usage = "mf-scan app list [OPTIONS] [PATTERN] <SOURCE>")]
+    List(AppListArgs),
     /// List everywhere an app and its widgets, extensions and groups keep data.
     Paths(AppPathsArgs),
     /// Copy all of an app's data (and its groups) into a directory.
     Export(AppExportArgs),
 }
 
-/// How to open the acquisition — shared by all three verbs.
+/// How to open the acquisition — shared by all three verbs. The source itself is
+/// each verb's last positional.
 #[derive(Args)]
 pub(crate) struct AppSourceArgs {
-    /// An archive, a backup, or a folder with --dir-mode.
-    #[arg(value_name = "SOURCE")]
-    pub(crate) source: PathBuf,
-
     /// Read a folder source's files.
     #[arg(long = "dir-mode")]
     pub(crate) dir_mode: bool,
@@ -76,15 +74,15 @@ pub(crate) struct AppSourceArgs {
     pub(crate) backup_password: Option<String>,
 }
 
-/// Arguments for `app grep`.
+/// Arguments for `app list`.
 #[derive(Args)]
-pub(crate) struct AppGrepArgs {
+pub(crate) struct AppListArgs {
+    /// [PATTERN] SOURCE: an optional id/name filter, then the archive or folder.
+    #[arg(value_name = "OPERAND", num_args = 1..=2, required = true)]
+    pub(crate) operands: Vec<PathBuf>,
+
     #[command(flatten)]
     pub(crate) source: AppSourceArgs,
-
-    /// Text in the bundle id or name, ignoring case; omit to list every app.
-    #[arg(value_name = "PATTERN")]
-    pub(crate) pattern: Option<String>,
 
     /// Output format: txt or json.
     #[arg(short = 'f', long, default_value = "txt", hide_default_value = true)]
@@ -98,12 +96,16 @@ pub(crate) struct AppGrepArgs {
 /// Arguments for `app paths`.
 #[derive(Args)]
 pub(crate) struct AppPathsArgs {
-    #[command(flatten)]
-    pub(crate) source: AppSourceArgs,
-
     /// The app's bundle id (iOS) or package name (Android).
     #[arg(value_name = "BUNDLE_ID")]
     pub(crate) bundle_id: String,
+
+    /// An archive, a backup, or a folder with --dir-mode.
+    #[arg(value_name = "SOURCE")]
+    pub(crate) path: PathBuf,
+
+    #[command(flatten)]
+    pub(crate) source: AppSourceArgs,
 
     /// Leave out shared App Group containers.
     #[arg(long = "no-groups")]
@@ -121,12 +123,16 @@ pub(crate) struct AppPathsArgs {
 /// Arguments for `app export`.
 #[derive(Args)]
 pub(crate) struct AppExportArgs {
-    #[command(flatten)]
-    pub(crate) source: AppSourceArgs,
-
     /// The app's bundle id (iOS) or package name (Android).
     #[arg(value_name = "BUNDLE_ID")]
     pub(crate) bundle_id: String,
+
+    /// An archive, a backup, or a folder with --dir-mode.
+    #[arg(value_name = "SOURCE")]
+    pub(crate) path: PathBuf,
+
+    #[command(flatten)]
+    pub(crate) source: AppSourceArgs,
 
     /// Destination directory.
     #[arg(long = "to", value_name = "DIR")]
@@ -147,6 +153,10 @@ pub(crate) struct AppExportArgs {
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
+
+    /// Also write DIR.work/: a writable copy of the read-only export.
+    #[arg(long = "work-copy")]
+    pub(crate) work_copy: bool,
 
     /// Keychain/keystore dump: each app database it decrypts is also written
     /// decrypted, beside the original. A dump beside the source is found on its own.

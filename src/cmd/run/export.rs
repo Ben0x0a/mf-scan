@@ -15,7 +15,7 @@ use mf_scan::report::export::{self, ExportOutcome};
 
 use crate::cmd::cli::ExportArgs;
 use crate::cmd::support::exporting::{
-    report_portability_warnings, report_skipped_too_long, write_export_report_file,
+    report_export_notes, work_copy_if_requested, write_export_report_file,
 };
 use crate::cmd::support::reporting::{report_verify, sha256_hex};
 use crate::cmd::support::sources::{
@@ -72,10 +72,7 @@ fn run_manifest_export(
             bytes,
             skipped,
             report,
-            skipped_too_long,
-            portability_warnings,
-            // A manifest re-ingestion writes no decrypted copies.
-            undecrypted: _,
+            notes,
         } => {
             let note = if skipped > 0 {
                 format!("; {skipped} listed file(s) not found in archive")
@@ -84,20 +81,13 @@ fn run_manifest_export(
             };
             // Per-file integrity record beside the exported artefacts. Reuses the
             // manifest's run metadata so the report says what produced it.
-            write_export_report_file(
-                &args.to,
-                &manifest.run,
-                &report,
-                &skipped_too_long,
-                &portability_warnings,
-                &[],
-            )?;
+            write_export_report_file(&args.to, &manifest.run, &report, &notes)?;
             eprintln!(
-                "exported {files} files ({bytes} bytes) to {}{note}",
+                "exported {files} files ({bytes} bytes, read-only) to {}{note}",
                 args.to.display()
             );
-            report_skipped_too_long(&skipped_too_long);
-            report_portability_warnings(&portability_warnings);
+            report_export_notes(&report, &notes);
+            work_copy_if_requested(args.work_copy, &args.to)?;
         }
         ExportOutcome::Refused { total_size, cap } => {
             eprintln!(

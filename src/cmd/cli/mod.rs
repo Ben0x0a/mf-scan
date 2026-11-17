@@ -20,7 +20,7 @@ mod find;
 mod grep;
 
 pub(crate) use app::{
-    AppArgs, AppCommand, AppExportArgs, AppGrepArgs, AppPathsArgs, AppSourceArgs,
+    AppArgs, AppCommand, AppExportArgs, AppListArgs, AppPathsArgs, AppSourceArgs,
 };
 pub(crate) use backup::{
     BackupArgs, BackupCommand, BackupInfoArgs, BackupRebuildArgs, BackupSourceArgs,

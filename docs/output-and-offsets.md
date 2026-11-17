@@ -161,6 +161,7 @@ app.json:1
 | `sqlite` (in a row) | `{ "page": N, "table": "...", "rowid": N, "column": "...", "type": "TEXT", "cell": "..." }` | `table: T  column: C [TYPE]  row: R  cell: V` |
 | `sqlite` (BLOB cell, recognised) | the above **plus** `"blob_format": "bplist"` and `"blob_context": { … }` | `… [BLOB]  cell: <blob N bytes>  blob: bplist  key: $.…` |
 | `sqlite` (elsewhere) | `{ "page": N, "page_offset": N }` | `page: N  offset: N  (not in a table cell)` |
+| `sqlite` (in a `-wal`) | the row form above **plus** `"wal_frame": N, "wal_page": N`, resolved in the database with that frame applied (needs the main file in the source) | `-wal frame F, page P: table: T  column: C …` |
 
 `cell` (and the txt `cell:` field) is the **decoded**, length-capped, text-safe
 value — a TEXT/INTEGER/REAL value as text, a NULL as `NULL`, a BLOB as
@@ -295,8 +296,10 @@ does not prevent the rest of the scan from completing (degrade-don't-die).
 
 ## Export report (`export-report.json`)
 
-Every export (`search --export DIR` or the `export` subcommand) writes
-`DIR/export-report.json`: the `run` metadata plus one entry per written file —
+Every export (`grep`/`find`/`diff --export DIR`, `app export`, or the `export`
+subcommand) writes `DIR/export-report.json`, read-only like the files, and never over
+an earlier report (that one stays; the new one is `export-report.json~1`): the `run`
+metadata plus one entry per written file —
 its `internal_path`, `output_path` (relative to `DIR`), `size`, and `sha256`.
 This records the integrity hash of each exported artefact (main files and
 SQLite sidecars alike) beside the artefacts themselves.

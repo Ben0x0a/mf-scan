@@ -341,3 +341,40 @@ fn safe_join_blocks_backslash_traversal() {
     let result = safe_join(&dir, "folder/file.db");
     assert_eq!(result, dir.join("folder").join("file.db"));
 }
+
+#[test]
+fn names_differing_only_in_accent_encoding_clash() {
+    // One file named with a composed é (U+00E9), one with e + U+0301: distinct on a
+    // phone's file system, one name on macOS. The second must be renamed, not merged.
+    let composed = "Media/caf\u{e9}.jpg";
+    let decomposed = "Media/cafe\u{301}.jpg";
+    assert_ne!(composed, decomposed);
+    assert_eq!(
+        super::plan::fold_case(composed),
+        super::plan::fold_case(decomposed)
+    );
+    assert_eq!(
+        super::plan::fold_case("Media/CAF\u{c9}.jpg"),
+        super::plan::fold_case(decomposed),
+        "case and accent form fold together"
+    );
+}
+
+#[test]
+fn an_export_never_overwrites_and_writes_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("a.db");
+    let first = super::write_read_only(&dest, b"first").unwrap();
+    let second = super::write_read_only(&dest, b"second").unwrap();
+    assert_eq!(first, dest);
+    assert_eq!(second, dir.path().join("a.db~1"));
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        b"first",
+        "never overwritten"
+    );
+    assert_eq!(std::fs::read(&second).unwrap(), b"second");
+    for path in [&first, &second] {
+        assert!(std::fs::metadata(path).unwrap().permissions().readonly());
+    }
+}

@@ -167,6 +167,9 @@ struct JsonView<'a> {
     /// whose metadata plist was found in the source.
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle_id: Option<&'a str>,
+    /// True when the match is in the file's path, not its content. Omitted when false.
+    #[serde(skip_serializing_if = "is_false")]
+    path_match: bool,
 }
 
 impl<'a> From<&'a MatchRecord> for JsonView<'a> {
@@ -189,6 +192,7 @@ impl<'a> From<&'a MatchRecord> for JsonView<'a> {
             context: r.inspection.as_ref().map(|i| &i.detail),
             line: textual_line(r),
             bundle_id: r.bundle_id.as_deref(),
+            path_match: r.path_match,
         }
     }
 }
@@ -266,6 +270,8 @@ struct CsvView<'a> {
     line: Cow<'a, str>,
     /// The match's line number; empty unless `-n` was given.
     line_number: Option<u64>,
+    /// True when the match is in the file's path, not its content.
+    path_match: bool,
 }
 
 impl<'a> From<&'a MatchRecord> for CsvView<'a> {
@@ -284,6 +290,7 @@ impl<'a> From<&'a MatchRecord> for CsvView<'a> {
             context: r.inspection.as_ref().map_or("", |i| i.summary.as_str()),
             line: textual_line(r).unwrap_or(Cow::Borrowed("")),
             line_number: r.line_number,
+            path_match: r.path_match,
         }
     }
 }
@@ -303,7 +310,7 @@ fn write_txt(
         // --match-path: the "match" is the file's path itself, so print just the
         // path (the source archive joined like a folder), highlighting the part
         // the pattern matched. No in-file offset — there is no content position.
-        if style == TxtStyle::PathOnly {
+        if style == TxtStyle::PathOnly || r.path_match {
             let out = match &r.archive {
                 Some(a) => format!("{a}/{}", render_line(r, colourise)),
                 None => render_line(r, colourise),

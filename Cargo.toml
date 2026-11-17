@@ -1,6 +1,6 @@
 [package]
 name = "mf-scan"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 # Minimum supported Rust. 1.98 stabilised `slice::as_chunks`, which the hex, UTF-16
 # and WAL-checksum decoders use so their fixed-size indices are checked at compile
@@ -46,6 +46,9 @@ sha2 = "0.10"
 # The spill file for decoding a large Android backup: unnamed and deleted by the OS,
 # on every platform. Already in the build as a test dependency.
 tempfile = "3.27.0"
+# Export name clashes: compare file names the way macOS does, which treats the
+# composed and decomposed forms of an accented letter as one name. Adds `tinyvec`.
+unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 # Used by integration tests to fabricate DEFLATE streams (a normal dependency

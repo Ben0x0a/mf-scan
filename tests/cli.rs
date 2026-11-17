@@ -711,7 +711,7 @@ fn help_and_short_help_are_the_same_screen() {
         &["export"],
         &["diff"],
         &["app"],
-        &["app", "grep"],
+        &["app", "list"],
         &["app", "paths"],
         &["app", "export"],
         &["backup"],

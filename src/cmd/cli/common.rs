@@ -148,6 +148,10 @@ pub(crate) struct ExportSink {
     /// Skip and record longer paths (default 260, Windows); 0 is off.
     #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
     pub(crate) max_path_len: usize,
+
+    /// Also write DIR.work/: a writable copy of the read-only export.
+    #[arg(long = "work-copy")]
+    pub(crate) work_copy: bool,
 }
 
 /// Parse a human size like `1024`, `200KB`, `50M`, `2G` into bytes (1024-based).

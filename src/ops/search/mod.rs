@@ -103,6 +103,17 @@ impl<'a> Query<'a> {
     }
 }
 
+/// What a search matches its pattern against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOn {
+    /// File contents, as grep does.
+    Content,
+    /// Internal paths only (`--match-path`), as find does; no content is read.
+    Path,
+    /// Both (`--and-paths`): each file's content, plus its path, in one pass.
+    Both,
+}
+
 /// Search a ZIP `archive` for `query` — a thin wrapper that opens a [`ZipSource`]
 /// over the memory-mapped bytes and delegates to [`search_source`]. Kept so callers
 /// (and tests) holding raw archive bytes need not build the source themselves.
@@ -110,13 +121,13 @@ pub fn search_with_query(
     archive: &[u8],
     query: &Query,
     deep: bool,
-    match_path: bool,
+    match_on: MatchOn,
     filter: &EntryFilter,
     decrypt: Option<&DecryptionContext>,
     progress: &dyn Progress,
 ) -> Result<Findings> {
     let source = ZipSource::open(archive)?;
-    search_source(&source, query, deep, match_path, filter, decrypt, progress)
+    search_source(&source, query, deep, match_on, filter, decrypt, progress)
 }
 
 /// Search every file in `source` for `query`, reporting progress via `progress`.
@@ -127,15 +138,14 @@ pub fn search_with_query(
 /// order within each entry). Each entry's content is obtained once (through the
 /// source) and reused for searching, inspection, and the matched-file list.
 ///
-/// When `match_path` is set, the pattern is matched against each entry's internal
-/// **path** instead of its content (no bytes are read); each matching file is
-/// reported once. The type/media filter, inspection, and base64 search are all
-/// skipped in this mode (a path is not base64).
+/// `match_on` says what the pattern is matched against: the content (grep), the
+/// internal **path** (no bytes are read; each matching file reported once; the
+/// type/media filter, inspection and base64 do not apply), or both, in one pass.
 pub fn search_source(
     source: &dyn Source,
     query: &Query,
     deep: bool,
-    match_path: bool,
+    match_on: MatchOn,
     filter: &EntryFilter,
     decrypt: Option<&DecryptionContext>,
     progress: &dyn Progress,
@@ -157,7 +167,7 @@ pub fn search_source(
         .par_iter()
         .map(|entry| {
             classify_entry(
-                source, entry, query, deep, match_path, filter, decrypt, progress,
+                source, entry, query, deep, match_on, filter, decrypt, progress,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -307,7 +317,7 @@ mod tests {
             &zip,
             &Query::plain(&re),
             false,
-            false,
+            MatchOn::Content,
             &EntryFilter::all(),
             Some(&ctx),
             &NoProgress,
@@ -384,7 +394,7 @@ mod tests {
             &zip,
             &Query::plain(&re),
             false,
-            false,
+            MatchOn::Content,
             &EntryFilter::all(),
             Some(&ctx),
             &NoProgress,

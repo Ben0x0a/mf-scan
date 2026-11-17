@@ -414,7 +414,7 @@ fn every_other_command_reads_an_android_backup_directly() {
         "apps/com.x/db/m.db\n"
     );
 
-    let app = mf_scan(dir.path(), &["app", "grep", "phone.ab"]);
+    let app = mf_scan(dir.path(), &["app", "list", "phone.ab"]);
     assert!(
         String::from_utf8_lossy(&app.stdout).contains("com.x"),
         "{}",
@@ -426,7 +426,7 @@ fn every_other_command_reads_an_android_backup_directly() {
         dir.path(),
         &["backup", "rebuild", "phone.ab", "--to", "device.zip"],
     );
-    let rebuilt = mf_scan(dir.path(), &["app", "grep", "device.zip"]);
+    let rebuilt = mf_scan(dir.path(), &["app", "list", "device.zip"]);
     assert!(
         String::from_utf8_lossy(&rebuilt.stdout).contains("com.x"),
         "{}",

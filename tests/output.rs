@@ -55,6 +55,7 @@ fn binary_record() -> Vec<MatchRecord> {
         encoding: Encoding::Plain,
         decoded: None,
         bundle_id: None,
+        path_match: false,
     }]
 }
 
@@ -76,6 +77,7 @@ fn sample() -> Vec<MatchRecord> {
             encoding: Encoding::Plain,
             decoded: None,
             bundle_id: None,
+            path_match: false,
         },
         MatchRecord {
             archive: None,
@@ -93,6 +95,7 @@ fn sample() -> Vec<MatchRecord> {
             encoding: Encoding::Plain,
             decoded: None,
             bundle_id: None,
+            path_match: false,
         },
     ]
 }
@@ -160,13 +163,13 @@ fn csv_has_header_and_rows() {
     let mut lines = out.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "archive,path,file_start,file_offset,archive_offset,compressed,decrypted,encoding,decoded,format,context,line,line_number"
+        "archive,path,file_start,file_offset,archive_offset,compressed,decrypted,encoding,decoded,format,context,line,line_number,path_match"
     );
     // Single archive => empty archive column; not decrypted; plain encoding with no
     // decoded value; format/context empty without inspect; offsets are 0x… hex.
     assert_eq!(
         lines.next().unwrap(),
-        ",sub/b.log,0x64,0x11,0x75,false,false,plain,,,,another SECRET line,"
+        ",sub/b.log,0x64,0x11,0x75,false,false,plain,,,,another SECRET line,,false"
     );
 }
 
@@ -188,6 +191,7 @@ fn txt_shows_hex_file_offset_for_compressed() {
         encoding: Encoding::Plain,
         decoded: None,
         bundle_id: None,
+        path_match: false,
     }];
 
     let out = render(&records, OutputFormat::Txt, false);
@@ -218,6 +222,7 @@ fn inspected() -> Vec<MatchRecord> {
         encoding: Encoding::Plain,
         decoded: None,
         bundle_id: None,
+        path_match: false,
     }]
 }
 

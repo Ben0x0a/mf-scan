@@ -38,4 +38,8 @@ pub(crate) struct ExportArgs {
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
+
+    /// Also write DIR.work/: a writable copy of the read-only export.
+    #[arg(long = "work-copy")]
+    pub(crate) work_copy: bool,
 }

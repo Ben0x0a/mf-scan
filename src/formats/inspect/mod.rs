@@ -38,6 +38,7 @@ mod json;
 mod nskeyed;
 mod plist;
 mod sqlite;
+pub(crate) use sqlite::inspect_wal;
 mod txt;
 mod xml;
 

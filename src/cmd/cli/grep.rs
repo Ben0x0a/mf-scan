@@ -59,8 +59,16 @@ pub(crate) struct GrepArgs {
     pub(crate) extended_regexp: bool,
 
     /// Match file paths, not contents (see also `mf-scan find`).
-    #[arg(long = "match-path", help_heading = "Matching")]
+    #[arg(
+        long = "match-path",
+        help_heading = "Matching",
+        conflicts_with = "and_paths"
+    )]
     pub(crate) match_path: bool,
+
+    /// Match contents and file paths too, in one pass (grep + find).
+    #[arg(long = "and-paths", help_heading = "Matching")]
+    pub(crate) and_paths: bool,
 
     /// Also find the pattern's base64 encoding (requires -F).
     #[arg(long = "base64", help_heading = "Matching")]

@@ -202,7 +202,9 @@ pub struct AppSummary {
     pub id: String,
     /// Human display name, best-effort (iOS only); `None` when unavailable.
     pub name: Option<String>,
-    pub container_count: usize,
+    /// Bytes in the app's own data container(s). Extensions and App Groups are not
+    /// counted: resolving them for every app would make the listing slow; `app paths`
+    /// lists them for one app.
     pub total_size: u64,
     /// The app's code-signing record from MobileContainerManager (iOS FFS only);
     /// `None` when the source carries no such record.

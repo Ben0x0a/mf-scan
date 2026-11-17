@@ -18,7 +18,7 @@ use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::source::Source;
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::engine::NoProgress;
-use mf_scan::ops::search::{Query, search_source};
+use mf_scan::ops::search::{MatchOn, Query, search_source};
 use mf_scan::platform::ios::containers::AppContainerMap;
 use regex::bytes::Regex;
 use tempfile::tempdir;
@@ -81,7 +81,7 @@ fn container_hit_gets_bundle_id_outside_does_not() {
         &src,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &EntryFilter::all(),
         None,
         &NoProgress,

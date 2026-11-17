@@ -14,7 +14,7 @@ use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::source::Source;
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::engine::NoProgress;
-use mf_scan::ops::search::{Query, search_source};
+use mf_scan::ops::search::{MatchOn, Query, search_source};
 use mf_scan::report::export::{self, ExportOutcome};
 use regex::bytes::Regex;
 use tempfile::tempdir;
@@ -106,7 +106,7 @@ fn search_and_export_run_over_a_folder_source() {
         &src,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &EntryFilter::all(),
         None,
         &NoProgress,
@@ -146,7 +146,7 @@ fn unreadable_file_is_counted_and_does_not_abort_the_scan() {
         &src,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &EntryFilter::all(),
         None,
         &NoProgress,

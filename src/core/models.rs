@@ -385,6 +385,10 @@ pub struct MatchRecord {
     /// outside any known container.
     /// Serialised by `report::output::JsonView` (not directly on this struct).
     pub bundle_id: Option<String>,
+    /// True when the pattern matched the file's PATH, not its content
+    /// (`--match-path`, or the path half of `--and-paths`): `line` then holds the
+    /// path and there is no in-file offset.
+    pub path_match: bool,
 }
 
 impl MatchRecord {
@@ -440,6 +444,7 @@ impl MatchRecord {
             encoding: Encoding::Plain,
             decoded: None,
             bundle_id: None,
+            path_match: false,
         }
     }
 }

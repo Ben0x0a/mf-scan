@@ -14,7 +14,7 @@ use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::zip::ZipSource;
 use mf_scan::engine::NoProgress;
-use mf_scan::ops::search::{Query, search_with_query};
+use mf_scan::ops::search::{MatchOn, Query, search_with_query};
 use mf_scan::report::export::{self, ExportOutcome};
 use regex::bytes::Regex;
 
@@ -57,7 +57,7 @@ fn findings_two_infoplists() -> (Vec<u8>, mf_scan::ops::search::Findings) {
         &zip,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &EntryFilter::all(),
         None,
         &NoProgress,
@@ -160,7 +160,7 @@ fn export_includes_sqlite_sidecars() {
         &zip,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &EntryFilter::all(),
         None,
         &NoProgress,

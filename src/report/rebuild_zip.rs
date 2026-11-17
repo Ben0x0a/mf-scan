@@ -36,6 +36,7 @@ use crate::platform::ios::backup::common::{ManifestDb, manifest_zip_paths_csv};
 use crate::report::export::{
     DEFAULT_MAX_PATH_LEN, ExportPlan, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
 };
+use crate::report::export::{make_writable, set_read_only};
 use crate::report::zip_writer::ZipWriter;
 
 /// The traceability record's name inside the archive. No device path can take this or
@@ -145,6 +146,40 @@ impl Drop for PartialFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+/// Move a finished archive from `partial` to `output`, write its `.sha256` sidecar,
+/// and make both read-only. Returns the sidecar's path.
+///
+/// An archive already at `output` (callers allow it only with `--force`) and its
+/// sidecar are removed first: they are read-only, and Windows refuses to replace a
+/// read-only file. Shared by the backup rebuild and `decrypt --to`.
+pub(crate) fn publish_archive(
+    partial: &Path,
+    output: &Path,
+    archive_sha256: &str,
+) -> Result<PathBuf> {
+    let sidecar = sidecar_path(output);
+    remove_read_only(output)?;
+    remove_read_only(&sidecar)?;
+    fs::rename(partial, output)
+        .with_context(|| format!("cannot move the archive to {}", output.display()))?;
+    set_read_only(output)?;
+    let file_name = output.file_name().unwrap_or_default().to_string_lossy();
+    // `sha256sum` format, verifiable with `sha256sum -c` or `shasum -a 256 -c`.
+    fs::write(&sidecar, format!("{archive_sha256}  {file_name}\n"))
+        .with_context(|| format!("cannot write {}", sidecar.display()))?;
+    set_read_only(&sidecar)?;
+    Ok(sidecar)
+}
+
+/// Remove `path` if it exists, read-only or not.
+fn remove_read_only(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    make_writable(path)?;
+    fs::remove_file(path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
 /// Where the sidecar for `output` goes: `<name>.zip.sha256`.
@@ -300,13 +335,7 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
     let expected = report.len() + directory_count + root.member_count() + 1;
     let archive_sha256 = check_and_hash(&partial.0, expected)?;
 
-    fs::rename(&partial.0, output)
-        .with_context(|| format!("cannot move the archive to {}", output.display()))?;
-    let sidecar = sidecar_path(output);
-    let file_name = output.file_name().unwrap_or_default().to_string_lossy();
-    // `sha256sum` format, verifiable with `sha256sum -c` or `shasum -a 256 -c`.
-    fs::write(&sidecar, format!("{archive_sha256}  {file_name}\n"))
-        .with_context(|| format!("cannot write {}", sidecar.display()))?;
+    let sidecar = publish_archive(&partial.0, output, &archive_sha256)?;
 
     Ok(RebuildOutcome {
         report,

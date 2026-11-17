@@ -1,7 +1,7 @@
 //! The `app` subcommand: locate and export an application's data.
 //!
 //! Defines: [`run_app`] (dispatches the three verbs) and a private helper per verb
-//! — `app grep` (inventory), `app paths` (per-app data locations), `app export`
+//! — `app list` (inventory), `app paths` (per-app data locations), `app export`
 //! (copy one app's data out, kind-labelled).
 //! Used by: `run` (dispatched from `main`).
 //! Uses: `mf_scan::ops::apps` (the platform-agnostic catalogue and selection),
@@ -21,12 +21,11 @@ use mf_scan::report::export::{self, ExportOutcome};
 use mf_scan::report::output::OutputFormat;
 
 use crate::cmd::cli::{
-    AppArgs, AppCommand, AppExportArgs, AppGrepArgs, AppPathsArgs, AppSourceArgs,
+    AppArgs, AppCommand, AppExportArgs, AppListArgs, AppPathsArgs, AppSourceArgs,
 };
 use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
 use crate::cmd::support::exporting::{
-    report_decrypted_copies, report_integrity, report_portability_warnings,
-    report_skipped_too_long, write_export_report_file,
+    report_export_notes, work_copy_if_requested, write_export_report_file,
 };
 use crate::cmd::support::reporting::{emit, report_verify, sha256_hex};
 use crate::cmd::support::sources::{
@@ -36,19 +35,25 @@ use crate::cmd::support::sources::{
 /// Run the `app` subcommand.
 pub(crate) fn run_app(args: AppArgs) -> Result<()> {
     match args.command {
-        AppCommand::Grep(a) => run_grep(a),
+        AppCommand::List(a) => run_list(a),
         AppCommand::Paths(a) => run_paths(a),
         AppCommand::Export(a) => run_export(a),
     }
 }
 
-/// `app grep`: list the installed-app inventory, optionally filtered by PATTERN.
-fn run_grep(args: AppGrepArgs) -> Result<()> {
-    open_app_source(&args.source, |source, _raw, _path| {
+/// `app list`: list the installed-app inventory, optionally filtered by PATTERN.
+fn run_list(args: AppListArgs) -> Result<()> {
+    // `[PATTERN] SOURCE`, as grep: the last operand is always the source.
+    let (source_path, pattern) = match args.operands.as_slice() {
+        [source] => (source, None),
+        [pattern, source] => (source, Some(pattern.to_string_lossy().into_owned())),
+        _ => unreachable!("clap allows one or two operands"),
+    };
+    open_app_source(source_path, &args.source, |source, _raw, _path| {
         let catalog = AppCatalog::build(source);
         warn_if_unknown(catalog.platform);
         note_mcm_wal(&catalog);
-        let apps = catalog.inventory(source, args.pattern.as_deref());
+        let apps = catalog.inventory(source, pattern.as_deref());
         emit(args.output.as_deref(), |w| {
             write_inventory(&apps, args.format, w)
         })
@@ -58,7 +63,7 @@ fn run_grep(args: AppGrepArgs) -> Result<()> {
 /// `app paths`: list every data location of one app (its own data, extensions/
 /// widgets, and — unless `--no-groups` — its App Groups).
 fn run_paths(args: AppPathsArgs) -> Result<()> {
-    open_app_source(&args.source, |source, _raw, _path| {
+    open_app_source(&args.path, &args.source, |source, _raw, _path| {
         let catalog = AppCatalog::build(source);
         warn_if_unknown(catalog.platform);
         note_mcm_wal(&catalog);
@@ -79,7 +84,7 @@ fn run_paths(args: AppPathsArgs) -> Result<()> {
 /// `app export`: copy all of an app's data out, one subfolder per container, with
 /// the on-device tree preserved and a per-file integrity report.
 fn run_export(args: AppExportArgs) -> Result<()> {
-    open_app_source(&args.source, |source, raw, path| {
+    open_app_source(&args.path, &args.source, |source, raw, path| {
         let verify_before = args.verify.then(|| raw.map(sha256_hex)).flatten();
 
         let catalog = AppCatalog::build(source);
@@ -131,7 +136,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
 
         // Keys from a dump beside the source (or --keyfile) give each app database
         // a decrypted copy beside its original.
-        let decrypt_ctx = build_decryption_context(&args.keys, &[args.source.source.as_path()])?;
+        let decrypt_ctx = build_decryption_context(&args.keys, &[args.path.as_path()])?;
         let source_ctx = context_for_source(decrypt_ctx.as_ref(), source);
         let decryptor = source_ctx
             .as_deref()
@@ -150,30 +155,19 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                 files: n,
                 bytes,
                 report,
-                skipped_too_long,
-                portability_warnings,
-                undecrypted,
+                notes,
                 ..
             } => {
-                write_export_report_file(
-                    &args.to,
-                    &run,
-                    &report,
-                    &skipped_too_long,
-                    &portability_warnings,
-                    &undecrypted,
-                )?;
+                write_export_report_file(&args.to, &run, &report, &notes)?;
                 eprintln!(
-                    "exported {n} file(s) ({bytes} bytes) for {} from {} container(s) to {}",
+                    "exported {n} file(s) ({bytes} bytes, read-only) for {} from {} container(s) to {}",
                     args.bundle_id,
                     containers.len(),
                     args.to.display()
                 );
                 report_group_attribution(&containers);
-                report_decrypted_copies(&report, &undecrypted);
-                report_integrity(&report);
-                report_skipped_too_long(&skipped_too_long);
-                report_portability_warnings(&portability_warnings);
+                report_export_notes(&report, &notes);
+                work_copy_if_requested(args.work_copy, &args.to)?;
             }
             ExportOutcome::Refused { total_size, cap } => {
                 eprintln!(
@@ -196,11 +190,12 @@ fn run_export(args: AppExportArgs) -> Result<()> {
 /// a folder/ranged source), and the source's display path; then surface any
 /// backup-unlock provenance on stderr.
 fn open_app_source<R>(
+    path: &std::path::Path,
     src: &AppSourceArgs,
     f: impl FnOnce(&dyn Source, Option<&[u8]>, &str) -> Result<R>,
 ) -> Result<R> {
     // `recursive = false`: an app command reads exactly one acquisition.
-    let resolved = resolve_sources(std::slice::from_ref(&src.source), src.dir_mode, false)?
+    let resolved = resolve_sources(&[path.to_path_buf()], src.dir_mode, false)?
         .sources
         .into_iter()
         .next()
@@ -289,7 +284,7 @@ fn platform_label(platform: Platform) -> &'static str {
     }
 }
 
-/// Write the `app grep` inventory in the chosen format.
+/// Write the `app list` inventory in the chosen format.
 fn write_inventory(
     apps: &[mf_scan::ops::apps::AppSummary],
     format: OutputFormat,
@@ -300,10 +295,9 @@ fn write_inventory(
             for s in apps {
                 writeln!(
                     w,
-                    "{}\t{}\t{} container(s)\t{} bytes\t{}",
+                    "{}\t{}\t{} bytes\t{}",
                     s.id,
                     s.name.as_deref().unwrap_or("-"),
-                    s.container_count,
                     s.total_size,
                     s.signing
                         .as_ref()
@@ -318,7 +312,7 @@ fn write_inventory(
             writeln!(w)?;
             Ok(())
         }
-        OutputFormat::Csv => bail!("app grep supports --format txt or json"),
+        OutputFormat::Csv => bail!("app list supports --format txt or json"),
     }
 }
 
@@ -468,13 +462,12 @@ mod tests {
         assert!(v["containers"].as_array().unwrap().is_empty());
     }
 
-    /// Locks the `app grep` JSON shape.
+    /// Locks the `app list` JSON shape.
     #[test]
-    fn app_grep_json_shape() {
+    fn app_list_json_shape() {
         let apps = vec![AppSummary {
             id: "com.x.App".into(),
             name: Some("App".into()),
-            container_count: 2,
             total_size: 10,
             signing: Some(SigningRecord {
                 team_identifier: Some("TEAMID1234".into()),
@@ -483,26 +476,25 @@ mod tests {
         }];
         let v = to_json(|w| write_inventory(&apps, OutputFormat::Json, w));
         let obj = v.as_array().unwrap()[0].as_object().unwrap();
-        for key in ["id", "name", "container_count", "total_size", "signing"] {
+        for key in ["id", "name", "total_size", "signing"] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
-        assert_eq!(obj.len(), 5);
+        assert_eq!(obj.len(), 4);
         assert_eq!(obj["signing"]["team_identifier"], "TEAMID1234");
     }
 
     /// An app with no MCM record omits `signing` entirely (Android, backups).
     #[test]
-    fn app_grep_json_omits_absent_signing() {
+    fn app_list_json_omits_absent_signing() {
         let apps = vec![AppSummary {
             id: "com.whatsapp".into(),
             name: None,
-            container_count: 1,
             total_size: 10,
             signing: None,
         }];
         let v = to_json(|w| write_inventory(&apps, OutputFormat::Json, w));
         let obj = v.as_array().unwrap()[0].as_object().unwrap();
         assert!(!obj.contains_key("signing"));
-        assert_eq!(obj.len(), 4);
+        assert_eq!(obj.len(), 3);
     }
 }

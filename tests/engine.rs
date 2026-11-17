@@ -15,7 +15,7 @@ use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use mf_scan::core::filter::EntryFilter;
 use mf_scan::engine::{NoProgress, Progress};
-use mf_scan::ops::search::{Findings, Query, search_with_query};
+use mf_scan::ops::search::{Findings, MatchOn, Query, search_with_query};
 use regex::bytes::Regex;
 
 /// A filter that searches everything.
@@ -37,7 +37,11 @@ fn search_plain(
         zip,
         &Query::plain(&re),
         deep,
-        match_path,
+        if match_path {
+            MatchOn::Path
+        } else {
+            MatchOn::Content
+        },
         filter,
         None,
         &NoProgress,
@@ -184,6 +188,46 @@ fn match_path_lists_files_whose_path_matches() {
     assert_eq!(findings.files.len(), 1);
 }
 
+#[test]
+fn and_paths_finds_names_and_contents_in_one_pass() {
+    let files = [
+        FileSpec::stored("app/banking/creds.db", b"no hit in content"),
+        FileSpec::stored("app/photos/img.jpg", b"banking is only in this content"),
+        FileSpec::stored("app/banking/notes.txt", b"banking in both"),
+        FileSpec::stored("other.txt", b"nothing"),
+    ];
+    let zip = build_zip(&files, false);
+    let re = Regex::new("banking").unwrap();
+    let findings = search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        MatchOn::Both,
+        &EntryFilter::all(),
+        None,
+        &NoProgress,
+    )
+    .unwrap();
+
+    let hits: Vec<(&str, bool)> = findings
+        .records
+        .iter()
+        .map(|r| (r.path.as_str(), r.path_match))
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            ("app/banking/creds.db", true),
+            ("app/photos/img.jpg", false),
+            ("app/banking/notes.txt", true),
+            ("app/banking/notes.txt", false),
+        ],
+        "path hits come first for a file, then its content hits"
+    );
+    // One matched file per file, whichever half (or both) matched.
+    assert_eq!(findings.files.len(), 3);
+}
+
 #[derive(Default)]
 struct CountProgress {
     total: AtomicUsize,
@@ -215,7 +259,7 @@ fn progress_counts_every_searched_entry() {
         &zip,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &no_filter(),
         None,
         &all,
@@ -231,7 +275,7 @@ fn progress_counts_every_searched_entry() {
         &zip,
         &Query::plain(&re),
         false,
-        false,
+        MatchOn::Content,
         &only_db,
         None,
         &filtered,

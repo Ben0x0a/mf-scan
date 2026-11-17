@@ -63,9 +63,9 @@ Examples:
 /// Shown by `mf-scan app -h`.
 pub(crate) const APP: &str = "\
 Examples:
-  mf-scan app grep case.zip whatsapp                    # list apps, optionally filtered
-  mf-scan app paths case.zip com.whatsapp.WhatsApp      # everywhere it keeps data
-  mf-scan app export case.zip com.whatsapp.WhatsApp --to ./out --max-size 5G";
+  mf-scan app list whatsapp case.zip                    # list apps, optionally filtered
+  mf-scan app paths com.whatsapp.WhatsApp case.zip      # everywhere it keeps data
+  mf-scan app export com.whatsapp.WhatsApp case.zip --to ./out --max-size 5G";
 
 /// Shown by `mf-scan backup -h`.
 pub(crate) const BACKUP: &str = "\

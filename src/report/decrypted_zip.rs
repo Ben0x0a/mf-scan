@@ -33,7 +33,7 @@ use crate::core::source::zip::ZipSource;
 use crate::core::util::{UtcTime, sha256_hex};
 use crate::ops::decrypting::DerivedCopy;
 use crate::report::export::decrypted_name;
-use crate::report::rebuild_zip::{PartialFile, check_and_hash, now_unix, sidecar_path};
+use crate::report::rebuild_zip::{PartialFile, check_and_hash, now_unix, publish_archive};
 use crate::report::zip_writer::ZipWriter;
 
 /// The record of what was decrypted, inside the archive. No device path starts with
@@ -199,13 +199,7 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
 
     let expected = original_members + decrypted.len() + 1;
     let archive_sha256 = check_and_hash(&partial.0, expected)?;
-    fs::rename(&partial.0, output)
-        .with_context(|| format!("cannot move the archive to {}", output.display()))?;
-    let sidecar = sidecar_path(output);
-    let file_name = output.file_name().unwrap_or_default().to_string_lossy();
-    // `sha256sum` format, verifiable with `sha256sum -c` or `shasum -a 256 -c`.
-    fs::write(&sidecar, format!("{archive_sha256}  {file_name}\n"))
-        .with_context(|| format!("cannot write {}", sidecar.display()))?;
+    let sidecar = publish_archive(&partial.0, output, &archive_sha256)?;
 
     Ok(DecryptedZipOutcome {
         decrypted,
@@ -278,6 +272,7 @@ mod tests {
     use super::*;
     use crate::core::models::Entry;
     use crate::ops::decrypting::Derived;
+    use crate::report::rebuild_zip::sidecar_path;
 
     /// "Decrypts" any member named `*.enc` by upper-casing it; fails on `bad.enc`.
     struct Upper;

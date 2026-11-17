@@ -24,7 +24,7 @@ use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
 use mf_scan::ops::apps::expand_app_globs;
 use mf_scan::ops::search;
-use mf_scan::ops::search::Query;
+use mf_scan::ops::search::{MatchOn, Query};
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{
@@ -575,6 +575,17 @@ struct SearchCtx<'a> {
     backup_record: &'a RefCell<BackupFacts>,
 }
 
+/// What the pattern is matched against, from `--match-path` / `--and-paths`.
+fn match_on(cli: &GrepArgs) -> MatchOn {
+    if cli.match_path {
+        MatchOn::Path
+    } else if cli.and_paths {
+        MatchOn::Both
+    } else {
+        MatchOn::Content
+    }
+}
+
 /// Open one source, search it, and hand the findings to `handle`; then fold the
 /// source's stats/decryptions into the run totals and emit the `--verify`
 /// attestation. The shared skeleton of the `--count` and records branches —
@@ -612,7 +623,7 @@ fn with_searched_source(
                 source,
                 ctx.query,
                 ctx.deep,
-                ctx.cli.match_path,
+                match_on(ctx.cli),
                 filter,
                 source_ctx.as_deref(),
                 !ctx.cli.quiet,

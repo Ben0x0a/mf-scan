@@ -2,9 +2,10 @@
 //!
 //! Defines: [`run_export_sink`] (the one manifest/export/status pipeline),
 //! [`export_if_requested`] (the search-time wrapper over it), and
-//! [`write_export_report_file`] (the per-export SHA-256 integrity report).
-//! Used by: `run::grep` (`export_if_requested`), `run::diff` (`run_export_sink`),
-//! and `run::export` (`write_export_report_file`).
+//! [`write_export_report_file`] (the per-export SHA-256 integrity report),
+//! [`report_export_notes`] and [`work_copy_if_requested`].
+//! Used by: `run::grep` (`export_if_requested`), `run::diff`/`run::find`
+//! (`run_export_sink`), and `run::export`/`run::app` (the report, notes, work copy).
 //! Uses: `mf_scan::report::export` (the library export engine) and `crate::cmd::cli`.
 
 use std::fs::File;
@@ -19,7 +20,8 @@ use mf_scan::decrypt::DecryptionContext;
 use mf_scan::ops::decrypting::{DerivedCopy, SourceDecryptor};
 use mf_scan::ops::search::{Findings, MatchedFile};
 use mf_scan::report::export::{
-    self, ExportOutcome, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
+    self, ExportNotes, ExportOutcome, ExportedFile, IntegritySummary, Renamed, SkippedFile,
+    StoredIntegrity,
 };
 
 use crate::cmd::cli::ExportSink;
@@ -90,27 +92,16 @@ pub(crate) fn run_export_sink(
                 files: n,
                 bytes,
                 report,
-                skipped_too_long,
-                portability_warnings,
-                undecrypted,
+                notes,
                 ..
             } => {
-                write_export_report_file(
-                    dir,
-                    run,
-                    &report,
-                    &skipped_too_long,
-                    &portability_warnings,
-                    &undecrypted,
-                )?;
+                write_export_report_file(dir, run, &report, &notes)?;
                 eprintln!(
-                    "exported {n} {what} file(s) ({bytes} bytes) to {}",
+                    "exported {n} {what} file(s) ({bytes} bytes, read-only) to {}",
                     dir.display()
                 );
-                report_decrypted_copies(&report, &undecrypted);
-                report_integrity(&report);
-                report_skipped_too_long(&skipped_too_long);
-                report_portability_warnings(&portability_warnings);
+                report_export_notes(&report, &notes);
+                work_copy_if_requested(sink.work_copy, dir)?;
             }
             ExportOutcome::Refused { total_size, cap } => {
                 eprintln!(
@@ -126,7 +117,7 @@ pub(crate) fn run_export_sink(
 
 /// Announce the decrypted copies an export wrote beside their originals, and loudly
 /// the databases that should have had one but did not decrypt.
-pub(crate) fn report_decrypted_copies(report: &[ExportedFile], undecrypted: &[SkippedFile]) {
+fn report_decrypted_copies(report: &[ExportedFile], undecrypted: &[SkippedFile]) {
     let copies: Vec<&ExportedFile> = report.iter().filter(|f| f.derived.is_some()).collect();
     if !copies.is_empty() {
         eprintln!(
@@ -199,7 +190,7 @@ pub(crate) fn report_integrity(report: &[ExportedFile]) {
 /// path exceeded the length guard — one line per file, so a portability problem
 /// (typically Windows `MAX_PATH`) cannot pass unnoticed. The files are also listed
 /// in `export-report.json`.
-pub(crate) fn report_skipped_too_long(skipped: &[SkippedFile]) {
+fn report_skipped_too_long(skipped: &[SkippedFile]) {
     if skipped.is_empty() {
         return;
     }
@@ -212,10 +203,49 @@ pub(crate) fn report_skipped_too_long(skipped: &[SkippedFile]) {
     }
 }
 
+/// Announce everything an export has to report besides its files: decrypted copies,
+/// integrity, and the files skipped, renamed or not portable.
+pub(crate) fn report_export_notes(report: &[ExportedFile], notes: &ExportNotes) {
+    report_decrypted_copies(report, &notes.undecrypted);
+    report_integrity(report);
+    report_skipped_too_long(&notes.skipped_too_long);
+    report_portability_warnings(&notes.portability_warnings);
+    report_renamed_on_disk(&notes.renamed);
+}
+
+/// Announce files written under another name because theirs was taken on disk.
+fn report_renamed_on_disk(renamed: &[Renamed]) {
+    if renamed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "⚠ {} file(s) written under another name, never over an existing file \
+         (a file this file system treats as the same name, or one already in the folder):",
+        renamed.len()
+    );
+    for r in renamed {
+        eprintln!("    {} -> {}", r.wanted, r.used);
+    }
+}
+
+/// With `--work-copy`, copy the finished export to `<dir>.work/`, writable.
+pub(crate) fn work_copy_if_requested(wanted: bool, dir: &Path) -> Result<()> {
+    if !wanted {
+        return Ok(());
+    }
+    let copy = export::work_copy(dir)?;
+    eprintln!(
+        "work copy: {} file(s), writable, each checked identical -> {}",
+        copy.files,
+        copy.path.display()
+    );
+    Ok(())
+}
+
 /// Announce files that were exported but whose path is too long to survive a move
 /// to Windows — a warning (the files ARE on disk here), so an analyst who will hand
 /// the export to a Windows examiner knows which files would be unreachable there.
-pub(crate) fn report_portability_warnings(warnings: &[SkippedFile]) {
+fn report_portability_warnings(warnings: &[SkippedFile]) {
     if warnings.is_empty() {
         return;
     }
@@ -251,22 +281,14 @@ pub(crate) fn write_export_report_file(
     dir: &Path,
     run: &RunInfo,
     report: &[export::ExportedFile],
-    skipped_too_long: &[SkippedFile],
-    portability_warnings: &[SkippedFile],
-    undecrypted: &[SkippedFile],
+    notes: &ExportNotes,
 ) -> Result<()> {
-    let path = dir.join("export-report.json");
-    let file = File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
-    let mut w = BufWriter::new(file);
-    export::write_export_report(
-        run,
-        report,
-        skipped_too_long,
-        portability_warnings,
-        undecrypted,
-        &mut w,
-    )?;
-    w.flush().context("failed flushing export report")?;
+    // Like the files it describes, the report is read-only and never replaces an
+    // earlier one in the same folder.
+    let mut bytes = Vec::new();
+    export::write_export_report(run, report, notes, &mut bytes)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = export::write_read_only(&dir.join("export-report.json"), &bytes)?;
     eprintln!(
         "export report: {} files -> {}",
         report.len(),

@@ -82,7 +82,8 @@ mf-scan find acquisition.zip --path '*WhatsApp*' --export ./whatsapp --max-size 
 ```
 
 `grep --match-path` also applies a *regex* to each file's path, within a search's
-filters and report.
+filters and report. `grep --and-paths` matches contents **and** paths in one pass:
+a file found by its name and one found by its content come back in the same run.
 
 ## 3. Understand a match (deep inspection)
 

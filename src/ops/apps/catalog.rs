@@ -73,22 +73,19 @@ impl AppCatalog {
     pub fn inventory(&self, source: &dyn Source, pattern: Option<&str>) -> Vec<AppSummary> {
         // Aggregate primary containers by id (an app usually has one, but multi-user
         // Android can have several).
-        let mut by_id: BTreeMap<&str, (usize, u64)> = BTreeMap::new();
+        let mut by_id: BTreeMap<&str, u64> = BTreeMap::new();
         for c in &self.containers {
             if !c.kind.is_primary() {
                 continue;
             }
-            let e = by_id.entry(c.id.as_str()).or_default();
-            e.0 += 1;
-            e.1 += c.total_size;
+            *by_id.entry(c.id.as_str()).or_default() += c.total_size;
         }
 
         by_id
             .into_iter()
-            .map(|(id, (count, size))| AppSummary {
+            .map(|(id, size)| AppSummary {
                 id: id.to_string(),
                 name: self.display_name(source, id),
-                container_count: count,
                 total_size: size,
                 signing: self.references.get(id).cloned(),
             })
