@@ -28,7 +28,7 @@ use mf_scan::ops::search::{MatchOn, Query};
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{
-    OutputFormat, TxtStyle, write_counts, write_file_list, write_results,
+    ListedFile, OutputFormat, TxtStyle, write_counts, write_file_list, write_results,
 };
 
 use crate::cmd::cli::{ColourWhen, GrepArgs};
@@ -159,7 +159,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
     if cli.count || cli.files_with_matches {
         // One line per file, aggregated across sources (path tagged when multi).
         // Neither form shows a match's location inside its file, so `deep` is false.
-        let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut counts: Vec<(ListedFile, usize)> = Vec::new();
         for src in &sources {
             let ctx = SearchCtx {
                 cli: &cli,
@@ -179,7 +179,12 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                     } else {
                         f.entry.name.clone()
                     };
-                    counts.push((path, f.offsets.len()));
+                    let listed = ListedFile {
+                        path,
+                        size: f.entry.uncompressed_size,
+                        mtime: f.entry.mtime,
+                    };
+                    counts.push((listed, f.offsets.len()));
                 }
                 if !multi {
                     // --manifest/--export only apply to a single source (guarded
@@ -189,13 +194,12 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 Ok(())
             })?;
         }
-        let pairs: Vec<(&str, usize)> = counts.iter().map(|(p, c)| (p.as_str(), *c)).collect();
         emit(cli.output.as_deref(), |w| {
             if cli.files_with_matches {
-                let paths: Vec<&str> = pairs.iter().map(|(p, _)| *p).collect();
-                write_file_list(&paths, cli.format, w)
+                let files: Vec<ListedFile> = counts.drain(..).map(|(f, _)| f).collect();
+                write_file_list(&files, cli.long, cli.format, w)
             } else {
-                write_counts(&pairs, cli.format, w)
+                write_counts(&counts, cli.long, cli.format, w)
             }
         })?;
     } else {
@@ -486,6 +490,10 @@ fn validate_flags(cli: &GrepArgs) -> Result<()> {
                 type_names().join(", ")
             );
         }
+    }
+    // --long describes files, so it needs an output that lists files.
+    if cli.long && !cli.files_with_matches && !cli.count {
+        anyhow::bail!("--long lists files: use it with -l or -c");
     }
     // --match-path reads no content, so anything needing the file's bytes is
     // meaningless alongside it.

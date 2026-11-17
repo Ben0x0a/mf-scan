@@ -375,3 +375,46 @@ fn export_from_manifest_skips_missing_entries() {
         ExportOutcome::Refused { .. } => panic!("should not refuse"),
     }
 }
+
+#[test]
+fn a_sidecar_planned_as_its_own_item_is_written_once() {
+    // A tree export plans a database and its -wal side by side. The -wal must not
+    // also be written as the database's sidecar: with an export that never
+    // overwrites, the second copy would land as `sms.db-wal~1`.
+    let files = [
+        FileSpec::stored("App/Library/sms.db", b"row with TARGET"),
+        FileSpec::stored("App/Library/sms.db-wal", b"wal with TARGET"),
+    ];
+    let zip = build_zip(&files, false);
+    let re = Regex::new("TARGET").unwrap();
+    let findings = search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        MatchOn::Content,
+        &EntryFilter::all(),
+        None,
+        &NoProgress,
+    )
+    .unwrap();
+    assert_eq!(findings.files.len(), 2);
+
+    let roots = vec![("App".to_string(), "app".to_string())];
+    let plan = export::plan_tree(&findings.files, &roots);
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = export::export_files(
+        &plan,
+        &ZipSource::open(&zip).unwrap(),
+        &findings.files,
+        dir.path(),
+        None,
+        0,
+        None,
+    )
+    .unwrap();
+    let ExportOutcome::Exported { files, notes, .. } = outcome else {
+        panic!("should not refuse without a cap");
+    };
+    assert_eq!(files, 2, "the db and its -wal, each once");
+    assert!(notes.renamed.is_empty(), "{:?}", notes.renamed);
+}

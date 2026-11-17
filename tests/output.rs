@@ -7,7 +7,7 @@
 
 use mf_scan::core::models::{Encoding, Inspection, MatchRecord, RunInfo};
 use mf_scan::core::stats::ScanStats;
-use mf_scan::report::output::{OutputFormat, TxtStyle, write_counts, write_results};
+use mf_scan::report::output::{ListedFile, OutputFormat, TxtStyle, write_counts, write_results};
 use serde_json::json;
 
 /// Minimal run metadata for output tests.
@@ -275,16 +275,32 @@ fn json_omits_line_for_binary() {
 #[test]
 fn count_writes_one_line_per_file() {
     let mut buf = Vec::new();
-    write_counts(
-        &[("a/x.db", 3), ("b/y.txt", 1)],
-        OutputFormat::Txt,
-        &mut buf,
-    )
-    .unwrap();
+    let file = |path: &str, size, mtime| ListedFile {
+        path: path.into(),
+        size,
+        mtime,
+    };
+    let counts = [
+        (file("a/x.db", 4096, Some(1_700_000_000)), 3),
+        (file("b/y.txt", 12, None), 1),
+    ];
+    write_counts(&counts, false, OutputFormat::Txt, &mut buf).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert_eq!(
         out.lines().collect::<Vec<_>>(),
         vec!["a/x.db:3", "b/y.txt:1"]
+    );
+
+    // --long: type, size and modified time (UTC) first, as `find --long`.
+    let mut buf = Vec::new();
+    write_counts(&counts, true, OutputFormat::Txt, &mut buf).unwrap();
+    let out = String::from_utf8(buf).unwrap();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec![
+            "f\t4096\t2023-11-14T22:13:20Z\ta/x.db:3",
+            "f\t12\t-\tb/y.txt:1"
+        ]
     );
 }
 

@@ -113,10 +113,17 @@ fn collect_items(value: &Value, out: &mut Vec<Secret>) {
     }
 }
 
-/// Build a [`Secret`] from a dictionary, if it carries `v_Data`.
+/// Build a [`Secret`] from a dictionary, if it carries `v_Data` and something to
+/// identify it by.
+///
+/// WHY an item with no account, service, access group or label is skipped: no profile
+/// can ever select it. Such items are what an iPhone's own still-wrapped keychain
+/// files hold (`/private/var/Keychains/keychain-ota-backup.plist`: only `v_Data` and
+/// `v_PersistentRef`, encrypted under a keybag); loading them would announce hundreds
+/// of "secrets" that are not keys.
 fn item_from_dict(dict: &Dictionary) -> Option<Secret> {
     let data = dict.get(VALUE_DATA_KEY)?.as_data()?.to_vec();
-    Some(Secret {
+    let secret = Secret {
         account: string_attr(dict, ACCOUNT_KEY),
         service: string_attr(dict, SERVICE_KEY).or_else(|| string_attr(dict, SERVICE_KEY_SHORT)),
         access_group: string_attr(dict, ACCESS_GROUP_KEY),
@@ -124,7 +131,12 @@ fn item_from_dict(dict: &Dictionary) -> Option<Secret> {
         protection_class: string_attr(dict, PROTECTION_CLASS_KEY),
         data,
         source: SOURCE_NAME.to_string(),
-    })
+    };
+    let identified = secret.account.is_some()
+        || secret.service.is_some()
+        || secret.access_group.is_some()
+        || secret.label.is_some();
+    identified.then_some(secret)
 }
 
 /// Read dict key `key` as an owned string: a string, or UTF-8 data.
@@ -268,6 +280,19 @@ mod tests {
             secrets[0].access_group.as_deref(),
             Some("U68MSDN6DR.org.whispersystems.signal")
         );
+    }
+
+    #[test]
+    fn items_with_nothing_to_identify_them_are_skipped() {
+        // The shape of an iPhone's own wrapped keychain backup: values, no names.
+        let wrapped = br#"<plist><dict>
+            <key>keybag-uuid</key><data>AAA=</data>
+            <key>genp</key>
+            <array>
+                <dict><key>v_Data</key><data>AQA=</data><key>v_PersistentRef</key><data>AgA=</data></dict>
+            </array>
+        </dict></plist>"#;
+        assert!(KeychainPlist.load(wrapped).unwrap().is_empty());
     }
 
     #[test]

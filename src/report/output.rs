@@ -29,6 +29,7 @@ use serde::Serialize;
 
 use crate::core::models::{Encoding, MatchRecord, RunInfo};
 use crate::core::stats::ScanStats;
+use crate::core::util::UtcTime;
 use crate::decrypt::DecryptionRecord;
 
 // ANSI escapes for match highlighting: bold red on, all attributes off. Bytes
@@ -381,75 +382,111 @@ fn write_txt(
     Ok(())
 }
 
-/// Per-file match counts (for `--count`).
+/// One file in a `-l`/`-c` listing: its path, and what `--long` adds.
+pub struct ListedFile {
+    pub path: String,
+    pub size: u64,
+    /// Modification time (Unix seconds), when the source records one.
+    pub mtime: Option<u64>,
+}
+
+impl ListedFile {
+    /// The `--long` prefix, as `find --long` prints it: type, size, modified (UTC).
+    fn long_prefix(&self) -> String {
+        let modified = self.modified_utc().unwrap_or_else(|| "-".to_string());
+        format!("f\t{}\t{modified}\t", self.size)
+    }
+
+    fn modified_utc(&self) -> Option<String> {
+        self.mtime.map(|m| UtcTime::from_unix(m).iso())
+    }
+}
+
+/// One file of a `-l`/`-c` listing in JSON/CSV. `size`/`modified_utc` are present
+/// only with `--long`, so a plain listing keeps its shape.
 #[derive(Serialize)]
-struct CountView<'a> {
+struct ListedView<'a> {
     path: &'a str,
-    count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_utc: Option<String>,
+}
+
+impl<'a> ListedView<'a> {
+    fn new(file: &'a ListedFile, count: Option<usize>, long: bool) -> Self {
+        Self {
+            path: &file.path,
+            count,
+            size: long.then_some(file.size),
+            modified_utc: if long { file.modified_utc() } else { None },
+        }
+    }
 }
 
 /// Write one `path:count` per file (txt), or a structured equivalent (json/csv).
+/// With `long`, each line also gives the file's type, size and modified time.
 pub fn write_counts(
-    counts: &[(&str, usize)],
+    counts: &[(ListedFile, usize)],
+    long: bool,
+    format: OutputFormat,
+    w: &mut dyn Write,
+) -> Result<()> {
+    write_listing(counts.iter().map(|(f, c)| (f, Some(*c))), long, format, w)
+}
+
+/// Write one path per file (txt), or a structured equivalent (json/csv). With
+/// `long`, each line also gives the file's type, size and modified time.
+pub fn write_file_list(
+    files: &[ListedFile],
+    long: bool,
+    format: OutputFormat,
+    w: &mut dyn Write,
+) -> Result<()> {
+    write_listing(files.iter().map(|f| (f, None)), long, format, w)
+}
+
+/// The shared body of [`write_counts`] and [`write_file_list`].
+fn write_listing<'a>(
+    files: impl Iterator<Item = (&'a ListedFile, Option<usize>)>,
+    long: bool,
     format: OutputFormat,
     w: &mut dyn Write,
 ) -> Result<()> {
     match format {
         OutputFormat::Txt => {
-            for (path, count) in counts {
-                writeln!(w, "{path}:{count}").context("failed writing count output")?;
+            for (file, count) in files {
+                let prefix = if long {
+                    file.long_prefix()
+                } else {
+                    String::new()
+                };
+                match count {
+                    Some(count) => writeln!(w, "{prefix}{}:{count}", file.path),
+                    None => writeln!(w, "{prefix}{}", file.path),
+                }
+                .context("failed writing the file list")?;
             }
             Ok(())
         }
         OutputFormat::Json => {
-            let views: Vec<CountView> = counts
-                .iter()
-                .map(|&(path, count)| CountView { path, count })
+            let views: Vec<ListedView> = files
+                .map(|(file, count)| ListedView::new(file, count, long))
                 .collect();
-            serde_json::to_writer_pretty(&mut *w, &views).context("failed writing count output")?;
-            writeln!(w).context("failed writing count output")?;
+            serde_json::to_writer_pretty(&mut *w, &views)
+                .context("failed writing the file list")?;
+            writeln!(w).context("failed writing the file list")?;
             Ok(())
         }
         OutputFormat::Csv => {
             let mut wtr = csv::Writer::from_writer(w);
-            for &(path, count) in counts {
-                wtr.serialize(CountView { path, count })
-                    .context("failed writing count row")?;
+            for (file, count) in files {
+                wtr.serialize(ListedView::new(file, count, long))
+                    .context("failed writing a file list row")?;
             }
-            wtr.flush().context("failed flushing count output")?;
-            Ok(())
-        }
-    }
-}
-
-/// One file in a `--files-with-matches` list.
-#[derive(Serialize)]
-struct FileView<'a> {
-    path: &'a str,
-}
-
-/// Write one path per file (txt), or a structured equivalent (json/csv).
-pub fn write_file_list(paths: &[&str], format: OutputFormat, w: &mut dyn Write) -> Result<()> {
-    match format {
-        OutputFormat::Txt => {
-            for path in paths {
-                writeln!(w, "{path}").context("failed writing file list")?;
-            }
-            Ok(())
-        }
-        OutputFormat::Json => {
-            let views: Vec<FileView> = paths.iter().map(|&path| FileView { path }).collect();
-            serde_json::to_writer_pretty(&mut *w, &views).context("failed writing file list")?;
-            writeln!(w).context("failed writing file list")?;
-            Ok(())
-        }
-        OutputFormat::Csv => {
-            let mut wtr = csv::Writer::from_writer(w);
-            for &path in paths {
-                wtr.serialize(FileView { path })
-                    .context("failed writing file list row")?;
-            }
-            wtr.flush().context("failed flushing file list")?;
+            wtr.flush().context("failed flushing the file list")?;
             Ok(())
         }
     }

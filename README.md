@@ -85,6 +85,10 @@ cargo build --release
 # binary at: target/release/mf-scan
 ```
 
+On Windows, build with the MSVC toolchain (`rustup default stable-x86_64-pc-windows-msvc`,
+with the Visual Studio C++ Build Tools): the GNU one fails with "dlltool not found" unless
+MinGW-w64's binutils are installed. Ready-made binaries are on the Releases page.
+
 ---
 
 ## Quick start
@@ -228,6 +232,7 @@ With more than one source, each result is tagged with its origin (see
 | `--fast` | Speed preset: exclude media + a customisable exclude list. |
 | `--inspect` | Resolve matches inside recognised formats (see [Inspection](#deep-inspection)). |
 | `-c`, `--count` | Print only the match count per file. |
+| `--long` | With `-l` or `-c`: each file also shows its type, size and modified time (UTC), like `ls -l` and `find --long` (`f  8196096  2025-12-22T15:43:39Z  path`). In JSON/CSV it adds `size` and `modified_utc`. |
 | `-f`, `--format txt\|json\|csv` | Output format (default `txt`). |
 | `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |

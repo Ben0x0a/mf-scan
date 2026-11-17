@@ -95,6 +95,10 @@ pub(crate) struct GrepArgs {
     #[arg(short = 'n', long = "line-number", help_heading = "Output")]
     pub(crate) line_number: bool,
 
+    /// With -l or -c: also show each file's type, size and modified time (UTC).
+    #[arg(long = "long", help_heading = "Output")]
+    pub(crate) long: bool,
+
     /// Print the number of matches per file.
     #[arg(
         short = 'c',

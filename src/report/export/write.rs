@@ -136,6 +136,13 @@ struct FileExporter<'a> {
     /// Every output path taken so far, case-folded: the plan's, then each derived
     /// copy's, so a derived copy never overwrites a planned file or the reverse.
     claimed: HashSet<String>,
+    /// Every destination the plan itself fills (relative, case-folded). A sidecar
+    /// whose destination is one of them is a planned item of its own (a tree export
+    /// plans a database's `-wal` beside it), so it is not written a second time as a
+    /// sidecar, which would land as `name~1` since an export never overwrites. In the
+    /// one-folder-per-file layout the destinations differ, and the sidecar is still
+    /// written beside its database.
+    planned: HashSet<String>,
     /// The full entry list, so a written file's declared sidecars can be fetched.
     by_path: &'a HashMap<&'a str, &'a Entry>,
     dir: &'a Path,
@@ -156,6 +163,7 @@ impl<'a> FileExporter<'a> {
             source,
             derive: None,
             claimed: HashSet::new(),
+            planned: HashSet::new(),
             by_path,
             dir,
             max_path_len,
@@ -285,11 +293,19 @@ impl<'a> FileExporter<'a> {
             .unwrap_or_default();
         for suffix in suffixes {
             let sidecar_path = format!("{internal_path}{suffix}");
+            let wanted = main_dest.with_file_name(format!("{main_name}{suffix}"));
+            let relative = wanted
+                .strip_prefix(self.dir)
+                .unwrap_or(&wanted)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if self.planned.contains(&fold_case(&relative)) {
+                continue;
+            }
             let Some(entry) = self.by_path.get(sidecar_path.as_str()) else {
                 continue;
             };
             let content = self.source.content(entry)?;
-            let wanted = main_dest.with_file_name(format!("{main_name}{suffix}"));
             let dest = self.write_new(&sidecar_path, &wanted, &content)?;
             let integrity = self.source.integrity_check(entry).into();
             self.bytes += content.len() as u64;
@@ -413,6 +429,7 @@ pub fn export_files(
         .iter()
         .map(|i| fold_case(&i.output_path()))
         .collect();
+    exporter.planned = exporter.claimed.clone();
     for (item, file) in plan.items.iter().zip(files) {
         let dest = dir.join(&item.folder).join(&item.name);
         exporter.write_one(&file.entry, &file.entry.name, &item.output_path(), &dest)?;
@@ -446,6 +463,11 @@ pub fn export_from_manifest(
     let by_path: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
     let mut exporter = FileExporter::new(source, &by_path, dir, max_path_len);
+    exporter.planned = manifest
+        .files
+        .iter()
+        .map(|f| fold_case(&f.output_path))
+        .collect();
     let mut skipped = 0usize;
     for entry in &manifest.files {
         let Some(found) = by_path.get(entry.internal_path.as_str()) else {
