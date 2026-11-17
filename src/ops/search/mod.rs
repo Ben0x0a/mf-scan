@@ -287,6 +287,7 @@ mod tests {
                     service: Some("Signal".into()),
                     ..Default::default()
                 },
+                file: None,
             },
             cipher: CipherSpec::Sqlcipher(params),
         };
@@ -362,6 +363,7 @@ mod tests {
                     service: Some("Signal".into()),
                     ..Default::default()
                 },
+                file: None,
             },
             cipher: CipherSpec::Sqlcipher(params),
         };

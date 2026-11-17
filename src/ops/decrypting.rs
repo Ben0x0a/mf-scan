@@ -13,9 +13,13 @@
 //! a database's `-wal` is another entry of that source. Every caller needs the same
 //! lookup, so it lives here once instead of in each of them.
 
+use crate::core::filter::matches;
 use crate::core::models::Entry;
 use crate::core::source::Source;
-use crate::decrypt::{Decryption, DecryptionContext, SecretStore, TryOutcome, load_if_dump};
+use crate::decrypt::profile::KEY_FILE_SOURCE;
+use crate::decrypt::{
+    Decryption, DecryptionContext, Secret, SecretStore, TryOutcome, load_if_dump,
+};
 
 /// A decryption context bound to the source whose entries it decrypts.
 pub struct SourceDecryptor<'a> {
@@ -173,4 +177,35 @@ pub fn dumps_in_source(source: &dyn Source) -> Vec<FoundDump> {
             })
         })
         .collect()
+}
+
+/// The key files the profiles in `ctx` name (`key: { file: <glob> }`), read from the
+/// source as secrets: each one's path is its label, so a profile matches it by glob.
+///
+/// Read only for files no larger than [`MAX_DUMP_LEN`]; a key file is tiny (WhatsApp's
+/// is 158 bytes).
+pub fn key_files_in_source(source: &dyn Source, ctx: &DecryptionContext) -> SecretStore {
+    let globs = ctx.key_file_globs();
+    if globs.is_empty() {
+        return SecretStore::default();
+    }
+    let items = source
+        .entries()
+        .iter()
+        .filter(|e| !e.is_dir() && e.uncompressed_size <= MAX_DUMP_LEN)
+        .filter(|e| globs.iter().any(|g| matches(g, &e.name)))
+        .filter_map(|e| {
+            let data = source.content(e).ok()?.to_vec();
+            Some(Secret {
+                account: None,
+                service: None,
+                access_group: None,
+                label: Some(e.name.clone()),
+                protection_class: None,
+                data,
+                source: KEY_FILE_SOURCE.to_string(),
+            })
+        })
+        .collect();
+    SecretStore::new(items)
 }

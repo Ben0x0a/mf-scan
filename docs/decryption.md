@@ -35,7 +35,7 @@ flowchart TD
     end
     subgraph ciphers["3 · ciphers (decrypt/cipher)"]
         SQL["SQLCipher"]
-        WA["WhatsApp crypt12/14"]
+        WA["WhatsApp crypt14"]
     end
     SS --> CTX["DecryptionContext"]
     REG --> CTX
@@ -56,7 +56,7 @@ Each layer is independent, so the framework is *scheme-agnostic*:
    `profiles/{ios,android}/*.yml`. A profile names the database, how to locate its
    key in the dump, and the cipher. Adding a target = adding one file.
 3. **Ciphers** (`src/decrypt/cipher/`) implement the `DbDecryptor` trait, one per
-   scheme. Today: **SQLCipher** and **WhatsApp crypt12/14**.
+   scheme. Today: **SQLCipher**, **page-level AES-OFB** (Find My) and **WhatsApp crypt14**.
 
 The **engine shim** (`src/ops/search/classify.rs`) consults the `DecryptionContext`
 once per entry: if a profile matches the entry's path, it tries each candidate key
@@ -144,8 +144,9 @@ db:                         # exactly one of:
 key:
   encoding: raw             # raw | hex | base64 | passphrase
   keychain:                 # locate the key in the dump (each field optional = wildcard)
-    service: TSKeyChainService
-    account: OWSDatabaseCipherKeySpec
+    service: GRDBKeyChainService
+    account: GRDBDatabaseCipherKeySpec
+# file: "*/com.whatsapp/files/key"   # or: the key is this file inside the source
 
 cipher:
   algorithm: sqlcipher      # see "Ciphers" below
@@ -200,20 +201,27 @@ Nothing authenticates the pages. The key is checked by page 1, whose first 16 by
 must decrypt to `SQLite format 3\0` (a wrong key passes with probability 2⁻¹²⁸), so
 `verified` means the key is right, not that every page is intact.
 
-### WhatsApp crypt12/14 (`algorithm: whatsapp-crypt`)
+### WhatsApp crypt14 (`algorithm: whatsapp-crypt`)
 
-AES-256-GCM over a zlib-compressed SQLite database. Knobs:
+AES-256-GCM over a zlib-compressed SQLite database. One knob, `zlib` (default true:
+inflate the decrypted payload).
 
-| key | default | notes |
-|---|---|---|
-| `iv_offsets` | `[8, 51, 67, 191]` | candidate 16-byte IV offsets |
-| `zlib` | true | inflate the decrypted payload |
+- **Key:** the app's `key` file, found inside the extraction by the profile's
+  `file: "*/com.whatsapp/files/key"`. It is a Java-serialised `byte[]` of 131 bytes,
+  and its last 32 are the AES key, used as they are (no key derivation). A bare
+  32-byte key is accepted too.
+- **File:** a varint, then a protobuf header whose `wa_provided_key_data` (field 2)
+  holds the 16-byte GCM nonce (its field 5). Then come the ciphertext, the 16-byte
+  tag, and, in a single-file backup, a 16-byte MD5. The decryptor tries the tag
+  with and without the MD5 after it; the GCM check (a false accept is ~2⁻¹²⁸) both
+  locates it and verifies the key, and is the `verified` flag.
+- **Naming:** a decrypted copy drops the `.crypt14`: `msgstore.db.crypt14` →
+  `msgstore.decrypted.db`.
+- **crypt15** (end-to-end encrypted backups, keyed by a 64-digit code or a password
+  the device does not keep) is refused by name.
 
-The crypt14 header is a variable-length protobuf, so the IV offset is not fixed.
-Rather than parse the protobuf, the decryptor **tries each candidate IV offset and
-relies on the GCM authentication tag** to confirm the right one (a false accept is
-~2⁻¹²⁸). That GCM verification is the `verified` flag. Key derivation is WhatsApp's
-"backup encryption" HKDF-SHA256 over the key material.
+The format follows wa-crypt-tools' documentation of it (key and database modules,
+`.proto` schemas); the code is independent.
 
 ---
 
@@ -304,16 +312,18 @@ Validation against real evidence, an iPhone full-filesystem extraction (December
 - **Page-level AES-OFB**: validated. All 9 Find My databases decrypt with their
   `-wal` replayed. An independent Python implementation produced the same SHA-256
   for each, and SQLite's `PRAGMA integrity_check` returned `ok` on all of them.
-- **WhatsApp crypt14**: not yet validated. Confirm against a genuine `.crypt14` +
-  `key` file.
+- **WhatsApp crypt14**: validated on a Google Pixel 9a and a Xiaomi Redmi 9a
+  extraction, with the `key` file found inside each. Every `*.db.crypt14` backup
+  decrypts with a verifying GCM tag (22 files on the Pixel, its backups being stored
+  twice; 9 on the Xiaomi). The decrypted `msgstore` passes `PRAGMA integrity_check`
+  with 251 tables (86 and 45 messages), and so does `wa.db`.
 
 Known gaps / follow-ups:
 
-- **WhatsApp key sourcing.** On Android the key is the `key` *file* in the
-  acquisition filesystem, not a keystore dump — so the WhatsApp profile needs that
-  file's bytes placed into the supplied dump until a "key from an archive file"
-  provider is added.
-- **crypt15** (64-digit passphrase) is not implemented.
+- **crypt15** (end-to-end encrypted WhatsApp backups) is not implemented: its key is
+  a 64-digit code or a password, not something the device keeps.
+- **WhatsApp Business** (`com.whatsapp.w4b`) has no profile yet: no sample to
+  validate one.
 - **Cellebrite-specific** keychain exports that differ from the standard SecItem
   plist need a real sample to add a dedicated provider.
 - **Shipped profile identifiers** for Signal, Session and Find My were read from the

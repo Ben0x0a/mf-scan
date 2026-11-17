@@ -464,14 +464,15 @@ mf-scan decrypt case.zip --to case.decrypted.zip        # whole archive + decryp
 Per-app **profiles** (`profiles/{ios,android}/*.yml`) say which database to decrypt,
 how to find its key, and the cipher. Supported ciphers: **SQLCipher** (Signal, Session,
 Samsung system apps), the **page-level AES-OFB** of Apple's Find My daemons, and
-**WhatsApp crypt12/14**. Every decryption is recorded in the scan report with the key's
+**WhatsApp crypt14** (its key file is found inside the extraction). Every decryption is
+recorded in the scan report with the key's
 provenance and the SHA-256 of the ciphertext and plaintext.
 
 > **Scope:** only works on acquisitions whose keychain was *already decrypted* by the
 > acquisition tool (a raw `keychain-2.db` cannot be decrypted offline).
 >
-> **Validation:** SQLCipher and the Find My cipher are validated on real iPhone and
-> Samsung extractions; WhatsApp crypt14 is not yet. See
+> **Validation:** every shipped cipher is validated on real extractions: SQLCipher
+> (iPhone, Samsung), Find My (iPhone) and WhatsApp crypt14 (Pixel, Xiaomi). See
 > [docs/decryption.md](docs/decryption.md) before relying on a decryption forensically.
 
 ---

@@ -13,9 +13,9 @@
 # The profile's `platform` field must match its folder name, or the loader refuses
 # it (a profile applied to the wrong acquisition type is a forensic hazard).
 #
-# Key acquisition is single-path by design: the key is always located in the
-# supplied keychain/keystore dump via the `keychain` criteria below. There is no
-# command-line key override — provide the dump, the profiles do the rest.
+# The key is located in one of two places, never on the command line: in the
+# keychain/keystore dump, by the `keychain` criteria below, or as a file inside the
+# source itself, by `file` (WhatsApp keeps its key in /data/data/com.whatsapp/files/key).
 
 # --- Identity ---------------------------------------------------------------
 name: example-app-ios            # stable id, used in provenance output
@@ -47,10 +47,13 @@ key:
     account: ExampleAccount      # keychain `acct`
     # access_group: group.com.example   # keychain `agrp`
     # label: Example Key
+  # Or, instead of `keychain`: a glob naming the key file inside the source. Every
+  # matching file is a candidate, and the cipher's check picks the right one.
+  # file: "*/com.example.app/files/key"
 
 # --- Cipher -----------------------------------------------------------------
 cipher:
-  algorithm: sqlcipher           # the only scheme implemented so far
+  algorithm: sqlcipher           # sqlcipher | page-aes-ofb | whatsapp-crypt
   # SQLCipher knobs — shown with their SQLCipher 4 defaults. Omit any you do not
   # need to change. For a SQLCipher 3 database, set: kdf_iter: 64000, hmac: sha1,
   # kdf: sha1.

@@ -18,7 +18,7 @@ use mf_scan::decrypt::{
 };
 
 use mf_scan::core::source::Source;
-use mf_scan::ops::decrypting::{MAX_DUMP_LEN, dumps_in_source, is_dump_name};
+use mf_scan::ops::decrypting::{MAX_DUMP_LEN, dumps_in_source, is_dump_name, key_files_in_source};
 
 use crate::cmd::cli::{KeyArgs, KeySources};
 
@@ -100,18 +100,15 @@ pub(crate) fn build_from_sources(
 }
 
 /// The context for one open source: `base`, plus any key dump the source carries
-/// inside it (announced on stderr). Borrowed when the source carries none.
+/// inside it and the key files profiles name (both announced on stderr). Borrowed
+/// when the source adds nothing.
 pub(crate) fn context_for_source<'a>(
     base: Option<&'a DecryptionContext>,
     source: &dyn Source,
 ) -> Option<Cow<'a, DecryptionContext>> {
     let base = base?;
-    let found = dumps_in_source(source);
-    if found.is_empty() {
-        return Some(Cow::Borrowed(base));
-    }
     let mut more = SecretStore::default();
-    for dump in found {
+    for dump in dumps_in_source(source) {
         eprintln!(
             "decrypt: key dump inside the source: {} ({} secret(s))",
             dump.path,
@@ -119,9 +116,20 @@ pub(crate) fn context_for_source<'a>(
         );
         more.merge(dump.secrets);
     }
+    let key_files = key_files_in_source(source, base);
+    for file in key_files.items() {
+        eprintln!(
+            "decrypt: key file inside the source: {}",
+            file.label.as_deref().unwrap_or("?")
+        );
+    }
+    more.merge(key_files);
+    if more.is_empty() {
+        return Some(Cow::Borrowed(base));
+    }
     let (ctx, added) = base.with_more_secrets(more);
     if added == 0 {
-        eprintln!("decrypt: (its secrets are already loaded)");
+        eprintln!("decrypt: (those secrets are already loaded)");
     }
     Some(Cow::Owned(ctx))
 }

@@ -26,10 +26,12 @@
 
 use serde::Serialize;
 
+use crate::core::filter::matches;
 use crate::core::util::sha256_hex;
 use crate::decrypt::cipher;
+use crate::decrypt::keyfile::Secret;
 use crate::decrypt::keyfile::SecretStore;
-use crate::decrypt::profile::{CipherSpec, Platform, Profile, ProfileRegistry};
+use crate::decrypt::profile::{CipherSpec, KEY_FILE_SOURCE, Platform, Profile, ProfileRegistry};
 use crate::formats::sqlite::checkpoint;
 
 /// Everything the engine needs to decrypt entries: the profile registry, the
@@ -100,6 +102,34 @@ impl DecryptionContext {
         (ctx, added)
     }
 
+    /// The secrets a profile may use: the key files its `file` glob names, or else
+    /// the dump items its keychain criteria match.
+    fn candidates(&self, profile: &Profile) -> Vec<&Secret> {
+        match &profile.key.file {
+            Some(glob) => self
+                .secrets
+                .items()
+                .iter()
+                .filter(|s| {
+                    s.source == KEY_FILE_SOURCE
+                        && s.label.as_deref().is_some_and(|path| matches(glob, path))
+                })
+                .collect(),
+            None => self.secrets.candidates(&profile.key.keychain),
+        }
+    }
+
+    /// The key-file globs of the profiles in scope, so a caller can load the files
+    /// they name from a source (see `ops::decrypting::key_files_in_source`).
+    pub fn key_file_globs(&self) -> Vec<&str> {
+        self.registry
+            .profiles()
+            .iter()
+            .filter(|p| self.platform.is_none_or(|plat| p.platform == plat))
+            .filter_map(|p| p.key.file.as_deref())
+            .collect()
+    }
+
     /// Whether the context can decrypt anything (it has at least one secret).
     ///
     /// With no secrets there is no key to try, so the engine can skip the
@@ -154,12 +184,16 @@ impl DecryptionContext {
             .into_iter()
             .chain([(ciphertext, false)]);
 
-        let candidates = self.secrets.candidates(&profile.key.keychain);
+        let candidates = self.candidates(profile);
         if candidates.is_empty() {
+            let reason = match &profile.key.file {
+                Some(glob) => format!("no key file matching {glob} in the source"),
+                None => "no keychain secret matched the profile's criteria".to_string(),
+            };
             return Some(TryOutcome::Failed {
                 profile: profile.name.clone(),
                 app: profile.app.clone(),
-                reason: "no keychain secret matched the profile's criteria".to_string(),
+                reason,
             });
         }
 
@@ -339,6 +373,7 @@ mod tests {
                     service: Some("Signal".into()),
                     ..Default::default()
                 },
+                file: None,
             },
             cipher: CipherSpec::Sqlcipher(SqlCipherParams {
                 page_size: PAGE_SIZE,
@@ -504,6 +539,50 @@ mod tests {
         assert!(d.verified && !d.wal_replayed);
         let re = Regex::new("FINDME-secret!!").unwrap();
         assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
+    }
+
+    #[test]
+    fn a_key_file_profile_uses_only_files_its_glob_names() {
+        let key = [0x42u8; 32];
+        let mut profile = signal_profile();
+        profile.key.file = Some("*/files/key".into());
+        let file_secret = |path: &str, data: &[u8]| Secret {
+            label: Some(path.into()),
+            data: data.to_vec(),
+            source: KEY_FILE_SOURCE.into(),
+            ..secret("unused", data)
+        };
+        let ctx = DecryptionContext::new(
+            ProfileRegistry::new(vec![profile]),
+            SecretStore::new(vec![
+                // A keychain item with the right bytes is not a key file: ignored.
+                secret("Signal", &key),
+                file_secret("data/app/other/key", &key),
+                file_secret("data/app/files/key", &key),
+            ]),
+            None,
+        );
+        assert_eq!(ctx.key_file_globs(), ["*/files/key"]);
+        let outcome = ctx
+            .try_decrypt("App/grdb/signal.sqlite", &encrypted_db(&key), None)
+            .unwrap();
+        let TryOutcome::Decrypted(d) = outcome else {
+            panic!("the key file the glob names decrypts");
+        };
+        assert_eq!(d.secret_source, KEY_FILE_SOURCE);
+
+        // With no matching file, the failure names the glob.
+        let mut lonely = signal_profile();
+        lonely.key.file = Some("*/files/key".into());
+        let ctx = DecryptionContext::new(
+            ProfileRegistry::new(vec![lonely]),
+            SecretStore::new(vec![secret("Signal", &key)]),
+            None,
+        );
+        match ctx.try_decrypt("App/grdb/signal.sqlite", &encrypted_db(&key), None) {
+            Some(TryOutcome::Failed { reason, .. }) => assert!(reason.contains("*/files/key")),
+            _ => panic!("expected a failure naming the glob"),
+        }
     }
 
     #[test]

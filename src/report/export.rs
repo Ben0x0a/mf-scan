@@ -150,15 +150,33 @@ pub fn decrypted_name(name: &str) -> String {
 }
 
 /// [`decrypted_name`], numbered after the first: `x.decrypted-2.db` for `n` = 2.
+///
+/// An encryption suffix such as `.crypt14` is dropped first, so WhatsApp's
+/// `msgstore.db.crypt14` becomes `msgstore.decrypted.db`, a name tools open as SQLite.
 fn decrypted_name_numbered(name: &str, n: usize) -> String {
     let tag = if n > 1 {
         format!(".decrypted-{n}")
     } else {
         ".decrypted".to_string()
     };
+    let name = strip_encryption_suffix(name);
     match name.rfind('.') {
         Some(dot) if dot > 0 => format!("{}{tag}{}", &name[..dot], &name[dot..]),
         _ => format!("{name}{tag}"),
+    }
+}
+
+/// `name` without a trailing `.cryptNN` (WhatsApp's encrypted-backup suffix).
+fn strip_encryption_suffix(name: &str) -> &str {
+    match name.rsplit_once(".crypt") {
+        Some((stem, digits))
+            if !stem.is_empty()
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            stem
+        }
+        _ => name,
     }
 }
 
@@ -1149,6 +1167,22 @@ impl From<&ExportItem> for ManifestEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decrypted_names_keep_a_usable_extension() {
+        assert_eq!(decrypted_name("signal.sqlite"), "signal.decrypted.sqlite");
+        assert_eq!(
+            decrypted_name("NetworkDiagnostic"),
+            "NetworkDiagnostic.decrypted"
+        );
+        assert_eq!(
+            decrypted_name("msgstore.db.crypt14"),
+            "msgstore.decrypted.db"
+        );
+        assert_eq!(decrypted_name("wa.db.crypt12"), "wa.decrypted.db");
+        assert_eq!(decrypted_name(".crypt14"), ".crypt14.decrypted");
+        assert_eq!(decrypted_name_numbered("x.db", 2), "x.decrypted-2.db");
+    }
+
     use super::*;
     use crate::core::models::{Entry, Location};
     use crate::ops::search::MatchedFile;

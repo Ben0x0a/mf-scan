@@ -187,16 +187,27 @@ pub struct KeychainMatch {
 
 /// How a profile's key is located and decoded.
 ///
-/// The key is always found in the supplied keychain/keystore dump by `keychain`'s
-/// criteria; `encoding` says how to turn the located bytes into key material.
+/// The key is found either in the keychain/keystore dump, by `keychain`'s criteria, or,
+/// with `file`, as a file inside the source itself (WhatsApp keeps its key in
+/// `/data/data/com.whatsapp/files/key`). `encoding` says how to turn the located bytes
+/// into key material.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeySpec {
     /// How the located bytes are encoded.
     pub encoding: KeyEncoding,
-    /// Keychain/keystore lookup criteria.
+    /// Keychain/keystore lookup criteria. Ignored when `file` is set.
+    #[serde(default)]
     pub keychain: KeychainMatch,
+    /// A `*`/`?` glob naming the key file inside the source. Every matching file is a
+    /// candidate key, so the copies Android keeps under `/data/data` and `/data/user`
+    /// are all tried.
+    #[serde(default)]
+    pub file: Option<String>,
 }
+
+/// The `source` recorded on a secret read from a file inside the source.
+pub const KEY_FILE_SOURCE: &str = "key-file";
 
 /// The cipher and its parameters.
 ///
@@ -210,8 +221,8 @@ pub enum CipherSpec {
     /// SQLCipher (page-based AES-CBC + per-page HMAC). Covers Signal, Wickr, and
     /// most app databases keyed from the keychain.
     Sqlcipher(SqlCipherParams),
-    /// WhatsApp crypt12/14 (AES-256-GCM over a zlib-compressed database, with the
-    /// "backup encryption" key derivation and offset-guessed IV).
+    /// WhatsApp crypt14 (AES-256-GCM over a zlib-compressed database, keyed by the
+    /// AES key inside the app's `key` file, the nonce read from the file's header).
     WhatsappCrypt(WhatsappCryptParams),
     /// Each page AES-256-OFB under a nonce in its reserved bytes (Apple's Find My
     /// daemons). Page size and reserve come from the clear header, so it has no knobs.
@@ -224,22 +235,13 @@ pub enum CipherSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PageAesOfbParams {}
 
-/// WhatsApp crypt12/14 knobs.
+/// WhatsApp crypt14 knobs. The nonce is read from the file's own header, so there is
+/// no offset to configure.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WhatsappCryptParams {
-    /// Candidate IV offsets to try; the GCM tag confirms which is correct (the
-    /// crypt14 header is a variable-length protobuf, so the IV offset is not fixed).
-    #[serde(default = "default_iv_offsets")]
-    pub iv_offsets: Vec<usize>,
-    /// Whether the decrypted plaintext is zlib-compressed (true for crypt12/14).
+    /// Whether the decrypted plaintext is zlib-compressed (true for crypt14).
     #[serde(default = "default_true")]
     pub zlib: bool,
-}
-
-/// Default candidate IV offsets for WhatsApp crypt files (the commonly observed
-/// positions; the GCM tag rejects any wrong guess).
-fn default_iv_offsets() -> Vec<usize> {
-    vec![8, 51, 67, 191]
 }
 
 /// SQLCipher knobs that vary across apps and versions.
