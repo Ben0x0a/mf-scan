@@ -91,6 +91,71 @@ fn ranged_content_prefix_reads_only_the_header() {
 }
 
 #[test]
+fn ranged_content_suffix_reads_only_the_end_stored_and_deflate() {
+    let raw = b"start of the file ... and its FOOTER";
+    let compressed = deflate(raw);
+    let files = [
+        FileSpec::stored("s.bin", raw),
+        FileSpec::deflate("d.bin", &compressed, raw.len() as u32),
+    ];
+    let bytes = build_zip(&files, false);
+    let (_tmp, rng) = ranged(&bytes);
+
+    for e in rng.entries() {
+        let end = rng.content_suffix(e, 6).unwrap();
+        assert_eq!(&*end, b"FOOTER", "{}", e.name);
+        // Asking for more than the file holds gives the whole file.
+        assert_eq!(&*rng.content_suffix(e, 1000).unwrap(), raw, "{}", e.name);
+    }
+}
+
+#[test]
+fn ranged_content_suffix_refuses_more_than_the_declared_size() {
+    // A DEFLATE entry that inflates past its declared size (a zip-bomb shape) is
+    // refused by the end read, as by a full read.
+    let raw = vec![b'A'; 100_000];
+    let compressed = deflate(&raw);
+    let files = [FileSpec::deflate("bomb.bin", &compressed, 10)];
+    let bytes = build_zip(&files, false);
+    let (_tmp, rng) = ranged(&bytes);
+    let e = &rng.entries()[0];
+    assert!(rng.content_suffix(e, 8).is_err());
+    assert!(rng.content(e).is_err());
+}
+
+#[test]
+fn type_from_ends_reads_the_end_only_when_it_can_matter_and_is_cheap() {
+    use mf_scan::engine::{Typing, type_from_ends};
+    // A LevelDB table: no header signature, its magic in the last 8 bytes, and
+    // longer than the 4 KiB head so the end is not already in hand.
+    let mut table = vec![0u8; 5000];
+    let n = table.len();
+    table[n - 8..].copy_from_slice(&[0x57, 0xFB, 0x80, 0x8B, 0x24, 0x75, 0x47, 0xDB]);
+    let compressed = deflate(&table);
+    let files = [
+        FileSpec::stored("s.ldb", &table),
+        FileSpec::deflate("d.ldb", &compressed, table.len() as u32),
+    ];
+    let bytes = build_zip(&files, false);
+    let (_tmp, rng) = ranged(&bytes);
+    let entry = |name: &str| rng.entries().iter().find(|e| e.name == name).unwrap();
+    let wants_leveldb = |a: Option<mf_scan::core::models::TypeInfo>,
+                         b: Option<mf_scan::core::models::TypeInfo>| {
+        a.map(|t| t.name == "leveldb") != b.map(|t| t.name == "leveldb")
+    };
+
+    // The end matters and is one small read: it names the table.
+    let stored = type_from_ends(&rng, entry("s.ldb"), wants_leveldb).unwrap();
+    assert!(matches!(stored, Typing::Known(Some(t)) if t.name == "leveldb"));
+    // The end matters but needs a whole inflate: left to the full read.
+    let deflated = type_from_ends(&rng, entry("d.ldb"), wants_leveldb).unwrap();
+    assert_eq!(deflated, Typing::Undecided);
+    // Nothing the end could name changes the decision: not read at all.
+    let never = type_from_ends(&rng, entry("d.ldb"), |_, _| false).unwrap();
+    assert_eq!(never, Typing::Known(None));
+}
+
+#[test]
 fn ranged_integrity_check_verifies_and_detects_corruption() {
     let files = [FileSpec::stored("c.txt", b"crc me please")];
     let bytes = build_zip(&files, false);

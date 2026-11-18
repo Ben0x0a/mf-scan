@@ -7,7 +7,8 @@
 //!     (the ZIP central-directory parser + the `Source` trait the engine reads
 //!     through), `filter` (entry selection), and `util` (tiny helpers).
 //!   • `engine` — the shared drive logic over a `Source`: the `is_selected` entry
-//!     rule and the `Progress` contract that `ops::search` and `ops::diff` both reuse.
+//!     rule and the `Progress` contract that `ops::search` and `ops::diff` both reuse,
+//!     and `type_from_ends` (a file's type from a cheap read, for `search` and `find`).
 //!   • `ops` — the operations driven over a `Source`, as peer modules: `search`
 //!     (scan → `Findings`, incl. the byte-search + per-entry `classify`), `diff`
 //!     (compare two sources), and `apps` (locate/select an app's data across

@@ -21,11 +21,10 @@ use regex::{Regex, RegexBuilder};
 
 use crate::core::filter::matches;
 use crate::core::models::Entry;
+use crate::core::models::TypeInfo;
 use crate::core::source::Source;
+use crate::engine::{Typing, type_from_ends};
 use crate::formats::inspect::detect_type;
-
-/// Bytes read to identify a file's format: its magic is at the very start.
-const TYPE_PREFIX: usize = 4 * 1024;
 
 /// One `--size` test. A bare number is bytes; `k`, `M` and `G` are 1024-based.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,12 +273,20 @@ pub fn find<'s>(source: &'s dyn Source, query: &FindQuery) -> Result<FindOutcome
             let mut format = None;
             if wants_format && !c.is_dir && !query.types.iter().any(|t| t == "f") {
                 let entry = c.entry.expect("a file candidate always has its entry");
-                let Ok(prefix) = source.content_prefix(entry, TYPE_PREFIX) else {
-                    return Fate::Unreadable(c.path);
+                let wanted_as = |info: Option<TypeInfo>| {
+                    info.filter(|i| query.types.iter().any(|t| t == i.name || t == i.category))
+                        .map(|i| i.name)
                 };
-                let info = detect_type(&entry.name, &prefix);
-                let wanted = info
-                    .is_some_and(|i| query.types.iter().any(|t| t == i.name || t == i.category));
+                let info = match type_from_ends(source, entry, |a, b| wanted_as(a) != wanted_as(b))
+                {
+                    Ok(Typing::Known(info)) => info,
+                    Ok(Typing::Undecided) => match source.content(entry) {
+                        Ok(content) => detect_type(&entry.name, &content),
+                        Err(_) => return Fate::Unreadable(c.path),
+                    },
+                    Err(_) => return Fate::Unreadable(c.path),
+                };
+                let wanted = wanted_as(info).is_some();
                 if !wanted {
                     return Fate::Dropped;
                 }

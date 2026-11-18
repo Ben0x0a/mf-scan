@@ -113,10 +113,7 @@ fn run_export(args: AppExportArgs) -> Result<()> {
             .collect();
         let files: Vec<MatchedFile> = mf_scan::ops::apps::entries_under(source, &prefixes)
             .into_iter()
-            .map(|e| MatchedFile {
-                entry: e.clone(),
-                offsets: Vec::new(),
-            })
+            .map(|e| MatchedFile::new(e.clone(), Vec::new()))
             .collect();
 
         let plan = export::plan_tree(&files, &roots);

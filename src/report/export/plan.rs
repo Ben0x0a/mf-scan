@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::core::layout::{attribute, sanitise_basename, sanitise_segment, split_dir_base};
+use crate::core::models::Encoding;
 use crate::ops::search::MatchedFile;
 
 /// Number of hex characters (4 bits each) of the path hash in a folder name.
@@ -26,6 +27,9 @@ pub struct ExportItem {
     pub size: u64,
     pub compressed: bool,
     pub offsets: Vec<u64>,
+    /// Matches per encoding, when other encodings than plain were found (see
+    /// `MatchedFile::encodings`); empty otherwise.
+    pub encodings: Vec<(Encoding, usize)>,
 }
 
 impl ExportItem {
@@ -117,6 +121,7 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
                 size: file.entry.uncompressed_size,
                 compressed: file.entry.is_compressed(),
                 offsets: file.offsets.clone(),
+                encodings: file.encodings.clone(),
             }
         })
         .collect();
@@ -258,6 +263,7 @@ pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPla
                 size: file.entry.uncompressed_size,
                 compressed: file.entry.is_compressed(),
                 offsets: file.offsets.clone(),
+                encodings: file.encodings.clone(),
             }
         })
         .collect();

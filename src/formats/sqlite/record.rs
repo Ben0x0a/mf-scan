@@ -11,6 +11,7 @@
 use super::page::Db;
 
 /// One column slot within a parsed record: its serial type and byte span.
+#[derive(Clone, Copy)]
 pub(crate) struct Col {
     pub(crate) serial: u64,
     pub(crate) start: usize, // absolute file offset of the value bytes
@@ -21,6 +22,12 @@ pub(crate) struct Col {
 pub(crate) struct Cell {
     pub(crate) rowid: u64,
     pub(crate) total_len: usize, // bytes occupied by the whole cell within the page
+    /// Absolute offset where the record starts (its header): column offsets minus
+    /// this are positions within the record.
+    pub(crate) record_start: usize,
+    /// Absolute offset where the record's on-page bytes end: after it come the
+    /// overflow page pointer (if any), then other cells. A value may run past it.
+    pub(crate) local_end: usize,
     pub(crate) columns: Vec<Col>,
 }
 
@@ -71,6 +78,8 @@ pub(crate) fn parse_cell(content: &[u8], db: &Db, cell_file: usize) -> Option<Ce
     Some(Cell {
         rowid,
         total_len,
+        record_start,
+        local_end: record_start.checked_add(local)?,
         columns,
     })
 }
@@ -113,16 +122,35 @@ pub(super) fn local_payload_len(db: &Db, payload: usize) -> Option<usize> {
 /// followed by up to `usable - 4` payload bytes. A cycle or an out-of-range page
 /// number aborts the read (`None`) rather than looping — the file is untrusted.
 pub(crate) fn cell_record(content: &[u8], db: &Db, cell_file: usize) -> Option<(u64, Vec<u8>)> {
+    cell_record_prefix(content, db, cell_file, usize::MAX)
+}
+
+/// [`cell_record`], stopping once the first `need` bytes of the record are in hand
+/// (the record is shorter when it ends first): a caller after one column follows
+/// the overflow chain only as far as that column, not through every later one.
+pub(crate) fn cell_record_prefix(
+    content: &[u8],
+    db: &Db,
+    cell_file: usize,
+    need: usize,
+) -> Option<(u64, Vec<u8>)> {
     let (payload_len, n1) = varint(content, cell_file)?;
     let after_payload = cell_file.checked_add(n1)?;
     let (rowid, n2) = varint(content, after_payload)?;
     let record_start = after_payload.checked_add(n2)?;
-    let payload = payload_len as usize;
+    let payload = usize::try_from(payload_len).ok()?;
+    // WHY: the length is untrusted, and a record lives in this file's pages, so it
+    // cannot be longer than the file. Checked before anything is allocated.
+    if payload > content.len() {
+        return None;
+    }
     let local = local_payload_len(db, payload)?;
+    let wanted = payload.min(need);
 
-    let mut buf = Vec::with_capacity(payload);
+    let mut buf = Vec::with_capacity(wanted);
     buf.extend_from_slice(content.get(record_start..record_start.checked_add(local)?)?);
-    if payload == local {
+    if buf.len() >= wanted {
+        buf.truncate(wanted);
         return Some((rowid, buf));
     }
 
@@ -133,12 +161,12 @@ pub(crate) fn cell_record(content: &[u8], db: &Db, cell_file: usize) -> Option<(
     let max_pages = content.len() / db.page_size + 1;
     let per_page = db.usable.checked_sub(4)?;
     for _ in 0..max_pages {
-        if next == 0 || buf.len() >= payload {
+        if next == 0 || buf.len() >= wanted {
             break;
         }
         // Page numbers are 1-based.
         let page_start = (next as usize).checked_sub(1)?.checked_mul(db.page_size)?;
-        let want = per_page.min(payload - buf.len());
+        let want = per_page.min(wanted - buf.len());
         let data_start = page_start.checked_add(4)?;
         buf.extend_from_slice(content.get(data_start..data_start.checked_add(want)?)?);
         next = read_u32_be(content, page_start)?;
@@ -146,7 +174,7 @@ pub(crate) fn cell_record(content: &[u8], db: &Db, cell_file: usize) -> Option<(
 
     // A truncated chain means the record is incomplete; report it as unreadable
     // rather than hand back a silently short record that would mis-decode.
-    if buf.len() == payload {
+    if buf.len() == wanted {
         Some((rowid, buf))
     } else {
         None

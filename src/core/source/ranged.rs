@@ -22,7 +22,9 @@
 //!     never reads every header;
 //!   • [`Source::content`] reads exactly the entry's data range (in 256 MiB chunks
 //!     for the rare huge file), and [`Source::content_prefix`] reads only a header
-//!     slice, so a media file excluded by `--type`/`--fast` is never fetched whole.
+//!     slice, so a media file excluded by `--type`/`--fast` is never fetched whole;
+//!     [`Source::content_suffix`] reads only the end of a STORED entry (cheap, see
+//!     [`Source::cheap_suffix`]), for a format signed at its end.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -195,6 +197,64 @@ impl Source for RangedZipSource {
                     .read_to_end(&mut out)
                     .with_context(|| format!("failed to inflate prefix of {}", entry.name))?;
                 Ok(Content::Owned(out))
+            }
+        }
+    }
+
+    /// Only a STORED entry: a DEFLATE stream must be inflated from its start to
+    /// reach its end.
+    fn cheap_suffix(&self, entry: &Entry) -> bool {
+        matches!(ranged_loc(entry), Ok((Method::Stored, _, _)))
+    }
+
+    /// Read only the last `max` uncompressed bytes. A STORED entry is one small
+    /// positioned read. A DEFLATE stream cannot be entered mid-way, so its range is
+    /// read (as [`Self::content_prefix`] does) and inflated as a stream, keeping only
+    /// the last `max` bytes in memory, and refused past its declared size, as a full
+    /// read (`zip::inflate`) would refuse it.
+    fn content_suffix(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        let (method, header_offset, data_len) = ranged_loc(entry)?;
+        let start = self.data_start(header_offset)?;
+        match method {
+            Method::Stored => {
+                let want = (data_len as usize).min(max);
+                Ok(Content::Owned(read_at(
+                    &self.file,
+                    start + data_len - want as u64,
+                    want,
+                )?))
+            }
+            Method::Deflate => {
+                let raw = read_range_chunked(&self.file, start, data_len)?;
+                let expected = entry.uncompressed_size;
+                let mut decoder =
+                    flate2::read::DeflateDecoder::new(&raw[..]).take(expected.saturating_add(1));
+                let mut tail = Vec::with_capacity(max.saturating_mul(2));
+                let mut chunk = vec![0u8; 64 * 1024];
+                let mut total = 0u64;
+                loop {
+                    let n = decoder
+                        .read(&mut chunk)
+                        .with_context(|| format!("failed to inflate {}", entry.name))?;
+                    if n == 0 {
+                        break;
+                    }
+                    total += n as u64;
+                    // Only the chunk's last `max` bytes can end the stream: copy
+                    // just those, and trim what they push out.
+                    let keep = &chunk[n.saturating_sub(max)..n];
+                    tail.extend_from_slice(keep);
+                    if tail.len() > max.saturating_mul(2) {
+                        tail.drain(..tail.len() - max);
+                    }
+                }
+                ensure!(
+                    total == expected,
+                    "inflated size {total} of {} does not match the declared {expected} bytes",
+                    entry.name
+                );
+                tail.drain(..tail.len().saturating_sub(max));
+                Ok(Content::Owned(tail))
             }
         }
     }

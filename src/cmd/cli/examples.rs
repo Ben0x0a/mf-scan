@@ -29,7 +29,7 @@ Examples:
   mf-scan grep -o 'https?://[^ ]+' case.zip             # only the matched text
   mf-scan grep -e 'imei' -e 'imsi' ./extracted --dir-mode
   mf-scan grep '07700900000' case.zip --type database --inspect --fast
-  mf-scan grep -F 'a@b.com' case.zip --base64 --keyfile keychain.plist
+  mf-scan grep -F 'a@b.com' case.zip --all-encodings --keyfile keychain.plist
   mf-scan grep 'token' case.zip --path '*com.whatsapp*' --export ./out --max-size 5G
 
 ^ and $ match at each line; \\A and \\z at the file's start and end. Results are

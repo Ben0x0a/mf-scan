@@ -12,10 +12,35 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::cmd::cli::common::{ColourWhen, DecryptArgs, ExportSink, FilterArgs, IoModeArg};
 use mf_scan::report::output::OutputFormat;
+
+/// An encoding `--encoding` adds to the plain (UTF-8) search.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum EncodingArg {
+    /// UTF-16, little-endian.
+    Utf16le,
+    /// UTF-16, big-endian (binary plists, NSString archives).
+    Utf16be,
+    /// UTF-16, both byte orders.
+    Utf16,
+    /// Base64, standard alphabet.
+    Base64,
+    /// Base64, URL-safe alphabet.
+    Base64url,
+    /// The other Unicode normal form: `é` as one character or as `e` + an accent.
+    Nfd,
+    /// Java's modified UTF-8: an emoji as two 3-byte surrogates.
+    Cesu8,
+    /// JSON escapes: `\u00e9`, `\ud83d\ude02`.
+    Json,
+    /// Percent-encoding, as in URLs: `%C3%A9`.
+    Url,
+    /// Every encoding above.
+    All,
+}
 
 /// Arguments for `grep`.
 #[derive(Args)]
@@ -70,13 +95,23 @@ pub(crate) struct GrepArgs {
     #[arg(long = "and-paths", help_heading = "Matching")]
     pub(crate) and_paths: bool,
 
-    /// Also find the pattern's base64 encoding (requires -F).
-    #[arg(long = "base64", help_heading = "Matching")]
-    pub(crate) base64: bool,
+    /// Also as utf16[le|be], json, url, cesu8, nfd, base64[url] or all (-F).
+    #[arg(
+        long = "encoding",
+        value_enum,
+        value_name = "ENC",
+        hide_possible_values = true,
+        help_heading = "Matching"
+    )]
+    pub(crate) encodings: Vec<EncodingArg>,
 
-    /// Like --base64, with the URL-safe alphabet.
-    #[arg(long = "base64-urlsafe", help_heading = "Matching")]
-    pub(crate) base64_urlsafe: bool,
+    /// Also find the pattern's UTF-16 forms, both byte orders (requires -F).
+    #[arg(long = "utf16", help_heading = "Matching")]
+    pub(crate) utf16: bool,
+
+    /// Find it in every encoding at once: UTF-8, UTF-16, JSON, URL, … (-F).
+    #[arg(long = "all-encodings", help_heading = "Matching")]
+    pub(crate) all_encodings: bool,
 
     /// List only the files with a match.
     #[arg(

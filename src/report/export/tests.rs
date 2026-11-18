@@ -37,6 +37,7 @@ fn loose(name: &str, size: u64) -> MatchedFile {
             location: Location::Loose { path: name.into() },
         },
         offsets: Vec::new(),
+        encodings: Vec::new(),
     }
 }
 
@@ -55,6 +56,7 @@ fn plan_tree_label_cannot_escape_the_destination() {
             },
         },
         offsets: Vec::new(),
+        encodings: Vec::new(),
     }];
 
     for label in [
@@ -111,6 +113,7 @@ fn plan_tree_does_not_let_case_colliding_files_overwrite_each_other() {
                 },
             },
             offsets: Vec::new(),
+            encodings: Vec::new(),
         })
         .collect();
     let roots = vec![("HomeDomain".to_string(), "private/var/mobile".to_string())];
@@ -155,6 +158,7 @@ fn plan_does_not_let_two_files_share_a_destination() {
                 },
             },
             offsets: Vec::new(),
+            encodings: Vec::new(),
         })
         .collect();
     let plan = plan(&files);
@@ -181,6 +185,7 @@ fn distinct_paths_are_never_renamed() {
                 },
             },
             offsets: Vec::new(),
+            encodings: Vec::new(),
         })
         .collect();
     let roots = vec![("HomeDomain".to_string(), "private/var/mobile".to_string())];
@@ -205,6 +210,7 @@ fn tree_dir_agrees_with_plan_tree() {
             },
         },
         offsets: Vec::new(),
+        encodings: Vec::new(),
     }];
     let plan = plan_tree(&files, &roots);
     assert_eq!(plan.items[0].folder, "private/var/mobile/Library/SMS");
@@ -230,6 +236,7 @@ fn plan_tree_leaves_a_relative_label_intact() {
             },
         },
         offsets: Vec::new(),
+        encodings: Vec::new(),
     }];
     let roots = vec![(
         "AppDomain-com.x".to_string(),

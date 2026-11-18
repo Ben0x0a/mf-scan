@@ -33,10 +33,7 @@ fn rebuild_fixture(
     let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);
     let files: Vec<MatchedFile> = rebuild::files_to_rebuild(&source)
         .into_iter()
-        .map(|e| MatchedFile {
-            entry: e.clone(),
-            offsets: Vec::new(),
-        })
+        .map(|e| MatchedFile::new(e.clone(), Vec::new()))
         .collect();
     let export_plan = export::plan_tree(&files, &plan.roots);
     let outcome = export::export_files(&export_plan, &source, &files, dir, None, 0, None)

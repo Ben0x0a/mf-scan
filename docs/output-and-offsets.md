@@ -55,8 +55,10 @@ path:0x<file_offset>[:line][  [format  labelled summary]]
   show just `path:0x<offset>`.
 - `--colour` wraps the matched bytes in ANSI bold-red (terminal only).
 - With `--inspect`, a labelled `  [format  key: value  …]` tag is appended.
-- With `--base64`, a base64 hit appends `  [base64 → "decoded value"]` so the
-  encoded run is flagged and the decoded value shown (see [base64 search](#base64-search--base64)).
+- With other encodings (`--encoding`, `--utf16`, `--all-encodings`), an encoded hit
+  appends `  [<encoding> → "decoded value"]` (`nfc`, `nfd`, `utf16le`, `utf16be`,
+  `cesu8`, `json`, `url`, `base64`) so it is
+  flagged and its text shown (see [base64 search](#base64-search---encoding-base64)).
 
 Examples:
 
@@ -78,7 +80,7 @@ filter in effect, so the file is self-describing), `stats` (the coverage tally �
 see [scan statistics](#scan-statistics--the-report-sidecar)), and `results` (one
 object per match). Offsets are `0x…` hex strings. `archive` is the source
 archive's full path; `line` appears only for textual matches; `format`/`context`
-only with `--inspect`; `encoding`/`decoded` only for base64 hits.
+only with `--inspect`; `encoding`/`decoded` only for encoded (UTF-16, base64) hits.
 
 ```json
 {
@@ -95,8 +97,7 @@ only with `--inspect`; `encoding`/`decoded` only for base64 hits.
     "not_path_globs": [],
     "types": ["sqlite"],
     "exclude_media": false,
-    "base64": false,
-    "base64_urlsafe": false
+    "encodings": []
   },
   "stats": { "files_scanned": 1280, "files_skipped": 4096, "...": "..." },
   "results": [
@@ -116,8 +117,10 @@ only with `--inspect`; `encoding`/`decoded` only for base64 hits.
 
 `context` is format-specific (see below). For binary formats the decoded value
 lives in `context` (e.g. `cell`); for text formats the surrounding `line` is the
-content. A base64 match adds `"encoding": "base64"` and `"decoded": "<value>"`;
-plain matches omit both (the `encoding` key is absent).
+content. An encoded match adds `"encoding"` (`nfc`, `nfd`, `utf16le`, `utf16be`,
+`cesu8`, `json`, `url` or `base64`) and
+`"decoded": "<value>"`; plain matches omit both (the `encoding` key is absent).
+`run.encodings` lists the encodings searched besides plain.
 
 ## csv
 
@@ -129,7 +132,7 @@ archive,path,file_start,file_offset,archive_offset,compressed,encoding,decoded,f
 
 Offsets are `0x…` hex strings. `archive` is the source archive's display label,
 empty unless several archives were searched (the full path is in json's `run`);
-`encoding` is always present (`plain` or `base64`) and `decoded` holds the
+`encoding` is always present (`plain`, or an encoding as above) and `decoded` holds the
 decoded value for base64 hits (empty otherwise); `format`/`context` are empty
 unless `--inspect` matched; `line` is empty for binary files. `context` is the
 human labelled one-liner (the same text as the txt tag). Run metadata (pattern,
@@ -160,6 +163,16 @@ app.json:1
 | `bplist` (NSKeyedArchiver) | `{ "path": "$.root.key", "archiver": "NSKeyedArchiver", "class": "NSDictionary" }` (`class` omitted when unresolvable) | `nskeyed key: $.root.key` |
 | `sqlite` (in a row) | `{ "page": N, "table": "...", "rowid": N, "column": "...", "type": "TEXT", "cell": "..." }` | `table: T  column: C [TYPE]  row: R  cell: V` |
 | `sqlite` (BLOB cell, recognised) | the above **plus** `"blob_format": "bplist"` and `"blob_context": { … }` | `… [BLOB]  cell: <blob N bytes>  blob: bplist  key: $.…` |
+| `sqlite` (BLOB cell, by structure) | the above **plus** `"blob_detection": "structure"` (JSON or protobuf: no signature, so a lead, not a certainty) | `… blob: protobuf (by structure)  field: 4.4.2.1  [len]  string: "…"` |
+| `protobuf` | `{ "path": "4.4.2.1", "wire_type": "len", "kind": "string", "value": "…", "offset_in_value": N }`, plus `"ambiguous": [{ "path": "4.4.2", "read_as": "message" }, …]` when a value on the path also reads the other way | `field: 4.4.2.1  [len]  string: "…"` |
+| `leveldb` (log entry) | `{ "record": N, "sequence": N, "operation": "put", "part": "key", "key": "…", "value": "…" }`; manifest: `{ "record": N, "field": "comparator", … }` | `record 4  sequence 8  put  key: "…"  value: "…"  (in the key)` |
+| `uuidtext` | `{ "entry": N, "string_offset": N, "format_string": "…", "binary": "/…" }` | `format string: "…"  (binary: /…)` |
+| `typedstream` | `{ "objects": ["NSMutableAttributedString", "NSMutableString"], "kind": "string", "value": "…", "offset_in_value": N }` | `object: NSMutableAttributedString / NSMutableString  string: "…"` |
+| `mmkv` (by structure) | `{ "key": "…", "part": "value", "reading": "string" (the store records no type: a reading of the bytes; `0 (or "")` for a single 0 byte), "value": "…", "entry": N, "entries": N, "superseded_by": N, "detection": "structure" }` | `key: "…"  value: "…"  (entry 3 of 133)  (by structure)` |
+| `abx` | `{ "path": "/packages[1]/package[37]", "attribute": "name", "type": "string", "value": "\"com.x\"" }`; text: `"node": "text()"` | `path: /packages[1]/package[37]/@name  value: "com.x"` |
+| `realm` (a value) | `{ "file_format": 24, "table": "class_Person", "class": "Person", "property": "name", "type": "string", "object": N, "offset_in_value": N }`; elsewhere `"part"`: `schema`, `class names`, `object keys`, `free`, … | `class: Person  property: name [string]  object: 0  value: "Alice"` (`object: unknown`, `null` in JSON, when the key could not be read) |
+| `segb` (in an entry) | `{ "version": 2, "entry": N, "states": ["written"], "times": ["…Z"], "crc_ok": true, "data_offset": N, "data_format": "protobuf", "data_detection": "structure", "data_context": { … } }` (v1 adds `time2`) | `SEGB v2  entry N: written …Z  crc ok  data: protobuf (by structure)  field: 5  [len]  string: "…"` |
+| any format, identified only (header known, position not resolved: identify-only formats, media, a file the inspector cannot parse) | `{}` | `[leveldb]` |
 | `sqlite` (elsewhere) | `{ "page": N, "page_offset": N }` | `page: N  offset: N  (not in a table cell)` |
 | `sqlite` (in a `-wal`) | the row form above **plus** `"wal_frame": N, "wal_page": N`, resolved in the database with that frame applied (needs the main file in the source) | `-wal frame F, page P: table: T  column: C …` |
 
@@ -167,10 +180,10 @@ app.json:1
 value — a TEXT/INTEGER/REAL value as text, a NULL as `NULL`, a BLOB as
 `<blob N bytes>`. Raw bytes are never shown.
 
-## base64 search (`--base64`)
+## base64 search (`--encoding base64`)
 
 Secrets, tokens, and identifiers are often stored **base64-encoded**, where a
-plaintext search would miss them. `--base64` also searches for the pattern's
+plaintext search would miss them. `--encoding base64` also searches for the pattern's
 base64 form, tagging each hit with its encoding so an analyst can tell an encoded
 hit from a literal one — and see the decoded value.
 
@@ -178,15 +191,15 @@ How it works: base64 packs **3 bytes into 4 characters**, so where the target
 falls relative to those 3-byte groups (its offset **mod 3**) changes its
 encoding. There are three such alignments; for each, the characters in the middle
 of the encoded run depend only on the target and so are a literal that must
-appear. `--base64` searches all three (≈3× the work), which finds the value at
-any alignment. See `src/ops/search/base64.rs` for the bit-level derivation.
+appear. The base64 search covers all three (≈3× the work), which finds the value at
+any alignment. See `src/ops/search/encodings/base64.rs` for the bit-level derivation.
 
 Constraints and behaviour:
 
 - **Requires `-F`** (a literal can be encoded; a regex has no byte form) and is
   **incompatible with `--match-path`** (a path is not base64).
 - Searches **both** plaintext and base64 in one run; plain hits are unaffected.
-- Standard alphabet (`+/`) by default; `--base64-urlsafe` uses the URL-safe one
+- `base64` uses the standard alphabet (`+/`), `base64url` the URL-safe one
   (`-_`). Base64 matching is always case-sensitive (the `-i` flag does not apply
   to it).
 - Very short terms produce short fragments and may match unreliably; a warning is

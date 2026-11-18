@@ -17,21 +17,20 @@ use anyhow::{Context, Result};
 use regex::bytes::{Regex, RegexBuilder};
 
 use mf_scan::core::filter::EntryFilter;
-use mf_scan::core::models::RunInfo;
+use mf_scan::core::models::{Encoding, RunInfo};
 use mf_scan::core::source::Source;
 use mf_scan::core::stats::ScanStats;
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
 use mf_scan::ops::apps::expand_app_globs;
-use mf_scan::ops::search;
-use mf_scan::ops::search::{MatchOn, Query};
+use mf_scan::ops::search::{MatchOn, Query, encodings};
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
 use mf_scan::report::output::{
     ListedFile, OutputFormat, TxtStyle, write_counts, write_file_list, write_results,
 };
 
-use crate::cmd::cli::{ColourWhen, GrepArgs};
+use crate::cmd::cli::{ColourWhen, EncodingArg, GrepArgs};
 use crate::cmd::support::decryption::{
     build_decryption_context, context_for_source, report_decryptions,
 };
@@ -126,7 +125,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
 
     let run = RunInfo {
         loose_files_skipped: loose_skipped,
-        ..build_run_info(&cli, &sources, built.base64_enabled)
+        ..build_run_info(&cli, &sources, built.wanted)
     };
 
     // Announce the active skip rules before any result, so the analyst knows what
@@ -183,6 +182,7 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                         path,
                         size: f.entry.uncompressed_size,
                         mtime: f.entry.mtime,
+                        encodings: f.encodings.clone(),
                     };
                     counts.push((listed, f.offsets.len()));
                 }
@@ -350,13 +350,37 @@ fn apply_presets(cli: &mut GrepArgs) -> Result<()> {
 /// the query handed to the engine.
 struct BuiltQuery {
     plain: Regex,
-    base64: Option<Regex>,
-    base64_enabled: bool,
+    /// The literal's other encodings, each tagged (empty for a plain search).
+    encoded: Vec<(Encoding, Regex)>,
+    /// The literal a base64 hit decodes to; `None` without base64.
+    decoded: Option<String>,
+    /// The encodings searched besides plain, for the run record.
+    wanted: encodings::EncodingSet,
+}
+
+/// The encodings the flags ask for, besides plain UTF-8.
+fn encoding_set(cli: &GrepArgs) -> encodings::EncodingSet {
+    let asked = |e: EncodingArg| cli.encodings.contains(&e);
+    if cli.all_encodings || asked(EncodingArg::All) {
+        return encodings::EncodingSet::all();
+    }
+    let utf16 = cli.utf16 || asked(EncodingArg::Utf16);
+    encodings::EncodingSet {
+        normal_forms: asked(EncodingArg::Nfd),
+        utf16le: utf16 || asked(EncodingArg::Utf16le),
+        utf16be: utf16 || asked(EncodingArg::Utf16be),
+        cesu8: asked(EncodingArg::Cesu8),
+        json: asked(EncodingArg::Json),
+        url: asked(EncodingArg::Url),
+        base64: asked(EncodingArg::Base64),
+        base64url: asked(EncodingArg::Base64url),
+        base64_named: asked(EncodingArg::Base64) || asked(EncodingArg::Base64url),
+    }
 }
 
 impl BuiltQuery {
-    /// Compile the plain pattern and, when `--base64` is set, the alternation of
-    /// its base64 fragments.
+    /// Compile the plain pattern and, when other encodings are asked for, the
+    /// literal's form in each.
     fn build(cli: &GrepArgs) -> Result<Self> {
         // -F means "match this exact text", so escape any regex metacharacters.
         let parts: Vec<String> = cli
@@ -400,58 +424,37 @@ impl BuiltQuery {
             .build()
             .context("invalid regular expression")?;
 
-        // --base64 also searches for the pattern's base64 encoding. Only a literal
-        // can be encoded (a regex has no byte form), and a path is not base64, so the
-        // mode requires -F and is incompatible with --match-path.
-        let base64_enabled = cli.base64 || cli.base64_urlsafe;
-        let base64 = if base64_enabled {
-            if !cli.literal_string {
-                anyhow::bail!(
-                    "--base64 requires -F/--fixed-strings (a regex cannot be base64-encoded)"
-                );
-            }
-            if cli.match_path {
-                anyhow::bail!(
-                    "--base64 cannot be combined with --match-path (a path is not base64)"
-                );
-            }
-            // A base64 hit reports the one value it decodes to, and a word boundary means
-            // nothing inside an encoded run.
-            let [value] = cli.regexps.as_slice() else {
-                anyhow::bail!("--base64 takes a single pattern");
-            };
-            if cli.word_regexp {
-                anyhow::bail!("--base64 cannot be combined with -w");
-            }
-            let frags = search::base64::fragments(value.as_bytes(), cli.base64_urlsafe);
-            if frags.is_empty() {
-                anyhow::bail!("pattern is too short to search as base64; give a longer literal");
-            }
-            if frags.iter().map(String::len).min().unwrap_or(0) < 4 {
-                eprintln!(
-                    "warning: base64 fragments are very short; base64 matches may be unreliable for such a short term"
-                );
-            }
-            // Alternation of the (already alphabet-correct) fragments. Base64 is
-            // case-sensitive, so this regex never takes the -i flag even if set.
-            let alt = frags
-                .iter()
-                .map(|f| regex::escape(f))
-                .collect::<Vec<_>>()
-                .join("|");
-            Some(
-                RegexBuilder::new(&alt)
-                    .build()
-                    .context("failed to build base64 search pattern")?,
-            )
-        } else {
-            None
-        };
-
+        let wanted = encoding_set(cli);
+        if !wanted.any() {
+            return Ok(Self {
+                plain,
+                encoded: Vec::new(),
+                decoded: None,
+                wanted,
+            });
+        }
+        // Only a literal has an encoded form (a regex has no byte form); a path is not
+        // encoded; and a word boundary means nothing inside an encoded run.
+        if !cli.literal_string {
+            anyhow::bail!("other encodings require -F/--fixed-strings (a regex cannot be encoded)");
+        }
+        if cli.match_path {
+            anyhow::bail!(
+                "other encodings cannot be combined with --match-path (a path is not encoded)"
+            );
+        }
+        if cli.word_regexp {
+            anyhow::bail!("other encodings cannot be combined with -w");
+        }
+        let built = encodings::build(&cli.regexps, cli.ignore_case, wanted)?;
+        for note in &built.notes {
+            eprintln!("{note}");
+        }
         Ok(Self {
             plain,
-            base64,
-            base64_enabled,
+            encoded: built.patterns,
+            decoded: built.decoded,
+            wanted: built.searched,
         })
     }
 
@@ -459,11 +462,8 @@ impl BuiltQuery {
     fn query<'a>(&'a self, cli: &'a GrepArgs) -> Query<'a> {
         Query {
             plain: &self.plain,
-            base64: self.base64.as_ref(),
-            decoded: self
-                .base64_enabled
-                .then(|| cli.regexps.first().map(String::as_str))
-                .flatten(),
+            encoded: &self.encoded,
+            decoded: self.decoded.as_deref(),
             line_numbers: cli.line_number,
         }
     }
@@ -525,7 +525,11 @@ fn validate_flags(cli: &GrepArgs) -> Result<()> {
 
 /// Run metadata: the query and every filter in effect, recorded so JSON output
 /// and the export report are self-describing.
-fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bool) -> RunInfo {
+fn build_run_info(
+    cli: &GrepArgs,
+    sources: &[ResolvedSource],
+    wanted: encodings::EncodingSet,
+) -> RunInfo {
     // Search runs are not app-selected; the `app export` path fills the app fields.
     RunInfo {
         pattern: cli.regexps.join(" | "),
@@ -546,8 +550,7 @@ fn build_run_info(cli: &GrepArgs, sources: &[ResolvedSource], base64_enabled: bo
         not_path_globs: cli.filter.not_path.clone(),
         types: cli.filter.file_type.clone(),
         exclude_media: cli.filter.exclude_media,
-        base64: base64_enabled,
-        base64_urlsafe: cli.base64_urlsafe,
+        encodings: wanted.names(),
         keyfiles: cli
             .decrypt
             .keys

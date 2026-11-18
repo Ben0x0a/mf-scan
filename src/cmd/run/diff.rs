@@ -176,10 +176,9 @@ fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> R
         .iter()
         .filter(|f| matches!(f.change, Change::Added | Change::Modified))
         .filter_map(|f| {
-            by_path.get(f.path.as_str()).map(|e| MatchedFile {
-                entry: (*e).clone(),
-                offsets: Vec::new(),
-            })
+            by_path
+                .get(f.path.as_str())
+                .map(|e| MatchedFile::new((*e).clone(), Vec::new()))
         })
         .collect();
 

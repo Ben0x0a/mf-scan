@@ -97,7 +97,8 @@ fn diff_reports_changed_and_added_plist_keys() {
 /// Crafted-input DoS guard (review finding S3): a binary-plist trailer claiming
 /// 2^60 objects once made every offset lookup iterate effectively forever.
 /// The trailer counts are now validated against the bytes actually available,
-/// so the inspector must degrade to `None` immediately.
+/// so the inspector must give up immediately: the header still names the format,
+/// but no position is resolved.
 #[test]
 fn crafted_bplist_trailer_with_bogus_counts_degrades_fast() {
     let mut content = b"bplist00".to_vec();
@@ -109,7 +110,9 @@ fn crafted_bplist_trailer_with_bogus_counts_degrades_fast() {
     trailer[24..32].copy_from_slice(&8u64.to_be_bytes()); // offset_table
     content.extend_from_slice(&trailer);
 
-    assert!(inspect("x.plist", &content, 10).is_none());
+    let found = inspect("x.plist", &content, 10).expect("identified by its header");
+    assert_eq!(found.format, "plist");
+    assert!(found.summary.is_empty(), "{}", found.summary);
 }
 
 // ── NSKeyedArchiver integration tests ────────────────────────────────────────

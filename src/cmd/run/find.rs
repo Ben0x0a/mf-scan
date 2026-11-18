@@ -192,10 +192,7 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
                         .found
                         .iter()
                         .filter_map(|f| f.entry)
-                        .map(|entry| MatchedFile {
-                            entry: entry.clone(),
-                            offsets: Vec::new(),
-                        })
+                        .map(|entry| MatchedFile::new(entry.clone(), Vec::new()))
                         .collect();
                     let source_ctx = context_for_source(decrypt_ctx.as_ref(), source);
                     run_export_sink(

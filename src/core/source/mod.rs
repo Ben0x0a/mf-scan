@@ -266,4 +266,21 @@ pub trait Source: Sync {
     fn content_prefix(&self, entry: &Entry, _max: usize) -> Result<Content<'_>> {
         self.content(entry)
     }
+
+    /// Read at least the last `max` bytes of `entry`'s logical content, for a
+    /// format whose signature is at the end of the file. The caller uses only the
+    /// last `max` bytes of what it gets.
+    ///
+    /// The default returns the whole content, like [`Source::content_prefix`]; the
+    /// ranged source overrides it to fetch just the end of a STORED entry.
+    fn content_suffix(&self, entry: &Entry, _max: usize) -> Result<Content<'_>> {
+        self.content(entry)
+    }
+
+    /// Whether [`Source::content_suffix`] costs about as little as the bytes it
+    /// returns, so the end of `entry` is worth reading before deciding to fetch the
+    /// whole of it. `false` by default (the default suffix is the whole content).
+    fn cheap_suffix(&self, _entry: &Entry) -> bool {
+        false
+    }
 }

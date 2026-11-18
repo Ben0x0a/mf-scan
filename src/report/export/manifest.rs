@@ -4,6 +4,7 @@
 //! Used by: the binary's `--manifest` and the `export --from-manifest` command.
 //! Uses: `report::export::plan::{ExportItem, ExportPlan}`, `core::models::RunInfo`.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
@@ -53,6 +54,11 @@ pub struct ManifestEntry {
     pub size: u64,
     pub compressed: bool,
     pub offsets: Vec<u64>,
+    /// Matches per encoding (`{"plain": 7, "utf16le": 5}`), when other encodings than
+    /// plain were found: why a file with few readable matches was exported. Absent
+    /// otherwise, and from manifests written before it existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub encodings: BTreeMap<String, usize>,
 }
 
 impl From<&ExportItem> for ManifestEntry {
@@ -63,6 +69,11 @@ impl From<&ExportItem> for ManifestEntry {
             size: item.size,
             compressed: item.compressed,
             offsets: item.offsets.clone(),
+            encodings: item
+                .encodings
+                .iter()
+                .map(|(e, n)| (e.as_str().to_string(), *n))
+                .collect(),
         }
     }
 }

@@ -13,21 +13,14 @@ use anyhow::Result;
 use regex::bytes::Regex;
 
 use crate::core::filter::{EntryFilter, PathDecision, TypeDecision};
-use crate::core::models::{Encoding, Entry, MatchRecord, SearchHit};
+use crate::core::models::{Encoding, Entry, MatchRecord};
 use crate::core::source::Source;
 use crate::decrypt::{DecryptionContext, DecryptionRecord, TryOutcome};
-use crate::engine::Progress;
+use crate::engine::{Progress, Typing, type_from_ends};
 use crate::formats::inspect;
 use crate::ops::decrypting::SourceDecryptor;
 
-use super::{MatchOn, MatchedFile, Query, search_bytes_capped};
-
-/// Bytes of an entry's content read for header-first type classification (see the
-/// `content_prefix` branch in [`classify_entry`]). File types are identified from
-/// a short magic at the very start, so a small page-sized read is plenty — and
-/// over a network mount, keeping it small is the point (one media file skipped is
-/// a few KB fetched instead of megabytes).
-const CLASSIFY_PREFIX: usize = 4 * 1024;
+use super::{MatchOn, MatchedFile, Query};
 
 /// How one entry was classified during the search pass — the per-entry input to
 /// the [`ScanStats`] fold. Kept private: it exists only to carry a skip reason
@@ -188,9 +181,11 @@ fn classify_content(
     if decrypt.is_none()
         && filter.may_skip_by_type()
         && source.prefers_prefix_classification()
-        && let Ok(prefix) = source.content_prefix(entry, CLASSIFY_PREFIX)
+        && let Ok(Typing::Known(info)) = type_from_ends(source, entry, |a, b| {
+            filter.accept_type(a) != filter.accept_type(b)
+        })
     {
-        match filter.accept_type(inspect::detect_type(&entry.name, &prefix)) {
+        match filter.accept_type(info) {
             TypeDecision::SkipMedia => {
                 progress.inc();
                 return Ok(EntryResult {
@@ -295,24 +290,10 @@ fn classify_content(
     }
     let type_name = type_info.map(|i| i.name);
 
-    // Search the plain pattern, then (when `--base64`) the base64 fragments. Each
-    // hit is tagged with its encoding; base64 hits also carry the decoded value.
-    // Combining into one list keeps a single record/offset stream per file.
-    let plain_hits = search_bytes_capped(&content, query.plain);
-    let mut truncated = plain_hits.truncated;
-    let mut hits: Vec<(SearchHit, Encoding)> = plain_hits
-        .hits
-        .into_iter()
-        .map(|h| (h, Encoding::Plain))
-        .collect();
-    if let Some(b64) = query.base64 {
-        let b64_hits = search_bytes_capped(&content, b64);
-        truncated |= b64_hits.truncated;
-        hits.extend(b64_hits.hits.into_iter().map(|h| (h, Encoding::Base64)));
-    }
-    // Sort by in-file offset so records and export offsets stay in position order
-    // regardless of which pattern produced each hit.
-    hits.sort_by_key(|(h, _)| h.offset);
+    // The plain pattern and the literal's encoded forms (`--encoding`), each match
+    // once, by offset, with its encoding and decoded text: one record/offset stream.
+    let matches = super::encodings::find(&content, query);
+    let (hits, truncated, encodings) = (matches.found, matches.truncated, matches.counts);
 
     // `decryption` is set only when this entry was decrypted (a failed match
     // returns earlier), so its presence marks the content as decrypted plaintext.
@@ -323,8 +304,8 @@ fn classify_content(
     let line_numbers: Vec<u64> = if query.line_numbers {
         let (mut line, mut counted) = (1u64, 0usize);
         hits.iter()
-            .map(|(hit, _)| {
-                let end = (hit.offset as usize).min(content.len());
+            .map(|f| {
+                let end = (f.hit.offset as usize).min(content.len());
                 line += content[counted..end]
                     .iter()
                     .filter(|&&b| b == b'\n')
@@ -341,7 +322,7 @@ fn classify_content(
     let (records, file) = if hits.is_empty() {
         (Vec::new(), None)
     } else {
-        let offsets: Vec<u64> = hits.iter().map(|(hit, _)| hit.offset).collect();
+        let offsets: Vec<u64> = hits.iter().map(|f| f.hit.offset).collect();
         // Resolve the entry's absolute data start ONCE for all of this file's
         // matches (the mmap source reads it off the entry; the ranged source reads
         // one Local File Header). Threaded into every record so STORED matches
@@ -369,13 +350,11 @@ fn classify_content(
         let records = hits
             .into_iter()
             .enumerate()
-            .map(|(index, (hit, encoding))| {
-                let mut record = MatchRecord::new(entry, hit, data_start);
-                record.encoding = encoding;
+            .map(|(index, found)| {
+                let mut record = MatchRecord::new(entry, found.hit, data_start);
+                record.encoding = found.encoding;
                 record.line_number = line_numbers.get(index).copied();
-                if encoding == Encoding::Base64 {
-                    record.decoded = query.decoded.map(str::to_string);
-                }
+                record.decoded = found.decoded;
                 if was_decrypted {
                     // The offsets are within the decrypted plaintext; the archive
                     // byte is the entry's data start (None for a loose file), not an
@@ -394,6 +373,7 @@ fn classify_content(
         let file = MatchedFile {
             entry: entry.clone(),
             offsets,
+            encodings,
         };
         (records, Some(file))
     };
@@ -449,6 +429,7 @@ fn match_entry_path(entry: &Entry, re: &Regex) -> (Vec<MatchRecord>, Option<Matc
     let file = MatchedFile {
         entry: entry.clone(),
         offsets: vec![0],
+        encodings: Vec::new(),
     };
     (vec![record], Some(file))
 }

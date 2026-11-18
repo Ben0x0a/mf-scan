@@ -21,6 +21,7 @@
 //! flag.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::str::FromStr;
 
@@ -155,7 +156,7 @@ struct JsonView<'a> {
     /// Encoding of the matched bytes; present only for non-plain matches (base64).
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<&'a str>,
-    /// The decoded value, present only for base64 matches.
+    /// The decoded value, present only for encoded (non-plain) matches.
     #[serde(skip_serializing_if = "Option::is_none")]
     decoded: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +265,7 @@ struct CsvView<'a> {
     decrypted: bool,
     /// Always present: `plain` or `base64` (so the column set never varies).
     encoding: &'a str,
-    /// The decoded value for base64 matches; empty otherwise.
+    /// The decoded value for encoded (non-plain) matches; empty otherwise.
     decoded: &'a str,
     format: &'a str,
     context: &'a str,
@@ -360,14 +361,18 @@ fn write_txt(
         if r.decrypted {
             out.push_str("  [decrypted]");
         }
-        if let Some(i) = &r.inspection {
-            out.push_str(&format!("  [{}  {}]", i.format, i.summary));
+        match &r.inspection {
+            // Identified by its header, position not resolved: the format alone.
+            Some(i) if i.summary.is_empty() => out.push_str(&format!("  [{}]", i.format)),
+            Some(i) => out.push_str(&format!("  [{}  {}]", i.format, i.summary)),
+            None => {}
         }
-        // Flag a base64 hit and show what the encoded run decodes to, so the
-        // analyst sees the value rather than the base64 gibberish that matched.
-        if r.encoding == Encoding::Base64 {
+        // Flag an encoded hit (UTF-16, base64) and show what it decodes to, so the
+        // analyst sees the value rather than the encoded bytes that matched.
+        if r.encoding != Encoding::Plain {
             out.push_str(&format!(
-                "  [base64 → \"{}\"]",
+                "  [{} → \"{}\"]",
+                r.encoding.as_str(),
                 r.decoded.as_deref().unwrap_or("")
             ));
         }
@@ -388,9 +393,23 @@ pub struct ListedFile {
     pub size: u64,
     /// Modification time (Unix seconds), when the source records one.
     pub mtime: Option<u64>,
+    /// Matches per encoding, when other encodings than plain were searched and found
+    /// (see `MatchedFile::encodings`); empty otherwise.
+    pub encodings: Vec<(Encoding, usize)>,
 }
 
 impl ListedFile {
+    /// The count per encoding as `plain 7, utf16le 5`; `None` when all are plain.
+    fn encoding_counts(&self) -> Option<String> {
+        (!self.encodings.is_empty()).then(|| {
+            self.encodings
+                .iter()
+                .map(|(e, n)| format!("{} {n}", e.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+
     /// The `--long` prefix, as `find --long` prints it: type, size, modified (UTC).
     fn long_prefix(&self) -> String {
         let modified = self.modified_utc().unwrap_or_else(|| "-".to_string());
@@ -403,9 +422,11 @@ impl ListedFile {
 }
 
 /// One file of a `-l`/`-c` listing in JSON/CSV. `size`/`modified_utc` are present
-/// only with `--long`, so a plain listing keeps its shape.
+/// only with `--long`, so a plain listing keeps its shape. `E` is how the count per
+/// encoding is written: a map in JSON (as in the manifest), text in CSV (a CSV cell
+/// cannot hold a map).
 #[derive(Serialize)]
-struct ListedView<'a> {
+struct ListedView<'a, E> {
     path: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<usize>,
@@ -413,15 +434,19 @@ struct ListedView<'a> {
     size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modified_utc: Option<String>,
+    /// With `-c`, the count per encoding when other encodings than plain were found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encodings: Option<E>,
 }
 
-impl<'a> ListedView<'a> {
-    fn new(file: &'a ListedFile, count: Option<usize>, long: bool) -> Self {
+impl<'a, E> ListedView<'a, E> {
+    fn new(file: &'a ListedFile, count: Option<usize>, long: bool, encodings: Option<E>) -> Self {
         Self {
             path: &file.path,
             count,
             size: long.then_some(file.size),
             modified_utc: if long { file.modified_utc() } else { None },
+            encodings: count.and(encodings),
         }
     }
 }
@@ -463,17 +488,29 @@ fn write_listing<'a>(
                 } else {
                     String::new()
                 };
-                match count {
-                    Some(count) => writeln!(w, "{prefix}{}:{count}", file.path),
-                    None => writeln!(w, "{prefix}{}", file.path),
+                match (count, file.encoding_counts()) {
+                    (Some(count), Some(by)) => {
+                        writeln!(w, "{prefix}{}:{count}  [{by}]", file.path)
+                    }
+                    (Some(count), None) => writeln!(w, "{prefix}{}:{count}", file.path),
+                    (None, _) => writeln!(w, "{prefix}{}", file.path),
                 }
                 .context("failed writing the file list")?;
             }
             Ok(())
         }
         OutputFormat::Json => {
-            let views: Vec<ListedView> = files
-                .map(|(file, count)| ListedView::new(file, count, long))
+            let views: Vec<ListedView<BTreeMap<&str, usize>>> = files
+                .map(|(file, count)| {
+                    let by: Option<BTreeMap<&str, usize>> =
+                        (!file.encodings.is_empty()).then(|| {
+                            file.encodings
+                                .iter()
+                                .map(|(e, n)| (e.as_str(), *n))
+                                .collect()
+                        });
+                    ListedView::new(file, count, long, by)
+                })
                 .collect();
             serde_json::to_writer_pretty(&mut *w, &views)
                 .context("failed writing the file list")?;
@@ -483,7 +520,7 @@ fn write_listing<'a>(
         OutputFormat::Csv => {
             let mut wtr = csv::Writer::from_writer(w);
             for (file, count) in files {
-                wtr.serialize(ListedView::new(file, count, long))
+                wtr.serialize(ListedView::new(file, count, long, file.encoding_counts()))
                     .context("failed writing a file list row")?;
             }
             wtr.flush().context("failed flushing the file list")?;

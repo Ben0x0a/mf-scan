@@ -34,7 +34,9 @@ mod wal;
 pub(crate) use page::{
     Db, TABLE_LEAF, btree_header_offset, for_each_leaf_cell, pages_of, parse_header, read_u16,
 };
-pub(crate) use record::{Col, Value, col_int, col_text, is_blob, parse_cell, serial_type_name};
+pub(crate) use record::{
+    Col, Value, cell_record_prefix, col_int, is_blob, parse_cell, serial_type_name,
+};
 pub(crate) use schema::{Table, parse_column_spans, read_schema};
 pub(crate) use table::{read_table, read_table_with_rowid};
 #[cfg(test)]

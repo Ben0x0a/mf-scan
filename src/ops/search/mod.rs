@@ -5,7 +5,8 @@
 //! the [`search_with_query`] convenience over raw archive bytes — which search
 //! entries in parallel and return both the per-match records (for output) and the
 //! de-duplicated matched files (for the export step). Also re-exports the byte-search
-//! primitives ([`search_bytes`], [`search_entry`], …) and the [`base64`] fragments.
+//! primitives ([`search_bytes`], [`search_entry`], …), and holds the literal's encoded
+//! forms ([`encodings`]: UTF-16, base64, JSON escapes, …).
 //! Used by: the binary's `cmd::run::grep` (and `cmd::support`), `report::export`, and
 //! the integration tests.
 //! Uses: `crate::engine` (the shared [`Progress`] contract and the [`is_selected`]
@@ -20,7 +21,7 @@
 
 mod classify;
 
-pub mod base64;
+pub mod encodings;
 mod scan;
 pub(crate) use scan::ELLIPSIS;
 
@@ -31,7 +32,7 @@ use rayon::prelude::*;
 use regex::bytes::Regex;
 
 use crate::core::filter::EntryFilter;
-use crate::core::models::{Entry, MatchRecord, SearchHit};
+use crate::core::models::{Encoding, Entry, MatchRecord, SearchHit};
 use crate::core::source::Source;
 use crate::core::source::zip::{self, ZipSource};
 use crate::core::stats::ScanStats;
@@ -56,6 +57,22 @@ pub fn search_entry(archive: &[u8], entry: &Entry, re: &Regex) -> Result<Vec<Sea
 pub struct MatchedFile {
     pub entry: Entry,
     pub offsets: Vec<u64>,
+    /// How many matches each encoding found in the file, in [`Encoding`] order; empty
+    /// when every match is plain (the usual case), so it only shows when it adds
+    /// something (`-c` breakdown, manifest).
+    pub encodings: Vec<(Encoding, usize)>,
+}
+
+impl MatchedFile {
+    /// A matched file with its offsets and no encoding breakdown (all plain, or a
+    /// file selected without searching its content: `find`, `app`, `diff`, backups).
+    pub fn new(entry: Entry, offsets: Vec<u64>) -> Self {
+        Self {
+            entry,
+            offsets,
+            encodings: Vec::new(),
+        }
+    }
 }
 
 /// The result of searching an archive.
@@ -72,19 +89,20 @@ pub struct Findings {
     pub decryptions: Vec<DecryptionRecord>,
 }
 
-/// What to search for: the verbatim pattern, plus optionally its base64 encoding.
+/// What to search for: the verbatim pattern, plus optionally its encoded forms.
 ///
-/// `plain` is matched against the raw bytes as before. When `base64` is set
-/// (`--base64`), it is a second regex — an alternation of the base64 *alignment
-/// fragments* (see [`base64`]) — and any hit it produces is tagged
-/// [`Encoding::Base64`](crate::core::models::Encoding::Base64) with `decoded` (the
-/// literal the user searched for) so the
-/// report shows what the encoded run contains. Borrows the regexes so the caller
-/// keeps ownership; building both once and reusing them across entries.
+/// `plain` is matched against the raw bytes as before. Each `encoded` pattern is
+/// another regex for the same literal in another encoding (see [`encodings`]: UTF-16,
+/// CESU-8, JSON escapes, percent-encoding, the other Unicode normal form, base64
+/// *alignment fragments*), and a hit it produces is
+/// tagged with that [`Encoding`]. A span matched by two
+/// of them is reported once, under the first encoding in `Encoding` order. A base64 hit
+/// carries `decoded` (the literal searched for); any other encoded hit its own text. Borrows
+/// the regexes so the caller keeps ownership, building them once for all entries.
 pub struct Query<'a> {
     pub plain: &'a Regex,
-    pub base64: Option<&'a Regex>,
-    /// The decoded value carried onto base64 hits; `None` when `base64` is unset.
+    pub encoded: &'a [(Encoding, Regex)],
+    /// The decoded value carried onto base64 hits; `None` without base64.
     pub decoded: Option<&'a str>,
     /// Number each match's line (`-n`). Off by default because it means counting the
     /// newlines before every match.
@@ -92,11 +110,11 @@ pub struct Query<'a> {
 }
 
 impl<'a> Query<'a> {
-    /// A plain-only query — the default when `--base64` is not in play.
+    /// A plain-only query — the default when no `--encoding` is in play.
     pub fn plain(re: &'a Regex) -> Self {
         Self {
             plain: re,
-            base64: None,
+            encoded: &[],
             decoded: None,
             line_numbers: false,
         }

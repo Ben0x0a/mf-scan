@@ -61,7 +61,8 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   type, with `find`'s own spellings accepted. See [`find`](#find).
 - **Filter by file type** (`--type`) and **by path** (`--path`/`--not-path`),
   recognised by content **header first**, then extension.
-- **Find base64-encoded values** (`--base64`), **decrypt app databases** (`--keyfile`,
+- **Find a term in every encoding at once** (`--all-encodings`: UTF-8, UTF-16, JSON
+  escapes, URL encoding, Java's CESU-8, both Unicode forms, base64), **decrypt app databases** (`--keyfile`,
   or a dump found beside the source). `--export` writes each decrypted database beside
   its original, and `mf-scan decrypt --to OUT.zip` writes the whole acquisition with
   the decrypted copies added. See [Decryption](#decryption).
@@ -71,8 +72,9 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   size cap — `grep` and `diff` share one export pipeline.
 - **Multi-threaded**, with a live progress hint on a terminal.
 
-> Additional inspectors (ABX, SEGB) are planned for a future version; see
-> [docs/inspectors.md](docs/inspectors.md).
+> SEGB (Biome), Realm, ABX, typedstream (iMessage text), MMKV, LevelDB logs and
+> unified-log `uuidtext` are inspected; KTX snapshots, `.tracev3` and about 25 other
+> formats are identified by their header. See [docs/inspectors.md](docs/inspectors.md).
 
 ---
 
@@ -227,7 +229,8 @@ With more than one source, each result is tagged with its origin (see
 | `-t`, `--type TYPE` | Only handle files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
 | `--match-path` | Match the PATTERN against each file's internal path instead of its content. |
 | `--and-paths` | Match the PATTERN against contents **and** paths in one pass (grep + find). A path hit prints as the bare path (JSON/CSV: `path_match: true`); a file can have both. |
-| `--base64` / `--base64-urlsafe` | Also search for the base64 encoding of the pattern (any alignment). Requires `-F`; not with `--match-path`. |
+| `--encoding <ENC>` | Also search the literal in another encoding (repeatable): `utf16le`, `utf16be`, `utf16` (both), `json` (`\u00e9`, `\ud83d\ude02`), `url` (`%C3%A9`, space as `+`), `cesu8` (Java's modified UTF-8: an emoji as two surrogates), `nfd` (the other Unicode normal form: `é` as one character or `e` + accent), `base64`, `base64url` (any alignment), or `all`. An encoding whose form of the literal is its plain form is skipped. Requires `-F`; not with `--match-path` or `-w`. `-i` covers every encoding but base64. |
+| `--utf16` / `--all-encodings` | Shorthands for `--encoding utf16` / `--encoding all`: every encoding above in one pass. |
 | `--exclude-media` | Skip image/video/audio files (searched by default). |
 | `--fast` | Speed preset: exclude media + a customisable exclude list. |
 | `--inspect` | Resolve matches inside recognised formats (see [Inspection](#deep-inspection)). |
@@ -249,6 +252,24 @@ With more than one source, each result is tagged with its origin (see
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
 | `--backup-password PASSWORD` | Password to unlock an **encrypted iOS or Android backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
+
+**Encoded matches.** Each match is one byte span in one encoding, so searching
+several encodings never duplicates a match: a match that is not plain UTF-8 is
+tagged with its encoding and decoded text (`[utf16be → "😂"]`, `"encoding"` in
+JSON/CSV). `-l` still lists each file once; `-c` adds the count per encoding
+(`ids.db:4  [utf16be 4]`); an export copies each file once, its manifest entry
+giving the count per encoding. Why it matters: binary plists store non-ASCII text
+as UTF-16, so on one test iPhone an emoji was in 174 files as UTF-8 and in 182 as
+UTF-16. Measured on test devices, the other encodings each hold what UTF-8 misses: a
+decomposed `é` in about 300 files per phone, an emoji as CESU-8 in 16 Android files,
+JSON-escaped in 13 iPhone files, percent-encoded in 6.
+
+Two rules keep these honest. A base64 match counts only when the base64 around it
+decodes to the term (a fragment of the encoding alone proves nothing); under 4 bytes,
+chance base64 text decodes to a term too, so `--all-encodings` leaves base64 out (with
+a note), as it does for several patterns. And Latin-range text in UTF-16, surrounded by
+the same, reads as little- and big-endian one byte apart: the byte order cannot be
+told from the text, so it is one match tagged `utf16`.
 
 ### `find`
 
@@ -438,7 +459,9 @@ txt shows only the in-file offset.
 
 When a matching file's format is recognised (by content header first, file extension
 as fallback), mf-scan resolves the match to a meaningful location: `[format summary]`
-in txt, a nested `context` object in json.
+in txt, a nested `context` object in json. A matched file nothing claims gets one more
+try: if its whole content is JSON or a protobuf message, that inspector resolves the
+match, marked "(by structure)" (`"detection": "structure"` in JSON): inferred, not certain.
 
 | Format | Resolves a match to |
 |---|---|
@@ -448,7 +471,35 @@ in txt, a nested `context` object in json.
 | CSV | row, column, and header name |
 | plist (XML & binary `bplist`) | dict-key / array-index path, e.g. `$.Account.Servers[1]` |
 | plist (NSKeyedArchiver `bplist`) | logical path through the `$objects`/UID graph, e.g. `$.root.prefs.token`; resolves wrapped scalars (NSMutableString, NSData), array indices, and dict key-name hits; reports the Foundation class of the containing object |
-| SQLite | `table`, `column [TYPE]`, `row`, and the decoded cell value; else `page` + offset |
+| protobuf (by structure: the whole file or BLOB parses) | field path with no `.proto`, e.g. `4.4.2.1`, wire type and value (string, number, bytes, nested message); a value that is both valid text and a valid message is flagged as ambiguous |
+| LevelDB logs (`*.log`) and manifests (`MANIFEST-*`) | record, sequence number, put or delete, key and value; manifest: the version edit field (comparator, new file and its key range, …) |
+| uuidtext (unified logs) | the format string, its offset in the binary's string space (as `.tracev3` refers to it), and the binary's path |
+| typedstream (`NSArchiver`: iMessage `attributedBody`, also inside a SQLite BLOB) | the chain of objects holding the string, e.g. `NSMutableAttributedString / NSMutableString`, and the text |
+| MMKV (by structure: no signature) | key, value (string or number), entry number, and the later entry that supersedes it |
+| ABX (Android Binary XML: `packages.xml`, permissions, settings) | element path with sibling indices, e.g. `/packages[1]/package[37]/@name`, and the attribute's typed value or the text |
+| Realm (file format 10+) | class, property (type), object key and value for a string or binary property; else the schema, the property's data, Realm structure, or free space from an earlier version |
+| SEGB (Biome streams, v1 and v2) | entry number, state (`written`/`deleted`), UTC time, CRC check, and the entry's data (usually protobuf, by structure) |
+| SQLite | `table`, `column [TYPE]`, `row`, and the decoded cell value; else `page` + offset. A match in a `-wal` is resolved through the main database |
+| SQLite BLOB cell | the format inside the cell: by signature (`bplist`, XML plist, SQLite, media…), else by structure (`blob: protobuf (by structure)`, `blob_detection` in JSON), as a lead to export and decode it properly |
+
+**Identified only** (by a signature in the file, never by its name): a
+match shows `[format]` with no position, so you know what the file is and which
+tool opens it.
+
+| Category | Formats |
+|---|---|
+| database | `leveldb` tables (`.ldb`/`.sst`: footer magic; logs and manifests are inspected), `lmdb`, `sqlite-wal`, `sqlite-shm`, `sqlite-journal` |
+| log | `tracev3` (unified logs: LZ4-compressed entries), `dsc` (shared-cache strings) |
+| structured | `binarycookies`, `bom` (`Assets.car`) |
+| archive | `zip` (APK, IPA, DOCX…), `gzip`, `bzip2`, `xz`, `zstd`, `7z`, `tar`, `lz4`, `lzfse`, `aea` |
+| executable | `elf`, `macho`, `dex`, `hermes` (React Native bytecode) |
+| document | `pdf`, `ole` (legacy Office) |
+| text (with line and column) | `vcard`, `icalendar`, `pem` |
+| cache | `chromium-cache` (Chrome / WebView simple cache) |
+
+Each name and category is also a `--type` value. A signature is looked for at the
+start of the file, then (for LevelDB tables, whose magic is their last 8 bytes) at
+its end; the end is read only when the start names nothing.
 
 The same inspectors power `diff --inspect`'s intra-file comparison. See
 [docs/inspectors.md](docs/inspectors.md).

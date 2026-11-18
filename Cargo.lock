@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "mf-scan"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -519,6 +519,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "serde_yaml",

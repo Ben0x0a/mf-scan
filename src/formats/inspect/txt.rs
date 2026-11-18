@@ -1,8 +1,9 @@
 //! TXT inspector: map a byte offset to a line and column.
 //!
-//! Defines: `inspect`, returning the 1-based line and (byte) column of a match
-//! within a text file.
-//! Used by: `inspect::inspect` (dispatch).
+//! Defines: the TXT inspector, returning the 1-based line and (byte) column of a
+//! match within a text file, and `resolve_many` (all of a file's matches in one pass).
+//! Used by: `inspect::inspect` (dispatch); `identify::text` (vCard, iCalendar, PEM
+//! resolve lines the same way).
 //! Uses: `crate::core::models::Inspection`, `serde_json` (structured detail).
 //!
 //! Column is counted in bytes, not Unicode scalar values — forensic text may
@@ -33,35 +34,51 @@ impl super::Inspector for Txt {
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
         resolve(content, offset)
     }
+    fn inspect_many(&self, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+        resolve_many(content, offsets)
+    }
     fn diff(&self, old: &[u8], new: &[u8]) -> Option<ContentDiff> {
         Some(line_diff(old, new))
     }
 }
 
-/// Report the 1-based line and byte-column of `offset` within `content`.
+/// Report the 1-based line and byte-column of `offset` within `content`. Also used
+/// by the identify-only text formats (PEM, vCard, iCalendar). An offset past the end
+/// means the caller passed a position from a different buffer: `None`, rather than a
+/// bogus location.
 fn resolve(content: &[u8], offset: usize) -> Option<Inspection> {
-    // An offset past the end means the caller passed a position from a
-    // different buffer; refuse rather than report a bogus location.
-    if offset > content.len() {
-        return None;
-    }
+    resolve_many(content, &[offset]).pop().flatten()
+}
 
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for &b in &content[..offset] {
-        if b == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+/// [`resolve`] for many offsets in one pass over the file: the offsets are visited in
+/// order and each line count continues from the previous one, instead of counting
+/// from the start for every match. Results are in the order of `offsets`.
+pub(super) fn resolve_many(content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
+    let mut order: Vec<usize> = (0..offsets.len()).collect();
+    order.sort_unstable_by_key(|&i| offsets[i]);
+    let mut out: Vec<Option<Inspection>> = offsets.iter().map(|_| None).collect();
+    // Line of `at`, and where that line starts.
+    let (mut at, mut line, mut line_start) = (0usize, 1usize, 0usize);
+    for i in order {
+        let offset = offsets[i];
+        if offset > content.len() {
+            continue;
         }
+        for (k, &b) in content[at..offset].iter().enumerate() {
+            if b == b'\n' {
+                line += 1;
+                line_start = at + k + 1;
+            }
+        }
+        at = offset;
+        let col = offset - line_start + 1;
+        out[i] = Some(Inspection {
+            format: "txt".into(),
+            summary: format!("line: {line}  col: {col}"),
+            detail: json!({ "line": line, "col": col }),
+        });
     }
-
-    Some(Inspection {
-        format: "txt".into(),
-        summary: format!("line: {line}  col: {col}"),
-        detail: json!({ "line": line, "col": col }),
-    })
+    out
 }
 
 /// Diff two text blobs by line multiset: how many lines were added/removed.
@@ -108,6 +125,33 @@ fn lines(content: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_many;
+
+    #[test]
+    fn resolve_many_matches_counting_from_the_start_for_each_offset() {
+        let text = b"first line\nsecond\n\nfourth line here\nlast";
+        // Unsorted, repeated, at a newline, at the end, and past the end.
+        let offsets = [30, 3, 11, 17, 18, 3, text.len(), text.len() + 1, 0];
+        let many = resolve_many(text, &offsets);
+        for (&offset, got) in offsets.iter().zip(&many) {
+            let expected = (offset <= text.len()).then(|| {
+                let before = &text[..offset];
+                let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+                let start = before
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |p| p + 1);
+                (line, offset - start + 1)
+            });
+            let got = got.as_ref().map(|i| {
+                (
+                    i.detail["line"].as_u64().unwrap() as usize,
+                    i.detail["col"].as_u64().unwrap() as usize,
+                )
+            });
+            assert_eq!(got, expected, "offset {offset}");
+        }
+    }
     use super::line_diff;
 
     #[test]

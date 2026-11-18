@@ -1,6 +1,6 @@
 [package]
 name = "mf-scan"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 # Minimum supported Rust. 1.98 stabilised `slice::as_chunks`, which the hex, UTF-16
 # and WAL-checksum decoders use so their fixed-size indices are checked at compile
@@ -38,6 +38,10 @@ plist = "1.9.0"
 quick-xml = "0.39.4"
 rayon = "1.12.0"
 regex = "1.12.3"
+# Unicode simple case folding for `-i` on encoded search patterns (UTF-16, JSON, …),
+# the same folding `regex` applies to the plain pattern. Already in the build as a
+# dependency of `regex`.
+regex-syntax = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9"

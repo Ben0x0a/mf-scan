@@ -71,6 +71,7 @@ fn capped(haystack: &[u8], re: &Regex, cap: usize) -> SearchHits {
         let (line, match_in_line) = preview(haystack, line_start, line_end, m.start(), m.end());
         hits.push(SearchHit {
             offset: m.start() as u64,
+            len: m.len(),
             line,
             match_in_line,
         });

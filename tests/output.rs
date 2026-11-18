@@ -26,8 +26,7 @@ fn run_info() -> RunInfo {
         not_path_globs: vec![],
         types: vec![],
         exclude_media: false,
-        base64: false,
-        base64_urlsafe: false,
+        encodings: Vec::new(),
         keyfiles: vec![],
         platform: None,
         app: None,
@@ -279,6 +278,7 @@ fn count_writes_one_line_per_file() {
         path: path.into(),
         size,
         mtime,
+        encodings: Vec::new(),
     };
     let counts = [
         (file("a/x.db", 4096, Some(1_700_000_000)), 3),

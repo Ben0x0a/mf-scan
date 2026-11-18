@@ -34,8 +34,7 @@ fn run_info() -> RunInfo {
         not_path_globs: vec![],
         types: vec![],
         exclude_media: false,
-        base64: false,
-        base64_urlsafe: false,
+        encodings: Vec::new(),
         keyfiles: vec![],
         platform: None,
         app: None,
@@ -355,6 +354,7 @@ fn export_from_manifest_skips_missing_entries() {
             size: 5,
             compressed: false,
             offsets: vec![],
+            encodings: Default::default(),
         }],
     };
     let dir = tempfile::tempdir().unwrap();

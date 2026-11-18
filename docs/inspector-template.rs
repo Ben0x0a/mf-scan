@@ -36,7 +36,8 @@ impl super::Inspector for Foo {
     }
 
     /// File-name extensions (lowercase, no dot) for fallback detection when the
-    /// content has no recognisable header.
+    /// content has no recognisable header. Only the format's standard extensions;
+    /// return `&[]` when it has none in common use (e.g. protobuf).
     fn extensions(&self) -> &'static [&'static str] {
         &["foo"]
     }
@@ -47,6 +48,16 @@ impl super::Inspector for Foo {
     fn detect(&self, content: &[u8]) -> bool {
         content.starts_with(b"FOO\0")
     }
+
+    // Optional, with defaults (see `src/formats/inspect/mod.rs`):
+    // - `detect_tail` + `has_tail_signature` — only for a format whose signature is
+    //   at the END of the file (a LevelDB table); `detect` must still decide from at
+    //   most `inspect::HEAD_LEN` bytes.
+    // - `inspect_many` — override when a file's state (a parsed tree, a schema) can
+    //   be built once for all its matches instead of once per match.
+    // - `selectable_by_type` — `false` only for a format never named when files are
+    //   classified (protobuf), so `--type` does not offer it.
+    // - `sidecars`, `diff`.
 
     /// Resolve a match at `offset` to a meaningful location, or `None` when it
     /// cannot be placed (the caller then emits a plain match record).

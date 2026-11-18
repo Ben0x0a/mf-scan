@@ -1,11 +1,14 @@
 //! In-file deep search: the inspector API, format detection, and dispatch.
 //!
 //! Defines: the [`Inspector`] trait (the standard interface every format
-//! implements), the inspector registry, and the public entry points
-//! [`inspect`], [`sidecars_for`], and the file-type helpers [`detect_type`] /
-//! [`is_known_type`] / [`type_names`] (which drive `--type` and the media skip).
-//! Used by: `engine.rs` (`--inspect`) and `export.rs` (sidecar export).
-//! Uses: `crate::core::models::Inspection` and the per-format submodules.
+//! implements), the `classify_inspector!` macro, the inspector registry, and the
+//! dispatch entry points [`inspect`] / [`inspect_many`], [`diff`], [`sidecars_for`];
+//! re-exports the detection API of `detect` ([`detect_type`], [`is_known_type`],
+//! [`type_names`], …, which drive `--type` and the media skip).
+//! Used by: `ops::search::classify` (`--inspect`, `--type`), `ops::find`, `ops::diff`,
+//! `engine::type_from_ends`, `report::export::write` (sidecar export), `cmd`.
+//! Uses: `crate::core::models::{Inspection, ContentDiff}`, the per-format submodules,
+//! `detect` (which inspector a file belongs to) and `nested` (data inside a value).
 //!
 //! ── The inspector API ───────────────────────────────────────────────────────
 //! An *inspector* turns a raw byte `offset` into a meaningful location inside a
@@ -23,32 +26,86 @@
 //! [`Inspector`], and add it to the `INSPECTORS` registry. See
 //! `docs/inspectors.md`.
 //!
-//! Currently implemented (resolve an offset): TXT, JSON, XML, SQLite, CSV, plist
-//! (XML + binary). Plus classification-only media inspectors (one per format,
-//! category `media`) used by `--type` and the media skip — they detect but do
-//! not resolve.
+//! Currently implemented (resolve an offset): TXT, JSON, XML, SQLite (and its
+//! `-wal`), CSV, plist (XML + binary), protobuf (by structure), SEGB (v1, v2) and
+//! Realm (format 10+), ABX (Android Binary XML), typedstream (iMessage
+//! `attributedBody`), MMKV (by structure), LevelDB logs and manifests, and unified-log
+//! `uuidtext`.
+//! Plus classification-only inspectors that detect but do not resolve: the media
+//! formats (`media/`, one file per family: image, video, audio) and the identify-only formats
+//! (`identify/`, one file per category: LevelDB, Realm, archives, executables, …).
 
 use crate::core::models::{ContentDiff, Inspection};
 
+// WHY defined here, above the `mod` lines: a `macro_rules!` is in scope for the
+// modules declared after it, so the per-format files use it with no import.
+/// Generate a classification-only inspector: a zero-sized type that names a file's
+/// format (`$name`, category `$cat`) from the `$detect` header predicate (and the
+/// `$ext` list), but does not resolve offsets (`inspect` is always `None`). Used by
+/// the media formats and the identify-only formats.
+macro_rules! classify_inspector {
+    ($ty:ident, $name:literal, $cat:literal, [$($ext:literal),*], $detect:expr) => {
+        pub struct $ty;
+        impl $crate::formats::inspect::Inspector for $ty {
+            fn name(&self) -> &'static str { $name }
+            fn category(&self) -> &'static str { $cat }
+            fn extensions(&self) -> &'static [&'static str] { &[$($ext),*] }
+            fn detect(&self, content: &[u8]) -> bool { ($detect)(content) }
+            fn inspect(
+                &self,
+                _content: &[u8],
+                _offset: usize,
+            ) -> Option<$crate::core::models::Inspection> {
+                None
+            }
+        }
+    };
+}
+
 // Structured / database / text inspectors (resolve offsets).
+mod abx;
 mod csv;
+// Format detection (header, end, name, structure) and the `--type` answers.
+mod detect;
+pub use detect::{
+    HEAD_LEN, TAIL_LEN, TypeInfo, detect_type, end_types, is_known_type, type_from_end,
+    type_from_start, type_names,
+};
+use detect::{detect, detect_by_extension, detect_by_tail};
+pub(crate) use detect::{detect_by_header, detect_structure};
 mod json;
+pub(crate) use json::unescape as json_unescape;
+mod leveldb;
+mod mmkv;
+// What an embedded byte run holds (shared by the SQLite and SEGB inspectors).
+mod nested;
+pub(crate) use nested::describe_nested_many;
 // NSKeyedArchiver graph-walk resolver — sibling of `plist`, uses `plist::Bplist`
 // via the `pub(super)` helpers exposed below.
 mod nskeyed;
 mod plist;
+mod protobuf;
+mod realm;
+mod segb;
 mod sqlite;
 pub(crate) use sqlite::inspect_wal;
 mod txt;
+mod typedstream;
+mod uuidtext;
 mod xml;
 
 // Shared helper: structured diff of two JSON value trees (used by json + plist).
 mod value_diff;
 
-// Media inspectors — the `media` category, one file per format under
-// `inspect/media/` (classify only). Its `mod.rs` is the category aggregator
-// (per-format submodules + the shared macro/magic), re-exporting each struct.
+// Media inspectors — the `media` category, one file per family (image, video,
+// audio) under `inspect/media/` (classify only). Its `mod.rs` is the category
+// aggregator (the family submodules + the shared magic), re-exporting each struct.
 mod media;
+
+// Identify-only formats (LevelDB, Realm, archives, executables, …) — recognised
+// by a signature at the start of the file, not inspected further. One file per
+// category under `inspect/identify/`.
+mod identify;
 
 /// The interface every format inspector implements — the inspector API.
 ///
@@ -68,12 +125,38 @@ pub trait Inspector: Sync {
 
     /// File-name extensions (lowercase, no dot) used for fallback detection when
     /// the content has no recognisable header.
+    ///
+    /// WHY kept small: a file name is weak evidence in an acquisition. List only
+    /// the format's standard extensions, and none when it has no common one
+    /// (protobuf) — an extension there would only add false claims.
     fn extensions(&self) -> &'static [&'static str];
 
     /// Recognise the format from the content's header/magic. Preferred over the
     /// extension, because forensic file names are often wrong or absent. Return
     /// `false` for formats with no signature (JSON, CSV, TXT).
     fn detect(&self, content: &[u8]) -> bool;
+
+    /// Recognise the format from the **last** [`TAIL_LEN`] bytes of the file (fewer
+    /// for a shorter file), for a format whose only signature is at its end (a
+    /// LevelDB table's footer). Checked only when no header matched. Default: none.
+    fn detect_tail(&self, _tail: &[u8]) -> bool {
+        false
+    }
+
+    /// Whether this format has an end-of-file signature ([`Self::detect_tail`]), so
+    /// a caller can tell, before reading a file's end, whether that read could
+    /// change anything. Must be `true` for every inspector that overrides
+    /// `detect_tail`.
+    fn has_tail_signature(&self) -> bool {
+        false
+    }
+
+    /// Whether `--type` can select this format. `false` for a format that is only
+    /// ever recognised by structure after a match (protobuf), never when files are
+    /// classified, so offering it as a `--type` would silently select nothing.
+    fn selectable_by_type(&self) -> bool {
+        true
+    }
 
     /// Resolve a match at `offset` to a meaningful location. Return `None` when
     /// the offset can't be placed; the caller then emits a plain record.
@@ -116,6 +199,44 @@ static INSPECTORS: &[&dyn Inspector] = &[
     &sqlite::Sqlite,
     &plist::Plist,
     &xml::Xml,
+    &segb::Segb,
+    &typedstream::Typedstream,
+    &uuidtext::Uuidtext,
+    // Identify-only — before media, because several media checks are weak (MP3's
+    // 11-bit frame sync matches any file starting `FF Ex`) and would otherwise take
+    // files these stronger signatures name. Within: magic at offset 0 first, then
+    // those further in (Realm and LMDB at 16, tar at 257), then LevelDB's checksum.
+    &identify::SqliteWal,
+    &identify::SqliteShm,
+    &identify::SqliteJournal,
+    &abx::Abx,
+    &identify::BinaryCookies,
+    &identify::Bom,
+    &identify::Zip,
+    &identify::Gzip,
+    &identify::Bzip2,
+    &identify::Xz,
+    &identify::Zstd,
+    &identify::SevenZip,
+    &identify::Lz4,
+    &identify::Lzfse,
+    &identify::Aea,
+    &identify::Elf,
+    &identify::MachO,
+    &identify::Dex,
+    &identify::Hermes,
+    &identify::Pdf,
+    &identify::Ole,
+    &identify::Vcard,
+    &identify::Icalendar,
+    &identify::Pem,
+    &identify::ChromiumCache,
+    &identify::Tracev3,
+    &identify::Dsc,
+    &realm::Realm,
+    &identify::Lmdb,
+    &identify::Tar,
+    &leveldb::Leveldb,
     // Media — recognised by header magic; classification only (no offset
     // resolution). List the more specific container before the generic one:
     // WebM before Matroska, Opus before Ogg (both share a magic).
@@ -127,6 +248,8 @@ static INSPECTORS: &[&dyn Inspector] = &[
     &media::Heif,
     &media::Webp,
     &media::Ico,
+    &media::Ktx,
+    &media::AppleKtx,
     &media::Dng,
     &media::Cr2,
     &media::Nef,
@@ -154,6 +277,8 @@ static INSPECTORS: &[&dyn Inspector] = &[
     // No signature — matched by extension only; keep last so a real header
     // always wins over a misleading file name.
     &json::Json,
+    &mmkv::Mmkv,
+    &protobuf::Protobuf,
     &csv::Csv,
     &txt::Txt,
 ];
@@ -163,18 +288,61 @@ static INSPECTORS: &[&dyn Inspector] = &[
 /// Returns `None` when the format is unsupported or undetected — the caller then
 /// emits the plain match record.
 pub fn inspect(name: &str, content: &[u8], offset: usize) -> Option<Inspection> {
-    detect(name, content)?.inspect(content, offset)
+    inspect_many(name, content, &[offset]).pop().flatten()
 }
 
 /// Produce inspection context for several match offsets in one file, one
 /// (positional) result per offset. The batch twin of [`inspect`]: detection
 /// runs once, and inspectors with per-file state derive it once for all
 /// offsets (see [`Inspector::inspect_many`]).
+///
+/// A file no inspector claims by header or extension gets one more chance: when its
+/// whole content is JSON or a protobuf message, that inspector resolves the matches,
+/// and each result is marked `"detection": "structure"` and "(by structure)" (inferred,
+/// not read from a signature or a name). Only matched files reach this, so the parse costs nothing
+/// for the rest, and `--type` never classifies a file this way.
 pub fn inspect_many(name: &str, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
-    match detect(name, content) {
-        Some(insp) => insp.inspect_many(content, offsets),
+    // A header is proof of the format: report it even where the inspector cannot
+    // place the match (an identify-only format, a media file), as `[format]`.
+    if let Some(insp) = detect_by_header(content).or_else(|| detect_by_tail(content)) {
+        return insp
+            .inspect_many(content, offsets)
+            .into_iter()
+            .map(|found| found.or_else(|| Some(identified(insp))))
+            .collect();
+    }
+    if let Some(insp) = detect_by_extension(name) {
+        return insp.inspect_many(content, offsets);
+    }
+    match detect_structure(content) {
+        Some(insp) => insp
+            .inspect_many(content, offsets)
+            .into_iter()
+            .map(|found| found.map(mark_inferred))
+            .collect(),
         None => offsets.iter().map(|_| None).collect(),
     }
+}
+
+/// The result for a match in a file whose format is known from its header but whose
+/// position the inspector does not resolve: the format alone, with no summary.
+fn identified(insp: &dyn Inspector) -> Inspection {
+    Inspection {
+        format: insp.name().to_string(),
+        summary: String::new(),
+        detail: serde_json::json!({}),
+    }
+}
+
+/// Mark an inspection as resting on a structural guess: `"detection": "structure"` in
+/// its detail and "(by structure)" in its summary. The `format` stays the plain name,
+/// so a consumer filtering on it still finds these results.
+fn mark_inferred(mut found: Inspection) -> Inspection {
+    if let Some(detail) = found.detail.as_object_mut() {
+        detail.insert("detection".into(), serde_json::json!("structure"));
+    }
+    found.summary.push_str("  (by structure)");
+    found
 }
 
 /// Describe what changed inside a modified file, comparing `old` (side A) and `new`
@@ -193,64 +361,50 @@ pub fn sidecars_for(name: &str, content: &[u8]) -> &'static [&'static str] {
     detect(name, content).map_or(&[], |insp| insp.sidecars())
 }
 
-/// Pick the inspector for a file: the first whose header matches, else the first
-/// claiming the file-name extension.
-fn detect(name: &str, content: &[u8]) -> Option<&'static dyn Inspector> {
-    if let Some(insp) = detect_by_header(content) {
-        return Some(insp);
-    }
-    let base = name.rsplit('/').next().unwrap_or(name);
-    let ext = base.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())?;
-    INSPECTORS
-        .iter()
-        .copied()
-        .find(|i| i.extensions().contains(&ext.as_str()))
-}
-
-/// Pick the inspector by **content header only** (no extension fallback).
-///
-/// Used to classify a nameless byte run — e.g. a SQLite BLOB cell — where there
-/// is no file name to fall back on, only the bytes' signature.
-pub(crate) fn detect_by_header(content: &[u8]) -> Option<&'static dyn Inspector> {
-    INSPECTORS.iter().copied().find(|i| i.detect(content))
-}
-
-// `TypeInfo` is defined in `core::models` (the foundation layer that `core::filter`
-// consumes); re-exported here because this layer fills it and callers reach it via
-// `crate::formats::inspect::TypeInfo`.
-pub use crate::core::models::TypeInfo;
-
-/// Classify a file by format and category (header-first, then extension).
-///
-/// `None` when no inspector claims the file — such a file has no known type, so
-/// `--type` excludes it while the default (untyped) search still scans it.
-pub fn detect_type(name: &str, content: &[u8]) -> Option<TypeInfo> {
-    detect(name, content).map(|i| TypeInfo {
-        name: i.name(),
-        category: i.category(),
-    })
-}
-
-/// Whether `s` names a known format or category — for validating `--type`.
-pub fn is_known_type(s: &str) -> bool {
-    INSPECTORS
-        .iter()
-        .any(|i| i.name() == s || i.category() == s)
-}
-
-/// Every `--type` value the tool accepts (format names + categories), sorted and
-/// de-duplicated — for help text and error messages.
-pub fn type_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = INSPECTORS
-        .iter()
-        .flat_map(|i| [i.name(), i.category()])
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
 // ── Shared helpers (reused by several inspectors) ───────────────────────────
+
+/// The longest text shown in a one-line summary, in characters.
+pub(crate) const SHOWN_CHARS: usize = 120;
+
+/// `text` for a one-line summary: control characters (a newline in a message) as
+/// spaces, at most [`SHOWN_CHARS`] characters, then `…` when cut. The detail (JSON)
+/// keeps the exact text; this is for the summary only.
+pub(crate) fn one_line(text: &str) -> String {
+    let mut shown: String = text
+        .chars()
+        .take(SHOWN_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().nth(SHOWN_CHARS).is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// [`one_line`] in double quotes.
+pub(crate) fn quoted(text: &str) -> String {
+    format!("\"{}\"", one_line(text))
+}
+
+/// Bytes as [`quoted`] text (invalid UTF-8 replaced).
+pub(crate) fn quoted_bytes(bytes: &[u8]) -> String {
+    quoted(&String::from_utf8_lossy(bytes))
+}
+
+/// A LEB128 varint at `i` in `b`, at most `max` bytes long (5 for a 32-bit value, 10
+/// for 64-bit): its value and the position after it.
+pub(crate) fn leb128(b: &[u8], mut i: usize, max: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for k in 0..max.min(10) {
+        let byte = *b.get(i)?;
+        i += 1;
+        value |= u64::from(byte & 0x7F) << (7 * k);
+        if byte & 0x80 == 0 {
+            return Some((value, i));
+        }
+    }
+    None
+}
 
 /// 1-based line number of `offset` within `content` (newline count + 1).
 ///

@@ -30,7 +30,7 @@ pub(crate) use decrypt::DecryptCmdArgs;
 pub(crate) use diff::DiffArgs;
 pub(crate) use export::ExportArgs;
 pub(crate) use find::FindArgs;
-pub(crate) use grep::GrepArgs;
+pub(crate) use grep::{EncodingArg, GrepArgs};
 
 use clap::{Parser, Subcommand};
 

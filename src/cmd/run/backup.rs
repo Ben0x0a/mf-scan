@@ -140,10 +140,7 @@ fn run_rebuild(args: BackupRebuildArgs) -> Result<()> {
 
         let files: Vec<MatchedFile> = rebuild::files_to_rebuild(source)
             .into_iter()
-            .map(|e| MatchedFile {
-                entry: e.clone(),
-                offsets: Vec::new(),
-            })
+            .map(|e| MatchedFile::new(e.clone(), Vec::new()))
             .collect();
 
         let export_plan = export::plan_tree(&files, &plan.roots);

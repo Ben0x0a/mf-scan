@@ -65,10 +65,12 @@ pub struct RunInfo {
     pub types: Vec<String>,
     /// Media files were excluded (`--exclude-media` or `--fast`).
     pub exclude_media: bool,
-    /// Also searched for the pattern's base64 encoding (`--base64`).
-    pub base64: bool,
-    /// Used the URL-safe base64 alphabet (`--base64-urlsafe`).
-    pub base64_urlsafe: bool,
+    /// Every encoding searched besides plain UTF-8 (`--encoding`, `--utf16`,
+    /// `--all-encodings`): `nfd`, `utf16le`, `utf16be`, `cesu8`, `json`, `url`, `base64`,
+    /// `base64url`.
+    /// Absent from manifests written before it existed.
+    #[serde(default)]
+    pub encodings: Vec<String>,
     /// Keychain/keystore dump files supplied for decryption (`--keyfile`).
     pub keyfiles: Vec<String>,
     /// Platform scope for decryption profiles (`--platform`), if set.
@@ -123,8 +125,7 @@ impl Default for RunInfo {
             not_path_globs: Vec::new(),
             types: Vec::new(),
             exclude_media: false,
-            base64: false,
-            base64_urlsafe: false,
+            encodings: Vec::new(),
             keyfiles: Vec::new(),
             platform: None,
             app: None,
@@ -137,22 +138,45 @@ impl Default for RunInfo {
 
 /// How a match's bytes were encoded in the file.
 ///
-/// `Plain` is the pattern found verbatim; `Base64` is the pattern found inside a
-/// base64-encoded run (see [`crate::ops::search::base64`]). The distinction is carried
-/// through to the report so an analyst can tell an encoded hit from a literal one
-/// and see the decoded value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `Plain` is the pattern found verbatim (as typed: UTF-8); every other variant is the
+/// same literal in another encoding (see [`crate::ops::search::encodings`]): its other
+/// Unicode normal form (`Nfc`, `Nfd`), UTF-16, CESU-8, JSON escapes, percent-encoding
+/// (`Url`), or inside a base64 run. The distinction is carried through to the report
+/// so an analyst can tell an encoded hit from a literal one and see the decoded value.
+///
+/// The order of the variants is the order of precedence when two encodings match the
+/// same bytes: the match is reported once, under the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoding {
     Plain,
+    Nfc,
+    Nfd,
+    Utf16Le,
+    Utf16Be,
+    /// UTF-16 whose byte order the text cannot tell: the same characters read one
+    /// byte apart as little- and big-endian (Latin-range text among Latin-range
+    /// text), reported once.
+    Utf16,
+    Cesu8,
+    Json,
+    Url,
     Base64,
 }
 
 impl Encoding {
-    /// Lowercase tag used in txt/csv output (`"plain"`, `"base64"`).
+    /// Lowercase tag used in txt/csv/json output.
     pub fn as_str(self) -> &'static str {
         match self {
             Encoding::Plain => "plain",
+            Encoding::Nfc => "nfc",
+            Encoding::Nfd => "nfd",
+            Encoding::Utf16Le => "utf16le",
+            Encoding::Utf16Be => "utf16be",
+            Encoding::Utf16 => "utf16",
+            Encoding::Cesu8 => "cesu8",
+            Encoding::Json => "json",
+            Encoding::Url => "url",
             Encoding::Base64 => "base64",
         }
     }
@@ -318,6 +342,9 @@ pub struct ContentDiff {
 pub struct SearchHit {
     /// Byte offset of the match start within the entry's (uncompressed) data.
     pub offset: u64,
+    /// The match's length in bytes. Not `match_in_line.len()`: the preview is capped
+    /// and drops a trailing carriage return.
+    pub len: usize,
     /// Raw bytes of the line containing the match (trailing `\r`/`\n` removed).
     pub line: Vec<u8>,
     /// Byte range of the match within `line`, for highlighting.
@@ -372,10 +399,11 @@ pub struct MatchRecord {
     /// Format-specific context, present only when `--inspect` matched a format.
     pub inspection: Option<Inspection>,
     /// How the matched bytes were encoded (plain or base64). `Plain` for an
-    /// ordinary match; `Base64` when found via `--base64`.
+    /// ordinary match; another variant when found via `--encoding`.
     pub encoding: Encoding,
-    /// The decoded value, set only for base64 matches — it is the literal the
-    /// user searched for, shown so the report says what the encoded run contains.
+    /// The decoded value, set only for encoded (non-plain) matches: the matched bytes'
+    /// text, or for base64 the literal searched for (the run around the match was
+    /// checked to decode to it), so the report says what the encoded bytes contain.
     pub decoded: Option<String>,
     /// iOS app bundle ID (e.g. `com.apple.weather`) for matches inside a
     /// container directory — resolved from the container's
@@ -456,6 +484,7 @@ mod tests {
     fn hit() -> SearchHit {
         SearchHit {
             offset: 17,
+            len: 1,
             line: b"x".to_vec(),
             match_in_line: 0..1,
         }

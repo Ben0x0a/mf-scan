@@ -24,7 +24,7 @@ use serde_json::json;
 
 use crate::core::models::{ContentDiff, Inspection};
 use crate::formats::sqlite::{
-    Col, Db, TABLE_LEAF, Table, btree_header_offset, checkpoint, col_int, col_text,
+    Col, Db, TABLE_LEAF, Table, btree_header_offset, cell_record_prefix, checkpoint, col_int,
     for_each_leaf_cell, is_blob, pages_of, parse_cell, parse_column_spans, parse_header,
     read_schema, read_u16, serial_type_name,
 };
@@ -46,21 +46,50 @@ impl super::Inspector for Sqlite {
         content.starts_with(b"SQLite format 3\x00")
     }
     fn inspect(&self, content: &[u8], offset: usize) -> Option<Inspection> {
-        locate(content, offset)
+        self.inspect_many(content, &[offset]).pop().flatten()
     }
     /// Batch resolution: the schema and each table's page set are derived once
     /// per file instead of once per match — a message DB with thousands of
     /// matches would otherwise re-walk the schema b-trees for every one
-    /// (review finding P1).
+    /// (review finding P1). Likewise each BLOB holding matches is read (overflow
+    /// pages included) and described once, all its matches resolved together.
     fn inspect_many(&self, content: &[u8], offsets: &[usize]) -> Vec<Option<Inspection>> {
         let Some(db) = parse_header(content) else {
             return offsets.iter().map(|_| None).collect();
         };
         let schema = SchemaMap::build(content, &db);
-        offsets
-            .iter()
-            .map(|&o| locate_with(content, &db, &schema, o))
-            .collect()
+        let mut results = Vec::with_capacity(offsets.len());
+        // BLOB matches, grouped by their cell's position and the column's offset.
+        let mut blobs: BTreeMap<(usize, usize), BlobHits> = BTreeMap::new();
+        for (i, &offset) in offsets.iter().enumerate() {
+            let (found, blob) = locate_with(content, &db, &schema, offset);
+            if let Some(blob) = blob {
+                let rel = offset - blob.col.start;
+                blobs
+                    .entry((blob.cell_file, blob.col.start))
+                    .or_insert_with(|| (blob, Vec::new()))
+                    .1
+                    .push((i, rel));
+            }
+            results.push(found);
+        }
+        for (blob, hits) in blobs.into_values() {
+            let value = full_value(content, &db, &blob);
+            let rels: Vec<usize> = hits.iter().map(|&(_, rel)| rel).collect();
+            // A BLOB may itself be a recognised format (e.g. a bplist stored in a
+            // cell): classified by signature and, when an inspector claims it, the
+            // match resolved inside it too — the same registry, no SQLite-specific
+            // parsing. With no signature, it is tried as JSON then protobuf, as a
+            // hint only (`blob: protobuf (by structure)`): the examiner exports the
+            // database and decodes the value with its real schema.
+            let notes = super::describe_nested_many(&value, "blob", &rels);
+            for ((i, _), note) in hits.into_iter().zip(notes) {
+                if let (Some(note), Some(Some(found))) = (note, results.get_mut(i)) {
+                    note.apply(found);
+                }
+            }
+        }
+        results
     }
     fn sidecars(&self) -> &'static [&'static str] {
         // Uncommitted rows live in the WAL; export these so the DB opens complete.
@@ -175,32 +204,48 @@ impl SchemaMap {
     }
 }
 
-/// Resolve `offset` to a table cell, or fall back to page + offset-in-page.
-fn locate(content: &[u8], offset: usize) -> Option<Inspection> {
-    let db = parse_header(content)?;
-    let schema = SchemaMap::build(content, &db);
-    locate_with(content, &db, &schema, offset)
+/// A BLOB and its matches: (result index, offset in the BLOB) for each.
+type BlobHits = (BlobAt, Vec<(usize, usize)>);
+
+/// Where a BLOB value holding a match lies, for describing it after all matches are
+/// placed (see `inspect_many`).
+struct BlobAt {
+    cell_file: usize,
+    record_start: usize,
+    local_end: usize,
+    col: Col,
 }
 
-/// [`locate`] against pre-built per-file state (the batch path shares it).
-fn locate_with(content: &[u8], db: &Db, schema: &SchemaMap, offset: usize) -> Option<Inspection> {
+/// Resolve `offset` to a table cell, or fall back to page + offset-in-page; plus
+/// the BLOB it falls in, when it does.
+fn locate_with(
+    content: &[u8],
+    db: &Db,
+    schema: &SchemaMap,
+    offset: usize,
+) -> (Option<Inspection>, Option<BlobAt>) {
     if offset >= content.len() {
-        return None;
+        return (None, None);
     }
     let page = (offset / db.page_size + 1) as u32;
     let page_off = offset % db.page_size;
 
-    Some(
-        resolve(content, db, schema, offset, page, page_off).unwrap_or_else(|| Inspection {
-            format: "sqlite".into(),
-            summary: format!("page: {page}  offset: {page_off}  (not in a table cell)"),
-            detail: json!({ "page": page, "page_offset": page_off }),
-        }),
-    )
+    match resolve(content, db, schema, offset, page, page_off) {
+        Some((found, blob)) => (Some(found), blob),
+        None => (
+            Some(Inspection {
+                format: "sqlite".into(),
+                summary: format!("page: {page}  offset: {page_off}  (not in a table cell)"),
+                detail: json!({ "page": page, "page_offset": page_off }),
+            }),
+            None,
+        ),
+    }
 }
 
-/// Full resolution to table/rowid/column; `None` whenever the byte is not in a
-/// live table-leaf cell (the caller then emits the page+offset fallback).
+/// Full resolution to table/rowid/column, plus the BLOB holding the match (described
+/// later, once per BLOB); `None` whenever the byte is not in a live table-leaf cell
+/// (the caller then emits the page+offset fallback).
 fn resolve(
     content: &[u8],
     db: &Db,
@@ -208,7 +253,7 @@ fn resolve(
     offset: usize,
     page: u32,
     page_off: usize,
-) -> Option<Inspection> {
+) -> Option<(Inspection, Option<BlobAt>)> {
     let page_start = (page as usize - 1) * db.page_size;
     let header_off = btree_header_offset(page);
 
@@ -234,30 +279,54 @@ fn resolve(
 
         // Inside this cell: find the column whose value bytes cover the offset.
         for (idx, col) in cell.columns.iter().enumerate() {
-            if offset >= col.start && offset < col.start + col.len {
+            // Only the on-page part of a value: past `local_end` lie the overflow
+            // pointer and other cells, which are not this value.
+            if offset >= col.start && offset < (col.start + col.len).min(cell.local_end) {
                 let column = table
                     .columns
                     .get(idx)
                     .cloned()
                     .unwrap_or_else(|| format!("column{idx}"));
                 let ty = serial_type_name(col.serial);
-                let cell_value = render_cell(content, col);
+                let at = BlobAt {
+                    cell_file: page_start + cp,
+                    record_start: cell.record_start,
+                    local_end: cell.local_end,
+                    col: *col,
+                };
+                // What is shown: the value's start, from its page when that holds
+                // enough to display; its complete bytes (overflow pages included)
+                // only when the page holds too little, or for a schema's SQL, which
+                // is parsed whole. Never the bytes after the on-page part, which are
+                // the overflow pointer and other cells.
+                let schema_sql = table.name == "sqlite_schema" && column == "sql";
+                let on_page = content
+                    .get(col.start..(col.start + col.len).min(cell.local_end))
+                    .unwrap_or_default();
+                let shown: std::borrow::Cow<'_, [u8]> = if schema_sql
+                    || (on_page.len() < col.len
+                        && on_page.len() < SHOWN_BYTES
+                        && !is_blob(col.serial))
+                {
+                    full_value(content, db, &at)
+                } else {
+                    on_page.into()
+                };
+                let cell_value = render_cell(&shown, col.serial, col.len);
 
                 // When the match is in sqlite_schema.sql, check if it lands
                 // on a column name token in the CREATE TABLE definition.
-                let defines_column = if table.name == "sqlite_schema" && column == "sql" {
-                    col_text(content, Some(col)).and_then(|sql_text| {
-                        let rel = offset - col.start;
-                        parse_column_spans(&sql_text)
-                            .into_iter()
-                            .find(|(_, s, e)| rel >= *s && rel < *e)
-                            .map(|(name, _, _)| name)
-                    })
+                let defines_column = if schema_sql {
+                    let rel = offset - col.start;
+                    parse_column_spans(&String::from_utf8_lossy(&shown))
+                        .into_iter()
+                        .find(|(_, s, e)| rel >= *s && rel < *e)
+                        .map(|(name, _, _)| name)
                 } else {
                     None
                 };
 
-                let mut summary = match &defines_column {
+                let summary = match &defines_column {
                     Some(def_col) => format!(
                         "table: {}  column: {} [{}]  (defines column: {})  row: {}  cell: {}",
                         table.name, column, ty, def_col, cell.rowid, cell_value
@@ -267,7 +336,7 @@ fn resolve(
                         table.name, column, ty, cell.rowid, cell_value
                     ),
                 };
-                let mut detail = match &defines_column {
+                let detail = match &defines_column {
                     Some(def_col) => json!({
                         "page": page,
                         "table": table.name,
@@ -287,81 +356,101 @@ fn resolve(
                     }),
                 };
 
-                // A BLOB may itself be a recognised format (e.g. a bplist stored
-                // in a cell). Classify it by signature and, when an inspector
-                // claims it, resolve the match position inside the blob as well —
-                // reusing the same inspector registry, no SQLite-specific parsing.
-                if is_blob(col.serial)
-                    && let Some(blob) = content.get(col.start..col.start + col.len)
-                    && let Some(insp) = super::detect_by_header(blob)
-                {
-                    let nested = insp.inspect(blob, offset - col.start);
-                    let blob_format = nested
-                        .as_ref()
-                        .map_or_else(|| insp.name().to_string(), |n| n.format.clone());
-                    summary.push_str(&format!("  blob: {blob_format}"));
-                    if let Some(n) = &nested {
-                        summary.push_str(&format!("  {}", n.summary));
-                    }
-                    if let Some(obj) = detail.as_object_mut() {
-                        obj.insert("blob_format".into(), json!(blob_format));
-                        if let Some(n) = nested {
-                            obj.insert("blob_context".into(), n.detail);
-                        }
-                    }
-                }
-
-                return Some(Inspection {
+                let found = Inspection {
                     format: "sqlite".into(),
                     summary,
                     detail,
-                });
+                };
+                return Some((found, is_blob(col.serial).then_some(at)));
             }
         }
 
         // In the cell but in its varints/record header, not a value.
-        return Some(Inspection {
+        let found = Inspection {
             format: "sqlite".into(),
             summary: format!(
                 "table: {}  row: {}  (record metadata)",
                 table.name, cell.rowid
             ),
             detail: json!({ "page": page, "table": table.name, "rowid": cell.rowid }),
-        });
+        };
+        return Some((found, None));
     }
     None
 }
+
+/// The complete bytes of the value at `at`, overflow pages included: borrowed when it
+/// lies on its page, else read from the overflow chain only as far as its end.
+///
+/// WHY: a value too large for its leaf cell continues on overflow pages, so the bytes
+/// after its on-page part are not the value (they are the overflow pointer, then the
+/// next cell). A match is always in the on-page part, which is the value's start, so
+/// its position in the value is unchanged. When the overflow chain cannot be read
+/// (damaged or carved evidence), the on-page part alone is used, cut at `local_end`
+/// (before the overflow page pointer): a signature at its start still identifies it,
+/// and a structural parse fails, rather than reading a neighbouring cell as part of
+/// the value.
+fn full_value<'c>(content: &'c [u8], db: &Db, at: &BlobAt) -> std::borrow::Cow<'c, [u8]> {
+    let col = &at.col;
+    let end = col.start + col.len;
+    let on_page = content
+        .get(col.start..end.min(at.local_end))
+        .unwrap_or_default();
+    if end <= at.local_end {
+        return on_page.into();
+    }
+    let Some(in_record) = col.start.checked_sub(at.record_start) else {
+        return on_page.into();
+    };
+    cell_record_prefix(content, db, at.cell_file, in_record + col.len)
+        .and_then(|(_, record)| {
+            record
+                .get(in_record..in_record + col.len)
+                .map(<[u8]>::to_vec)
+        })
+        .map_or_else(|| on_page.into(), Into::into)
+}
+
+/// The most bytes of a text value decoded for display: enough for `render_cell`'s
+/// 80 characters at up to 4 bytes each.
+const SHOWN_BYTES: usize = 80 * 4;
 
 /// Render a column value as a short, text-safe string for display.
 ///
 /// Decodes by serial type (NULL / integer / real / text / blob). Text is
 /// length-capped and control characters are stripped, so a cell value never
 /// dumps raw or runaway bytes into the output.
-fn render_cell(content: &[u8], col: &Col) -> String {
-    const MAX: usize = 80;
-    match col.serial {
+fn render_cell(value: &[u8], serial: u64, len: usize) -> String {
+    const MAX: usize = SHOWN_BYTES / 4;
+    let col = Col {
+        serial,
+        start: 0,
+        len: value.len(),
+    };
+    match serial {
         0 => "NULL".into(),
         8 => "0".into(),
         9 => "1".into(),
-        1..=6 => col_int(content, Some(col)).map_or_else(String::new, |v| v.to_string()),
-        7 => content
-            .get(col.start..col.start + 8)
+        1..=6 => col_int(value, Some(&col)).map_or_else(String::new, |v| v.to_string()),
+        7 => value
+            .get(..8)
             .and_then(|b| <[u8; 8]>::try_from(b).ok())
             .map_or_else(String::new, |a| f64::from_be_bytes(a).to_string()),
         s if s >= 13 && s % 2 == 1 => {
-            let text = col_text(content, Some(col)).unwrap_or_default();
-            let mut out: String = text
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            if out.chars().count() > MAX {
-                out = out.chars().take(MAX).collect::<String>() + "…";
+            // Only the bytes that can be shown are decoded, not a long value whole.
+            let head = &value[..value.len().min(SHOWN_BYTES)];
+            let text = String::from_utf8_lossy(head);
+            let mut chars = text.chars().map(|c| if c.is_control() { ' ' } else { c });
+            let mut out: String = chars.by_ref().take(MAX).collect();
+            if chars.next().is_some() || len > head.len() {
+                out.push('…');
             }
             out
         }
-        _ => format!("<blob {} bytes>", col.len), // even serial >= 12
+        _ => format!("<blob {len} bytes>"), // even serial >= 12
     }
 }
+
 /// Resolve matches inside a database's `-wal` file to a table, column and row.
 ///
 /// HOW: a WAL is a 32-byte header, then frames of a 24-byte header (whose first four
@@ -390,7 +479,9 @@ pub(crate) fn inspect_wal(main: &[u8], wal: &[u8], offsets: &[usize]) -> Vec<Opt
         return out;
     }
     let frame_len = FRAME_HEADER + page_size;
-    let replayed = checkpoint(main, wal).unwrap_or_else(|| main.to_vec());
+    // One working copy: each frame's page is swapped in, its matches resolved, and
+    // the page swapped back out — never a copy of the whole database per frame.
+    let mut image = checkpoint(main, wal).unwrap_or_else(|| main.to_vec());
 
     // Group the matches by frame, so each frame's image is built once.
     let mut by_frame: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -416,22 +507,19 @@ pub(crate) fn inspect_wal(main: &[u8], wal: &[u8], offsets: &[usize]) -> Vec<Opt
             continue;
         }
         let page_start = (page_no - 1) * page_size;
-        let mut overlaid;
-        let image: &[u8] = if replayed.get(page_start..page_start + page_size) == Some(page) {
-            &replayed
-        } else {
-            overlaid = replayed.clone();
-            if overlaid.len() < page_start + page_size {
-                overlaid.resize(page_start + page_size, 0);
-            }
-            overlaid[page_start..page_start + page_size].copy_from_slice(page);
-            &overlaid
-        };
+        let replayed_len = image.len();
+        if image.len() < page_start + page_size {
+            image.resize(page_start + page_size, 0);
+        }
+        let saved = image[page_start..page_start + page_size].to_vec();
+        image[page_start..page_start + page_size].copy_from_slice(page);
         let mapped: Vec<usize> = indices
             .iter()
             .map(|&i| page_start + offsets[i] - start - FRAME_HEADER)
             .collect();
-        let results = <Sqlite as super::Inspector>::inspect_many(&Sqlite, image, &mapped);
+        let results = <Sqlite as super::Inspector>::inspect_many(&Sqlite, &image, &mapped);
+        image[page_start..page_start + page_size].copy_from_slice(&saved);
+        image.truncate(replayed_len);
         for (&i, result) in indices.iter().zip(results) {
             out[i] = result.map(|mut inspection| {
                 inspection.summary = format!(
