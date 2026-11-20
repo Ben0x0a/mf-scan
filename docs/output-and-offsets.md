@@ -152,11 +152,17 @@ app.json:1
 
 ## Inspection `context` by format
 
+A text value in a context (an XML attribute or node, a protobuf string, a LevelDB key
+or value) longer than 4,096 characters is given as `{ "text": its first 4,096,
+"truncated": true }`: each match is one record, and a large value matched many times
+would otherwise be written whole each time. keva gives no `value` past 4 KiB, and
+`offset_in_value` places the match.
+
 | `format` | `context` (json) | summary (txt tag / csv) |
 |---|---|---|
 | `txt`    | `{ "line": N, "col": N }` | `line: N  col: N` |
 | `json`   | `{ "path": "$.a.b[2]", "line": N }` | `key: $.a.b[2]  line: N` |
-| `xml`    | `{ "path": "/a/b/c", "line": N }` | `path: /a/b/c  line: N` |
+| `xml`    | `{ "path": "/map[1]/string[4]", "attribute": "name", "value": "…", "line": N }`; text: `"node": "text()"` (or `cdata()`, `comment()`, …) and its `"value"`; in a tag elsewhere: `path` and `line` only | `path: /map[1]/string[4]/@name  value: "…"  line: N` |
 | `csv`    | `{ "row": N, "col": N, "header": "..." }` | `row: N  col: N  header: H` |
 | `plist`  | `{ "path": "$.Account.Servers[1]", "line": N }` | `key: $.Account.Servers[1]  line: N` |
 | `bplist` | `{ "path": "...", "object": N }` | `key: $.Account.Servers[1]` |
@@ -166,9 +172,11 @@ app.json:1
 | `sqlite` (BLOB cell, by structure) | the above **plus** `"blob_detection": "structure"` (JSON or protobuf: no signature, so a lead, not a certainty) | `… blob: protobuf (by structure)  field: 4.4.2.1  [len]  string: "…"` |
 | `protobuf` | `{ "path": "4.4.2.1", "wire_type": "len", "kind": "string", "value": "…", "offset_in_value": N }`, plus `"ambiguous": [{ "path": "4.4.2", "read_as": "message" }, …]` when a value on the path also reads the other way | `field: 4.4.2.1  [len]  string: "…"` |
 | `leveldb` (log entry) | `{ "record": N, "sequence": N, "operation": "put", "part": "key", "key": "…", "value": "…" }`; manifest: `{ "record": N, "field": "comparator", … }` | `record 4  sequence 8  put  key: "…"  value: "…"  (in the key)` |
+| `leveldb` (table entry) | `{ "block": "data", "block_number": N, "compression": "snappy", "entry": N, "part": "value", "sequence": N, "operation": "put", "key": "…", "value": "…" }`; index: `"block": "index"`, `"data_block": N`; elsewhere `"part"`: `trailer`, `restarts`, `filter`, `compressed` (a Snappy tag or copy), `contents` (not decoded), `unlocated` (in no block located; `"index_decoded": false` when the index did not decode) | `data block 3  sequence 41  put  key: "…"  value: "…"  (in the value)` |
 | `uuidtext` | `{ "entry": N, "string_offset": N, "format_string": "…", "binary": "/…" }` | `format string: "…"  (binary: /…)` |
 | `typedstream` | `{ "objects": ["NSMutableAttributedString", "NSMutableString"], "kind": "string", "value": "…", "offset_in_value": N }` | `object: NSMutableAttributedString / NSMutableString  string: "…"` |
 | `mmkv` (by structure) | `{ "key": "…", "part": "value", "reading": "string" (the store records no type: a reading of the bytes; `0 (or "")` for a single 0 byte), "value": "…", "entry": N, "entries": N, "superseded_by": N, "detection": "structure" }` | `key: "…"  value: "…"  (entry 3 of 133)  (by structure)` |
+| `keva` (single value) | `{ "file": "keva-sgv", "key_from": "file name", "type": "string", "part": "value", "offset_in_value": N, "value": "…" }` (`value` up to 4 KiB); array: `"type": "string array", "element": N, "elements": N` (`"elements_decoded": false` when they do not parse); a file cut short: `"truncated": true, "declared_length": N`; other keva files: `{ "file": "keva-blk", "decoded": false }` | `single value (key: the file name)  string array: element 3 of 309  value: "…"` |
 | `abx` | `{ "path": "/packages[1]/package[37]", "attribute": "name", "type": "string", "value": "\"com.x\"" }`; text: `"node": "text()"` | `path: /packages[1]/package[37]/@name  value: "com.x"` |
 | `realm` (a value) | `{ "file_format": 24, "table": "class_Person", "class": "Person", "property": "name", "type": "string", "object": N, "offset_in_value": N }`; elsewhere `"part"`: `schema`, `class names`, `object keys`, `free`, … | `class: Person  property: name [string]  object: 0  value: "Alice"` (`object: unknown`, `null` in JSON, when the key could not be read) |
 | `segb` (in an entry) | `{ "version": 2, "entry": N, "states": ["written"], "times": ["…Z"], "crc_ok": true, "data_offset": N, "data_format": "protobuf", "data_detection": "structure", "data_context": { … } }` (v1 adds `time2`) | `SEGB v2  entry N: written …Z  crc ok  data: protobuf (by structure)  field: 5  [len]  string: "…"` |

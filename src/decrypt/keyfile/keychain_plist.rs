@@ -1,7 +1,7 @@
 //! Keychain-plist provider: a property-list keychain dump (XML *or* binary) →
 //! normalised secrets.
 //!
-//! Defines: [`KeychainPlist`], a [`KeyfileProvider`](super::KeyfileProvider)
+//! Defines: [`KeychainPlist`], a [`KeyfileProvider`]
 //! that reads a keychain dump in either plist encoding and maps each item to a
 //! [`Secret`].
 //! Used by: `decrypt::keyfile` (registered in its `PROVIDERS` list).
@@ -27,7 +27,7 @@
 //! Not (yet) covered: a Cellebrite/GrayKey export whose schema differs from the
 //! standard SecItem attributes (e.g. different field names, or a non-plist report
 //! format). That needs a real sample to implement correctly rather than guess; a
-//! new [`KeyfileProvider`](super::KeyfileProvider) can be added for it.
+//! new [`KeyfileProvider`] can be added for it.
 
 use std::io::Cursor;
 

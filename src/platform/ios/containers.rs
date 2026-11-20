@@ -12,8 +12,9 @@
 //!
 //! Used by: `run::grep` (post-search annotation pass) and `ops::apps::ios_ffs`
 //! (inverts the mapping into the app catalogue).
-//! Uses: `crate::core::source::Source`, `plist` crate (binary/XML plist parsing,
-//! already present in the dependency tree).
+//! Uses: `crate::core::source::Source`, `crate::core::layout::PrefixIndex` (the
+//! longest-prefix rule), `plist` crate (binary/XML plist parsing, already present in
+//! the dependency tree).
 //!
 //! WHY longest-prefix matching: a match deep inside a container sub-directory
 //! must still resolve to the correct container. WHY segment-boundary check:
@@ -21,9 +22,9 @@
 //! `containers/Bundle/Application/Apple/` — a naive string-prefix match would
 //! do exactly that if the shorter key is a byte-level prefix of the longer path.
 
-use std::collections::HashMap;
 use std::io::Cursor;
 
+use crate::core::layout::PrefixIndex;
 use crate::core::source::Source;
 
 /// The exact filename that iOS's container manager places in every container
@@ -59,13 +60,12 @@ pub struct ContainerMeta {
 
 /// A map of container-directory path (in-source) → that container's metadata.
 ///
-/// Built once per source by scanning for container-metadata plists; used for
-/// O(k * log n) resolution (k = depth of match path, n = number of containers)
-/// by walking the match's path components from longest to shortest.
+/// Built once per source by scanning for container-metadata plists; a path resolves
+/// in as many lookups as it has folders ([`PrefixIndex`]).
 pub struct AppContainerMap {
     /// Keys are container-directory paths exactly as they appear in the source
     /// entries, WITHOUT a trailing `/`. Values are what the metadata plist said.
-    map: HashMap<String, ContainerMeta>,
+    map: PrefixIndex<ContainerMeta>,
 }
 
 impl AppContainerMap {
@@ -100,7 +100,7 @@ impl AppContainerMap {
     /// have partial or corrupt metadata files, and missing one annotation is far
     /// better than aborting the scan.
     pub fn build(source: &dyn Source) -> Self {
-        let mut map = HashMap::new();
+        let mut map = Vec::new();
 
         for entry in source.entries() {
             // WHY basename check: only the exact metadata file triggers
@@ -124,10 +124,12 @@ impl AppContainerMap {
                 None => continue,
             };
 
-            map.insert(container_dir.to_string(), meta);
+            map.push((container_dir.to_string(), meta));
         }
 
-        Self { map }
+        Self {
+            map: map.into_iter().collect(),
+        }
     }
 
     /// True when no iOS container metadata was found in the source.
@@ -148,7 +150,7 @@ impl AppContainerMap {
     /// struct the single source of truth for the container→identifier mapping; the
     /// caller groups them however it needs.
     pub fn containers(&self) -> impl Iterator<Item = (&str, &ContainerMeta)> {
-        self.map.iter().map(|(dir, meta)| (dir.as_str(), meta))
+        self.map.iter()
     }
 
     /// Return the bundle ID for the innermost container whose directory path is
@@ -163,47 +165,10 @@ impl AppContainerMap {
     /// `containers/Bundle/Application/AppleX/data.db` — every candidate key
     /// must be followed by a `/` in the target path (or be the full path).
     pub fn resolve(&self, path: &str) -> Option<&str> {
-        // WHY linear scan with longest-wins: the map is small (one entry per
-        // installed app, typically tens to low hundreds), so a linear scan with
-        // max tracking is simpler and fast enough compared to a trie.
-        let mut best: Option<(&str, &str)> = None; // (container_dir, bundle_id)
-
-        for (container_dir, meta) in &self.map {
-            let bundle_id = meta.identifier.as_str();
-            // The match path must be a descendant of the container directory.
-            // Check: path starts with `<container_dir>/` (file inside), OR
-            // path == container_dir (path IS the container dir itself, though
-            // that should not happen for a content hit).
-            if !is_path_prefix(container_dir, path) {
-                continue;
-            }
-            // Keep the longest prefix (most specific container).
-            if best.is_none_or(|(prev, _)| container_dir.len() > prev.len()) {
-                best = Some((container_dir, bundle_id));
-            }
-        }
-
-        best.map(|(_, id)| id)
+        self.map
+            .longest(path)
+            .map(|(meta, _)| meta.identifier.as_str())
     }
-}
-
-/// True when `prefix` is a `/`-segment-boundary prefix of `path`.
-///
-/// Accepted cases:
-///   - `path == prefix` (exact match, e.g. the container dir itself)
-///   - `path` starts with `prefix/` (a file inside the container)
-///
-/// Rejected: `prefix = "…/Apple"`, `path = "…/AppleX/file"` — the character
-/// following the prefix in path must be `/` or nothing.
-fn is_path_prefix(prefix: &str, path: &str) -> bool {
-    if path == prefix {
-        return true;
-    }
-    // WHY: strip_prefix only returns Some when the exact byte sequence matches;
-    // then we require the next byte to be `/` to enforce segment boundaries.
-    path.strip_prefix(prefix)
-        .map(|rest| rest.starts_with('/'))
-        .unwrap_or(false)
 }
 
 /// Read the entry's bytes from `source`, parse as a plist, and return what the
@@ -320,30 +285,13 @@ mod tests {
     /// `run::grep` is unchanged by the metadata restructure.
     #[test]
     fn resolve_still_returns_the_identifier() {
-        let map = AppContainerMap {
-            map: HashMap::from([(
-                "a/b".to_string(),
-                ContainerMeta {
-                    identifier: "com.example.app".to_string(),
-                    parent_id: None,
-                },
-            )]),
-        };
+        let map = AppContainerMap::from_pairs(&[
+            ("a/b", "com.example.app"),
+            ("a/b/c", "com.example.app.Widget"),
+        ]);
         assert_eq!(map.resolve("a/b/Documents/x.db"), Some("com.example.app"));
+        assert_eq!(map.resolve("a/b/c/x.db"), Some("com.example.app.Widget"));
         assert_eq!(map.resolve("a/bc/x.db"), None);
-    }
-
-    #[test]
-    fn is_path_prefix_segment_boundary() {
-        // Exact match accepted.
-        assert!(is_path_prefix("a/b", "a/b"));
-        // File inside accepted.
-        assert!(is_path_prefix("a/b", "a/b/file.txt"));
-        // A longer path that merely starts with the same bytes is rejected.
-        assert!(!is_path_prefix("a/b", "a/bc/file.txt"));
-        // Prefix that is the entire path minus a non-/ suffix is rejected.
-        assert!(!is_path_prefix("Apple", "AppleX/file.txt"));
-        // Empty prefix never matches (there is no leading `/`).
-        assert!(!is_path_prefix("", "a/b"));
+        assert_eq!(map.resolve("Apple/x"), None);
     }
 }

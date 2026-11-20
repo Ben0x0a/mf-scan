@@ -23,7 +23,7 @@ use crate::ops::decrypting::SourceDecryptor;
 use super::{MatchOn, MatchedFile, Query};
 
 /// How one entry was classified during the search pass — the per-entry input to
-/// the [`ScanStats`] fold. Kept private: it exists only to carry a skip reason
+/// the [`ScanStats`](crate::core::stats::ScanStats) fold. Kept private: it exists only to carry a skip reason
 /// (and the bytes/type it represents) out of the parallel map and into the
 /// sequential tally, so the statistics can attribute every skip to its rule.
 pub(super) enum Class {

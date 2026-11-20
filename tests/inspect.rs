@@ -75,12 +75,13 @@ fn json_pathological_nesting_does_not_overflow_the_stack() {
 #[test]
 fn xml_resolves_element_path() {
     // Non-plist XML, so it is handled by the generic XML inspector (element
-    // path) rather than the plist inspector (key path).
+    // path and node) rather than the plist inspector (key path).
     let content =
         br#"<?xml version="1.0"?><config><section><value>TARGET</value></section></config>"#;
     let insp = inspect("d.xml", content, at(content, "TARGET")).unwrap();
     assert_eq!(insp.format, "xml");
-    assert_eq!(insp.detail["path"], "/config/section/value");
+    assert_eq!(insp.detail["path"], "/config[1]/section[1]/value[1]");
+    assert_eq!(insp.detail["node"], "text()");
 }
 
 #[test]
@@ -109,5 +110,5 @@ fn detection_prefers_header_over_extension() {
     let content = br#"<?xml version="1.0"?><root><item>TARGET</item></root>"#;
     let insp = inspect("evidence.txt", content, at(content, "TARGET")).unwrap();
     assert_eq!(insp.format, "xml"); // header wins over the .txt extension
-    assert_eq!(insp.detail["path"], "/root/item");
+    assert_eq!(insp.detail["path"], "/root[1]/item[1]");
 }

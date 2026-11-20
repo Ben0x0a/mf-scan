@@ -137,10 +137,10 @@ pub fn entry_names(entries: &[Entry]) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::layout::tree_dir;
+    use crate::core::layout::{output_roots, tree_dir};
 
     fn device_path(name: &str, names: &[&str]) -> String {
-        let roots = roots(names.iter().copied());
+        let roots = output_roots(&roots(names.iter().copied()));
         tree_dir(name, &roots).unwrap_or_else(|| panic!("{name} has no root"))
     }
 

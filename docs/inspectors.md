@@ -50,7 +50,8 @@ log whose first record does not fit in the first 4 KiB is not named.
 
 | Format | Signature |
 |---|---|
-| `leveldb` (own inspector: logs and manifests resolve) | `MANIFEST-*`, `.log`: no magic, the first log record's masked CRC-32C matches its bytes; `.ldb`/`.sst` tables: the footer magic `57 FB 80 8B 24 75 47 DB` as the last 8 bytes |
+| `leveldb` (own inspector: logs, manifests and tables resolve) | `MANIFEST-*`, `.log`: no magic, the first log record's masked CRC-32C matches its bytes; `.ldb`/`.sst` tables: the footer magic `57 FB 80 8B 24 75 47 DB` as the last 8 bytes |
+| `keva` (own inspector: single values resolve) | `keva-` + `blk`, `chk`, `gxi`, `lxi`, `mmb` or `sgv` at 0, version 1 at 8 |
 | `lmdb` | meta flag `0x08` at 10, `DE C0 EF BE` + version 1 at 16 |
 | `sqlite-wal` | `37 7F 06 82`/`83` + version 3007000 |
 | `sqlite-shm` | version 3007000 (`18 E2 2D 00`) at 0 and at 48 (the header's two copies) |
@@ -96,9 +97,16 @@ parsed tree but no byte spans, so this is hand-rolled; it locates, it does not
 validate.)
 
 ### XML
-Uses quick-xml's event byte positions to track open elements and reports the
-**element path**, e.g. `/plist/dict/string`. Attribute-level resolution is a
-future refinement.
+Reports the **element path** with sibling indices, as for ABX, e.g.
+`/map[1]/string[4]`, then the **attribute** (`/@name  value: "…"`, a match in its
+name or value) or the **node** (`text()`, `cdata()`, `comment()`,
+`processing-instruction()`, `doctype()`) and its text, and the line. Text and the
+entity references in it (`a &amp; b`) are one node, shown resolved. Positions come
+from quick-xml reading the file in place, so an attribute's range is exact. All the
+matches of a file are placed in one pass that stops after the last one, keeping only
+the open elements, so a match near the top of a large file costs the bytes before it.
+Checked on the shared preferences of two Android phones: the 9,994 matches in text XML each
+resolve to the element they did before, now with its attribute or node.
 
 ### CSV
 A quote-aware scan (RFC 4180: `"`-quoted fields, `""` escapes) reports the 1-based
@@ -225,8 +233,26 @@ number**, **put** or **delete**, and the **key** and **value**; in a manifest
 (`MANIFEST-*`), to the version edit field (comparator, new file with its key range,
 compact pointer, …). Records split across 32 KiB blocks are reassembled. A record is
 read only when its CRC verifies, as LevelDB's reader requires: bytes left from an
-earlier use of the file are not shown as records. Tables (`.ldb`) are identified.
-Checked on the 1,029 logs and manifests of two Android devices.
+earlier use of the file are not shown as records. Checked on the 1,029 logs and
+manifests of two Android devices.
+
+### LevelDB tables
+A match in a table (`*.ldb`, `*.sst`) resolves to its **data block**, the entry's
+**sequence number**, **put** or **delete**, and the **key** and **value**; in the
+index, to the separator key and the data block it leads to; the filter block (a Bloom
+filter), the footer and each block's trailer are named. A block is decoded only when
+its CRC verifies and it parses exactly. Snappy-compressed blocks (most of Chrome's)
+are decompressed, and a match in one of their literal runs maps to its entry. A
+block that fails its CRC or does not parse is named, not decoded. When the index
+block itself does not decode, the data blocks cannot be located (a block does not
+hold its own size; only the index does): a match in one is named as in the data
+blocks, not located.
+
+What this cannot do: grep searches the bytes as stored, and a compressed block stores
+text that repeats earlier bytes as a reference to them, not as text. A string so
+stored is not found at all; the inspector only places what grep found. Checked on
+the 510 tables of four phones: every block's CRC verifies and every block decodes
+(2,504 data blocks, 2,096 of them Snappy; 168,420 entries).
 
 ### uuidtext (unified logs)
 A match in a `uuidtext` file resolves to the **format string** holding it, its
@@ -241,6 +267,21 @@ BLOB to the **objects** holding the string (`NSMutableAttributedString /
 NSMutableString`) and the **text**. Little-endian streams (`\x04\x0bstreamtyped`)
 only; reading stops at an array, struct or pointer type, which iMessage text does
 not use. Checked on the `sms.db` of three iPhones.
+
+### keva (ByteDance)
+ByteDance's key-value store (TikTok, Lemon8) has no published format. Each store
+(`files/keva/repo/<name>/`) has a `.blk` and a `.chk` and may have `.lxi`, `.mmb` and
+`.sgv` files; every file starts with `keva-` and its kind. A match in a single-value
+file (`.sgv`, where the large JSON settings and feeds are) resolves to the value: a
+string, or the element of a string array and its number. A file shorter than its
+declared length (cut short, or carved) shows what it holds and says it is truncated;
+an array whose elements do not parse shows its bytes as stored. The key is the file's name
+(222 of 248 names on the test phone are a key of their store; the 26 others are in
+no key record of it). A match in any other keva file is named, not decoded: the
+`.blk` holds the keys and string values and the `.chk` the typed entries pointing at
+them, but how an entry's index maps to its block is not worked out for every store,
+and a value shown under the wrong key would mislead. Worked out from the 3,816 keva
+files of one Android phone (TikTok and Lemon8).
 
 ### MMKV
 Tencent's key-value store (Discord, WeChat, many React Native apps). No signature,
@@ -363,8 +404,6 @@ sidecars is one line in its inspector — `report/export/` needs no change.
 
 ## Coming in a future version
 
-- **LevelDB tables** (`.ldb`): identified today; their uncompressed blocks hold
-  readable keys and values (Chrome Local Storage), which could resolve like logs.
 - **Unified logs** (`.tracev3`): identified today; decoding needs LZ4, the format
   strings from `uuidtext` and the shared cache.
 - **UTF-16 search**: a literal's UTF-16 forms, as bplists store non-ASCII text.

@@ -71,11 +71,40 @@ pub struct AppScope {
 /// the MobileContainerManager signing records that go with it.
 pub struct AppCatalog {
     pub platform: Platform,
-    pub containers: Vec<AppContainer>,
+    /// Every container, sorted by prefix (then id). Not public: `normal` is
+    /// computed from it and must stay in step.
+    ///
+    /// WHY sorted: the iOS container map is a hash map, so its order changed from run
+    /// to run, and so did every listing made from it; an output that cannot be
+    /// reproduced cannot be compared with an earlier one.
+    pub(super) containers: Vec<AppContainer>,
     /// MCM's code-signing/entitlement records, read once per source. Empty for
     /// every platform but iOS FFS, and for an FFS that did not capture the
     /// database — in which case group attribution falls back to the heuristic.
     pub(super) references: McmReferences,
+    /// Each container's [`NormalIds`], by its index in `containers`.
+    normal: Vec<NormalIds>,
+    /// Each normal id → the ids in this source that have it: those of the
+    /// containers but App Groups, and of the entitlement records.
+    ids_by_normal: BTreeMap<String, Vec<String>>,
+}
+
+/// A container's id and its declared parent's, as [`normal_id`]s.
+///
+/// WHY computed once, when the catalogue is built: every lookup of an app compares
+/// them with every container's, and `app list` looks up every app.
+pub(super) struct NormalIds {
+    id: String,
+    parent: Option<String>,
+}
+
+impl NormalIds {
+    fn of(c: &AppContainer) -> Self {
+        Self {
+            id: normal_id(&c.id),
+            parent: c.parent_id.as_deref().map(normal_id),
+        }
+    }
 }
 
 impl AppCatalog {
@@ -106,11 +135,48 @@ impl AppCatalog {
             Platform::IosFfs => McmReferences::build(source),
             _ => McmReferences::empty(),
         };
+        Self::new(platform, containers, references)
+    }
+
+    /// A catalogue of `containers`, sorted, their normal ids computed.
+    pub(super) fn new(
+        platform: Platform,
+        mut containers: Vec<AppContainer>,
+        references: McmReferences,
+    ) -> Self {
+        containers.sort_by(|a, b| a.prefix.cmp(&b.prefix).then_with(|| a.id.cmp(&b.id)));
+        let normal = containers.iter().map(NormalIds::of).collect();
+        let mut ids_by_normal: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let ids = containers
+            .iter()
+            .filter(|c| c.kind != ContainerKind::AppGroup)
+            .map(|c| c.id.as_str())
+            .chain(references.ids());
+        for id in ids {
+            ids_by_normal
+                .entry(normal_id(id))
+                .or_default()
+                .push(id.to_string());
+        }
         Self {
             platform,
             containers,
             references,
+            normal,
+            ids_by_normal,
         }
+    }
+
+    /// The containers that are app `id`'s own data, an extension/widget of it, or
+    /// its bundle ([`is_app_or_extension`]); `id` stands for every id
+    /// [`matching_ids`](Self::matching_ids) gives.
+    pub(super) fn own_containers(&self, id: &str) -> impl Iterator<Item = &AppContainer> {
+        let wanted = normal_id(id);
+        self.containers
+            .iter()
+            .zip(&self.normal)
+            .filter(move |(c, normal)| is_app_or_extension(c, normal, &wanted))
+            .map(|(c, _)| c)
     }
 
     /// True when a `references.sqlite3-wal` sidecar was replayed into the MCM
@@ -149,11 +215,11 @@ impl AppCatalog {
         let mut by_storage: BTreeMap<(String, &str), u64> = BTreeMap::new();
         // Normal id → the id shown, whether it is a data container's, and the size.
         let mut rows: BTreeMap<String, (&str, bool, Option<u64>)> = BTreeMap::new();
-        for c in &self.containers {
+        for (c, normal) in self.containers.iter().zip(&self.normal) {
             if matches!(c.kind, ContainerKind::AppGroup | ContainerKind::Extension) {
                 continue;
             }
-            let key = normal_id(&c.id);
+            let key = normal.id.clone();
             let primary = c.kind.is_primary();
             let row = rows
                 .entry(key.clone())
@@ -203,19 +269,14 @@ impl AppCatalog {
     /// `app paths` / `app export`: every container the app `id` or its dependencies
     /// can write — the app's own data (`id`), its extensions/widgets (`id.*`), the
     /// app bundle, and, when `with_groups`, its App Groups (each tagged with how it
-    /// was attributed). Returned in a stable, grouped order.
+    /// was attributed). The app's own containers first, then its groups, each by prefix.
     ///
     /// `id` stands for every id [`matching_ids`](Self::matching_ids) gives.
     pub fn containers_for(&self, id: &str, with_groups: bool) -> Vec<AppContainer> {
         let ids = self.matching_ids(id);
-        let mut out: Vec<AppContainer> = self
-            .containers
-            .iter()
-            // One pass: every matching id has the same normal form, which the test
-            // compares.
-            .filter(|c| is_app_or_extension(c, id))
-            .cloned()
-            .collect();
+        // One pass: every matching id has the same normal form, which the test
+        // compares.
+        let mut out: Vec<AppContainer> = self.own_containers(id).cloned().collect();
 
         if with_groups {
             let links = self.resolve_group_links(&ids);
@@ -282,15 +343,12 @@ impl AppCatalog {
     /// operator asking for that app. Matched exactly, both found only the groups a
     /// name guess attached, which reads as "this app has almost no data".
     pub fn matching_ids(&self, id: &str) -> Vec<String> {
-        let wanted = normal_id(id);
         let mut ids: Vec<String> = self
-            .containers
-            .iter()
-            .filter(|c| c.kind != ContainerKind::AppGroup)
-            .map(|c| c.id.as_str())
-            .chain(self.references.ids())
-            .filter(|candidate| normal_id(candidate) == wanted)
-            .map(str::to_string)
+            .ids_by_normal
+            .get(&normal_id(id))
+            .into_iter()
+            .flatten()
+            .cloned()
             .chain(std::iter::once(id.to_string()))
             .collect();
         ids.sort();
@@ -309,10 +367,12 @@ impl AppCatalog {
 
     /// The `Bundle/Application` container prefix for an app id, if present.
     fn bundle_prefix(&self, id: &str) -> Option<&str> {
+        let wanted = normal_id(id);
         self.containers
             .iter()
-            .find(|c| c.kind == ContainerKind::Bundle && normal_id(&c.id) == normal_id(id))
-            .map(|c| c.prefix.as_str())
+            .zip(&self.normal)
+            .find(|(c, normal)| c.kind == ContainerKind::Bundle && normal.id == wanted)
+            .map(|(c, _)| c.prefix.as_str())
     }
 }
 
@@ -362,14 +422,19 @@ pub(super) fn normal_id(id: &str) -> String {
 ///
 /// Ids compare as [`normal_id`]s: across case and an Apple team-id prefix, so an
 /// app recorded as `5Q4J53EFRC.com.sbb.ch` keeps a widget named `com.sbb.ch.Widget`.
-pub(super) fn is_app_or_extension(c: &AppContainer, id: &str) -> bool {
-    let id = normal_id(id);
-    let own = normal_id(&c.id);
+/// `normal` is `c`'s, `id` already normal.
+fn is_app_or_extension(c: &AppContainer, normal: &NormalIds, id: &str) -> bool {
+    let own = normal.id.as_str();
     match c.kind {
         ContainerKind::AppData | ContainerKind::Bundle => own == id,
-        ContainerKind::Extension => match &c.parent_id {
-            Some(parent) => normal_id(parent) == id,
-            None => own == id || own.starts_with(&format!("{id}.")),
+        ContainerKind::Extension => match &normal.parent {
+            Some(parent) => parent == id,
+            None => {
+                own == id
+                    || own
+                        .strip_prefix(id)
+                        .is_some_and(|rest| rest.starts_with('.'))
+            }
         },
         ContainerKind::AndroidData
         | ContainerKind::AndroidUserDe
@@ -383,6 +448,11 @@ pub(super) fn is_app_or_extension(c: &AppContainer, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_app_or_extension`] for an id as typed.
+    fn owns(c: &AppContainer, id: &str) -> bool {
+        is_app_or_extension(c, &NormalIds::of(c), &normal_id(id))
+    }
 
     fn container(id: &str, kind: ContainerKind) -> AppContainer {
         AppContainer {
@@ -414,14 +484,14 @@ mod tests {
         assert_eq!(normal_id("abcdefghij.com.x"), "abcdefghij.com.x");
         assert_eq!(normal_id("5Q4J53EFRC.app"), "5q4j53efrc.app");
 
-        let catalog = AppCatalog {
-            platform: Platform::IosFfs,
-            containers: vec![
+        let catalog = AppCatalog::new(
+            Platform::IosFfs,
+            vec![
                 container("5Q4J53EFRC.com.sbb.ch", ContainerKind::AppData),
                 container("net.whatsapp.WhatsApp", ContainerKind::AppData),
             ],
-            references: McmReferences::empty(),
-        };
+            McmReferences::empty(),
+        );
         assert_eq!(
             catalog.matching_ids("com.sbb.ch"),
             ["5Q4J53EFRC.com.sbb.ch", "com.sbb.ch"]
@@ -434,8 +504,8 @@ mod tests {
         assert_eq!(catalog.containers_for("com.sbb.ch", false).len(), 1);
         // A widget named after the plain id belongs to the team-prefixed app.
         let widget = container("com.sbb.ch.Widget", ContainerKind::Extension);
-        assert!(is_app_or_extension(&widget, "5Q4J53EFRC.com.sbb.ch"));
-        assert!(is_app_or_extension(&widget, "com.sbb.ch"));
+        assert!(owns(&widget, "5Q4J53EFRC.com.sbb.ch"));
+        assert!(owns(&widget, "com.sbb.ch"));
     }
 
     #[test]
@@ -443,9 +513,9 @@ mod tests {
         let app = container("com.x.App", ContainerKind::AppData);
         let ext = container("com.x.App.Widget", ContainerKind::Extension);
         let other = container("com.x.AppHelper", ContainerKind::AppData);
-        assert!(is_app_or_extension(&app, "com.x.App"));
-        assert!(is_app_or_extension(&ext, "com.x.App")); // child extension included
-        assert!(!is_app_or_extension(&other, "com.x.App")); // sibling app excluded
+        assert!(owns(&app, "com.x.App"));
+        assert!(owns(&ext, "com.x.App")); // child extension included
+        assert!(!owns(&other, "com.x.App")); // sibling app excluded
     }
 
     /// The real misattribution the declared parent fixes: `com.apple.siri` and
@@ -457,8 +527,8 @@ mod tests {
             "com.apple.siri.SiriGeo.SiriGeoIntentExtension",
             "com.apple.siri.SiriGeo",
         );
-        assert!(is_app_or_extension(&ext, "com.apple.siri.SiriGeo"));
-        assert!(!is_app_or_extension(&ext, "com.apple.siri"));
+        assert!(owns(&ext, "com.apple.siri.SiriGeo"));
+        assert!(!owns(&ext, "com.apple.siri"));
     }
 
     /// Where the metadata declares no parent (147/785 plugin containers on a real
@@ -466,14 +536,14 @@ mod tests {
     #[test]
     fn undeclared_parent_falls_back_to_the_prefix_rule() {
         let ext = container("com.x.App.Widget", ContainerKind::Extension);
-        assert!(is_app_or_extension(&ext, "com.x.App"));
-        assert!(!is_app_or_extension(&ext, "com.x.Other"));
+        assert!(owns(&ext, "com.x.App"));
+        assert!(!owns(&ext, "com.x.Other"));
     }
 
     #[test]
     fn android_child_packages_are_not_extensions() {
         let helper = container("com.x.helper", ContainerKind::AndroidData);
         // A different Android package that merely shares a prefix is NOT pulled in.
-        assert!(!is_app_or_extension(&helper, "com.x"));
+        assert!(!owns(&helper, "com.x"));
     }
 }

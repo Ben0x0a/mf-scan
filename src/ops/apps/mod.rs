@@ -1,7 +1,7 @@
 //! Application-data location and selection, across acquisition types.
 //!
 //! Defines: this namespace and its public surface, re-exported from the submodules
-//! below — the catalogue ([`AppCatalog`], [`AppScope`], [`detect`],
+//! below — the catalogue ([`AppCatalog`], [`AppScope`], [`detect()`],
 //! [`entries_under`]) and its data types ([`Platform`], [`ContainerKind`],
 //! [`GroupLink`], [`AppContainer`], [`AndroidRoot`], [`AppSummary`],
 //! [`SigningRecord`]).

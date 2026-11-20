@@ -1,6 +1,6 @@
 //! Android-Keystore JSON provider: an acquisition tool's keystore dump → secrets.
 //!
-//! Defines: [`AndroidKeystoreJson`], a [`KeyfileProvider`](super::KeyfileProvider) for
+//! Defines: [`AndroidKeystoreJson`], a [`KeyfileProvider`] for
 //! the JSON report a full-filesystem acquisition writes next to an Android extraction
 //! (`<serial>_android_keystore`, often shipped inside a zip).
 //! Used by: `decrypt::keyfile` (registered in its `PROVIDERS` list).

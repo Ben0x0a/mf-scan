@@ -34,6 +34,9 @@ src/
     filter.rs     EntryFilter: --app scope (path prefixes) + path globs (--path/--not-path)
                   + --type / media skip
     util.rs       tiny crate-wide helpers (sha256_hex, the UTC calendar)
+    layout.rs     PrefixIndex: the ONE longest-prefix rule (which nested container owns
+                  a path: search annotation, app tally, export tree, backup rebuild)
+                  + host-safe export path segments
     source/       the container abstraction the engine reads through (see ADR 0002)
       mod.rs        Source trait: entries() + content() + byte_size() + integrity_check();
                     sniff_container: the one decision on what kind of file an operand is
@@ -52,6 +55,9 @@ src/
       mod.rs        Inspector trait (detect/inspect/diff) + registry + detect_type
       txt.rs json.rs xml.rs csv.rs plist.rs sqlite.rs   (resolve offsets; some diff)
       value_diff.rs  shared JSON-tree diff used by json + plist
+      leveldb/      logs and manifests (log.rs), tables (table.rs) and the Snappy
+                    decoder tables need (snappy.rs)
+      keva.rs abx.rs mmkv.rs realm.rs segb.rs …   (own-format inspectors)
       media/        the `media` category (classification only)
     sqlite/       low-level SQLite reader (page/record/schema/table + wal replay),
                   shared by the inspector, the backup Manifest.db reader and the

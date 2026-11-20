@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::core::layout::tree_dir;
+use crate::core::layout::{output_roots, tree_dir};
 use crate::core::models::Entry;
 use crate::core::source::Source;
 use crate::platform::android::paths;
@@ -104,9 +104,10 @@ pub fn plan(source: &dyn Source, structure: &BackupStructure, kind: BackupKind) 
     // Map the directory records through the SAME roots the files use, so a
     // directory is created exactly where its contents land. Two records can land on one
     // path (a token's root and an empty domain, say); the first with a time wins.
+    let index = output_roots(&roots);
     let mut directories: BTreeMap<String, (Option<u64>, Vec<String>)> = BTreeMap::new();
     for directory in &structure.directories {
-        if let Some(path) = tree_dir(&directory.name, &roots) {
+        if let Some(path) = tree_dir(&directory.name, &index) {
             let (mtime, names) = directories.entry(path).or_default();
             *mtime = mtime.or(directory.mtime);
             names.push(directory.name.clone());

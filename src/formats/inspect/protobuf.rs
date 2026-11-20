@@ -42,9 +42,6 @@ use crate::core::models::Inspection;
 const RECURSION_LIMIT: usize = 100;
 /// The largest field number the protobuf specification allows (2^29 - 1).
 const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
-/// The longest string kept in the JSON detail, in characters; a longer one becomes
-/// `{ "text": first VALUE_CHARS, "truncated": true }`.
-const VALUE_CHARS: usize = 4096;
 
 /// Protobuf inspector — recognised by structure only (see the module doc).
 pub struct Protobuf;
@@ -399,12 +396,9 @@ fn describe(
             let text = String::from_utf8_lossy(data);
             // Control characters (a newline in a chat message) become spaces in the
             // one-line summary; the JSON value keeps the exact text, up to
-            // VALUE_CHARS (a multi-megabyte string is not copied whole per match).
+            // DETAIL_CHARS (a multi-megabyte string is not copied whole per match).
             let shown = super::one_line(&text);
-            let value = match text.char_indices().nth(VALUE_CHARS) {
-                Some((cut, _)) => json!({ "text": &text[..cut], "truncated": true }),
-                None => json!(text),
-            };
+            let value = super::detail_text(&text);
             ("string", format!("string: \"{shown}\""), value)
         }
         (Wire::Len, Reading::Message) | (Wire::Group, _) => (
@@ -510,7 +504,7 @@ mod tests {
         assert_eq!(found.detail["value"]["truncated"], true);
         assert_eq!(
             found.detail["value"]["text"].as_str().unwrap().len(),
-            VALUE_CHARS
+            crate::formats::inspect::DETAIL_CHARS
         );
         // ("xxx…" also parses as varint fields: 'x' is field 15, varint.)
         assert!(found.summary.contains("…\""), "{}", found.summary);

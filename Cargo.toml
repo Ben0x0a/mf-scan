@@ -1,6 +1,6 @@
 [package]
 name = "mf-scan"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 # Minimum supported Rust. 1.98 stabilised `slice::as_chunks`, which the hex, UTF-16
 # and WAL-checksum decoders use so their fixed-size indices are checked at compile

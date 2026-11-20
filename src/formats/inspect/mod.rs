@@ -75,6 +75,7 @@ use detect::{detect, detect_by_extension, detect_by_tail};
 pub(crate) use detect::{detect_by_header, detect_structure};
 mod json;
 pub(crate) use json::unescape as json_unescape;
+mod keva;
 mod leveldb;
 mod mmkv;
 // What an embedded byte run holds (shared by the SQLite and SEGB inspectors).
@@ -236,6 +237,7 @@ static INSPECTORS: &[&dyn Inspector] = &[
     &realm::Realm,
     &identify::Lmdb,
     &identify::Tar,
+    &keva::Keva,
     &leveldb::Leveldb,
     // Media — recognised by header magic; classification only (no offset
     // resolution). List the more specific container before the generic one:
@@ -389,6 +391,26 @@ pub(crate) fn quoted(text: &str) -> String {
 /// Bytes as [`quoted`] text (invalid UTF-8 replaced).
 pub(crate) fn quoted_bytes(bytes: &[u8]) -> String {
     quoted(&String::from_utf8_lossy(bytes))
+}
+
+/// The longest text a JSON detail keeps whole, in characters.
+pub(crate) const DETAIL_CHARS: usize = 4096;
+
+/// `text` for a JSON detail: whole up to [`DETAIL_CHARS`], else
+/// `{ "text": its first DETAIL_CHARS, "truncated": true }`.
+///
+/// WHY a cap: each match is one record, so a multi-megabyte value matched 500 times
+/// would otherwise be written 500 times whole.
+pub(crate) fn detail_text(text: &str) -> serde_json::Value {
+    match text.char_indices().nth(DETAIL_CHARS) {
+        Some((cut, _)) => serde_json::json!({ "text": &text[..cut], "truncated": true }),
+        None => text.into(),
+    }
+}
+
+/// Bytes as [`detail_text`] (invalid UTF-8 replaced).
+pub(crate) fn detail_bytes(bytes: &[u8]) -> serde_json::Value {
+    detail_text(&String::from_utf8_lossy(bytes))
 }
 
 /// A LEB128 varint at `i` in `b`, at most `max` bytes long (5 for a 32-bit value, 10

@@ -2,7 +2,7 @@
 //!
 //! Defines: [`ExportItem`] / [`ExportPlan`] / [`Renamed`], [`plan`] (one folder per
 //! file) and [`plan_tree`] (the device tree), the clash rule (`disambiguate`,
-//! `fold_case`), and the name of a decrypted copy ([`decrypted_name`]).
+//! `fold_case`), and the name of a decrypted copy ([`decrypted_name_numbered`]).
 //! Used by: `report::export::write` and `manifest`, and the binary's export paths.
 //! Uses: `core::layout` (tree layout), `ops::search::MatchedFile`.
 
@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::core::layout::{attribute, sanitise_basename, sanitise_segment, split_dir_base};
+use crate::core::layout::{
+    attribute, output_roots, sanitise_basename, sanitise_segment, split_dir_base,
+};
 use crate::core::models::Encoding;
 use crate::ops::search::MatchedFile;
 
@@ -216,27 +218,28 @@ fn disambiguate(items: &mut [ExportItem]) -> Vec<Renamed> {
 ///
 /// WHY longest-prefix wins: containers can nest (an extension container may sit
 /// inside another registered directory), so the most specific owner must claim the
-/// file — the same rule [`crate::platform::ios::containers::AppContainerMap::resolve`] uses.
+/// file — the one rule of [`crate::core::layout::PrefixIndex`].
 /// WHY per-segment sanitisation (not only the member-name cleaning at write time):
 /// the tree is reconstructed here, so each component must be made safe to extract on
 /// any host as it is built; every member name, a re-ingested manifest's included,
 /// still passes through `write::member_name`, which drops any `..`.
 pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPlan {
+    let roots = output_roots(roots);
     let mut total_size = 0u64;
     let mut items: Vec<ExportItem> = files
         .iter()
         .map(|file| {
             total_size += file.entry.uncompressed_size;
             let path = file.entry.name.as_str();
-            let (folder, name) = match attribute(path, roots) {
+            let (folder, name) = match attribute(path, &roots) {
                 // The file IS the root: the label's last segment is its name.
                 Some((label, "")) => match label.rsplit_once('/') {
                     Some((folder, name)) => (folder.to_string(), name.to_string()),
-                    None => (String::new(), label),
+                    None => (String::new(), label.to_string()),
                 },
                 Some((label, rel)) => {
                     let (dirs, base) = split_dir_base(rel);
-                    let mut folder = label;
+                    let mut folder = label.to_string();
                     for seg in dirs {
                         folder.push('/');
                         folder.push_str(&sanitise_segment(seg));

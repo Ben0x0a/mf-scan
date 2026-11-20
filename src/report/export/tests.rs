@@ -9,7 +9,7 @@ fn decrypted_name(name: &str) -> String {
     decrypted_name_numbered(name, 1)
 }
 use super::write::{extraction_warning, member_name};
-use crate::core::layout::tree_dir;
+use crate::core::layout::{output_roots, tree_dir};
 #[test]
 fn decrypted_names_keep_a_usable_extension() {
     assert_eq!(decrypted_name("signal.sqlite"), "signal.decrypted.sqlite");
@@ -217,12 +217,13 @@ fn tree_dir_agrees_with_plan_tree() {
     }];
     let plan = plan_tree(&files, &roots);
     assert_eq!(plan.items[0].folder, "private/var/mobile/Library/SMS");
+    let index = output_roots(&roots);
     assert_eq!(
-        tree_dir("HomeDomain/Library/SMS", &roots).as_deref(),
+        tree_dir("HomeDomain/Library/SMS", &index).as_deref(),
         Some("private/var/mobile/Library/SMS"),
         "the directory record must map to exactly the folder its files land in"
     );
-    assert_eq!(tree_dir("OtherDomain/x", &roots), None);
+    assert_eq!(tree_dir("OtherDomain/x", &index), None);
 }
 
 /// A well-formed relative label must survive untouched, so hardening the

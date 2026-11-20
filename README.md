@@ -72,8 +72,8 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   size cap — `grep` and `diff` share one export pipeline.
 - **Multi-threaded**, with a live progress hint on a terminal.
 
-> SEGB (Biome), Realm, ABX, typedstream (iMessage text), MMKV, LevelDB logs and
-> unified-log `uuidtext` are inspected; KTX snapshots, `.tracev3` and about 25 other
+> SEGB (Biome), Realm, ABX, typedstream (iMessage text), MMKV, keva (single values),
+> LevelDB (logs and tables) and unified-log `uuidtext` are inspected; KTX snapshots, `.tracev3` and about 25 other
 > formats are identified by their header. See [docs/inspectors.md](docs/inspectors.md).
 
 ---
@@ -468,14 +468,16 @@ match, marked "(by structure)" (`"detection": "structure"` in JSON): inferred, n
 |---|---|
 | TXT | line and column |
 | JSON | key path + line, e.g. `$.users[3].token` |
-| XML | element path + line |
+| XML | element path with sibling indices, e.g. `/map[1]/string[4]/@name`, the attribute's value or the text, and the line |
 | CSV | row, column, and header name |
 | plist (XML & binary `bplist`) | dict-key / array-index path, e.g. `$.Account.Servers[1]` |
 | plist (NSKeyedArchiver `bplist`) | logical path through the `$objects`/UID graph, e.g. `$.root.prefs.token`; resolves wrapped scalars (NSMutableString, NSData), array indices, and dict key-name hits; reports the Foundation class of the containing object |
 | protobuf (by structure: the whole file or BLOB parses) | field path with no `.proto`, e.g. `4.4.2.1`, wire type and value (string, number, bytes, nested message); a value that is both valid text and a valid message is flagged as ambiguous |
 | LevelDB logs (`*.log`) and manifests (`MANIFEST-*`) | record, sequence number, put or delete, key and value; manifest: the version edit field (comparator, new file and its key range, …) |
+| LevelDB tables (`*.ldb`, `*.sst`) | data block, sequence number, put or delete, key and value, Snappy-compressed blocks included; an index entry's key and its data block; filter block, footer |
 | uuidtext (unified logs) | the format string, its offset in the binary's string space (as `.tracev3` refers to it), and the binary's path |
 | typedstream (`NSArchiver`: iMessage `attributedBody`, also inside a SQLite BLOB) | the chain of objects holding the string, e.g. `NSMutableAttributedString / NSMutableString`, and the text |
+| keva (ByteDance: TikTok, Lemon8) | single-value files (`.sgv`): the value, or the element of a string array; the key is the file's name; other keva files are named, not decoded |
 | MMKV (by structure: no signature) | key, value (string or number), entry number, and the later entry that supersedes it |
 | ABX (Android Binary XML: `packages.xml`, permissions, settings) | element path with sibling indices, e.g. `/packages[1]/package[37]/@name`, and the attribute's typed value or the text |
 | Realm (file format 10+) | class, property (type), object key and value for a string or binary property; else the schema, the property's data, Realm structure, or free space from an earlier version |
@@ -489,7 +491,7 @@ tool opens it.
 
 | Category | Formats |
 |---|---|
-| database | `leveldb` tables (`.ldb`/`.sst`: footer magic; logs and manifests are inspected), `lmdb`, `sqlite-wal`, `sqlite-shm`, `sqlite-journal` |
+| database | `lmdb`, `sqlite-wal`, `sqlite-shm`, `sqlite-journal` |
 | log | `tracev3` (unified logs: LZ4-compressed entries), `dsc` (shared-cache strings) |
 | structured | `binarycookies`, `bom` (`Assets.car`) |
 | archive | `zip` (APK, IPA, DOCX…), `gzip`, `bzip2`, `xz`, `zstd`, `7z`, `tar`, `lz4`, `lzfse`, `aea` |

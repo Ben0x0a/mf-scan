@@ -3,15 +3,14 @@
 //! Defines: [`detect`] (the platform sniffer) and `tally` (each container's file
 //! count and size, in one pass).
 //! Used by: `catalog` (`AppCatalog::build`), and re-exported as `ops::apps::detect`.
-//! Uses: the data types in `types`, [`crate::platform::ios::domains`] (backup
+//! Uses: the data types in `types`, [`PrefixIndex`] (the tally), [`crate::platform::ios::domains`] (backup
 //! domains), [`crate::platform::android::paths::is_backup_member`] (`.ab` members).
 //!
 //! WHY its own module: reading the source's shape is done once, before and apart
 //! from the questions the catalogue answers about apps.
 
-use std::collections::HashMap;
-
 use super::types::{AppContainer, Platform};
+use crate::core::layout::PrefixIndex;
 use crate::core::source::Source;
 use crate::platform::android::paths::is_backup_member;
 use crate::platform::ios::domains;
@@ -69,11 +68,12 @@ fn is_backup_domain(name: &str) -> bool {
 
 /// Tally each container's file count and total size in one pass: every
 /// non-directory entry is charged to the longest container prefix that contains
-/// it (an entry deep in a nested container counts toward the innermost one).
+/// it (an entry deep in a nested container counts toward the innermost one), by the
+/// one rule of [`PrefixIndex`].
 pub(super) fn tally(source: &dyn Source, containers: &mut [AppContainer]) {
     // Owned keys: the index outlives the immutable borrow so the tally below can
     // mutate `containers` (a `&str`-keyed index would borrow it for the whole loop).
-    let index: HashMap<String, usize> = containers
+    let index: PrefixIndex<usize> = containers
         .iter()
         .enumerate()
         .map(|(i, c)| (c.prefix.clone(), i))
@@ -82,23 +82,9 @@ pub(super) fn tally(source: &dyn Source, containers: &mut [AppContainer]) {
         if entry.is_dir() {
             continue;
         }
-        if let Some(idx) = longest_container(&entry.name, &index) {
+        if let Some((&idx, _)) = index.longest(&entry.name) {
             containers[idx].file_count += 1;
             containers[idx].total_size += entry.uncompressed_size;
         }
     }
-}
-
-/// Find the index of the longest container prefix that is an ancestor of `path`,
-/// by walking the path's parent directories from longest to shortest.
-fn longest_container(path: &str, index: &HashMap<String, usize>) -> Option<usize> {
-    let mut cur = path;
-    // Start one level up: a file is never itself a container prefix.
-    while let Some(pos) = cur.rfind('/') {
-        cur = &cur[..pos];
-        if let Some(&idx) = index.get(cur) {
-            return Some(idx);
-        }
-    }
-    None
 }

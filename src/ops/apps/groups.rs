@@ -6,7 +6,7 @@
 //! heuristic (`vendor_tokens`, `group_matches_tokens`).
 //! Used by: `catalog` (`containers_for`), and the binary's `app list`
 //! (`unclaimed_groups`).
-//! Uses: `catalog` (the `AppCatalog` it extends, `is_app_or_extension`), the data
+//! Uses: `catalog` (the `AppCatalog` it extends, `own_containers`), the data
 //! types in `types`, and the MobileContainerManager records it holds
 //! ([`crate::platform::ios::references`]).
 //!
@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::catalog::{AppCatalog, is_app_or_extension};
+use super::catalog::AppCatalog;
 use super::types::{AppContainer, ContainerKind, GroupLink};
 
 impl AppCatalog {
@@ -78,9 +78,8 @@ impl AppCatalog {
         // pass over the containers serves them all.
         if let Some(id) = ids.first() {
             identities.extend(
-                self.containers
-                    .iter()
-                    .filter(|c| c.kind == ContainerKind::Extension && is_app_or_extension(c, id))
+                self.own_containers(id)
+                    .filter(|c| c.kind == ContainerKind::Extension)
                     .map(|c| c.id.as_str()),
             );
         }
