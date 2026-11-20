@@ -1,6 +1,6 @@
 //! What an export records: each written file with its hashes, and the report.
 //!
-//! Defines: [`ExportedFile`], [`SkippedFile`], [`StoredIntegrity`],
+//! Defines: [`ExportedFile`], [`FileNote`], [`StoredIntegrity`],
 //! [`IntegritySummary`], and [`write_export_report`] (`export-report.json`).
 //! Used by: `report::export::write` (fills the records), `report::rebuild_zip` and
 //! `report::decrypted_zip`, and the binary (prints and writes the report).
@@ -14,16 +14,16 @@ use serde::{Deserialize, Serialize};
 use super::plan::Renamed;
 use crate::core::models::RunInfo;
 
-/// A file that was NOT written because its destination path would exceed the
-/// length guard — recorded (rather than silently dropped or truncated) so the
-/// analyst can re-export to a shorter root or raise `--max-path-len`.
+/// A file an export has to say something about: one written under a name too long
+/// to extract on Windows, a database whose decrypted copy could not be made, a file
+/// a rebuild could not read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkippedFile {
-    /// Path inside the source that was skipped.
+pub struct FileNote {
+    /// Path inside the source.
     pub internal_path: String,
-    /// The destination path that would have been written, relative to the dir.
+    /// Its member name in the archive (or the one it would have had).
     pub output_path: String,
-    /// Why it was skipped (which limit it hit), for the operator and the report.
+    /// What happened, for the operator and the report.
     pub reason: String,
 }
 
@@ -38,10 +38,10 @@ pub struct SkippedFile {
 pub struct ExportedFile {
     /// Path inside the source archive.
     pub internal_path: String,
-    /// Path written, relative to the export destination directory.
+    /// Its member name in the archive.
     pub output_path: String,
     pub size: u64,
-    /// SHA-256 of the written bytes (read back from disk), lowercase hex.
+    /// SHA-256 of the written bytes (read back from the archive), lowercase hex.
     pub sha256: String,
     /// SHA-256 of the source bytes (as read out of the source), lowercase hex.
     pub source_sha256: String,
@@ -52,8 +52,8 @@ pub struct ExportedFile {
     /// Source-recorded stored-bytes integrity, when the source carries one (an
     /// encrypted backup's per-file SHA-1). `Unrecorded` for plain sources.
     pub stored_integrity: StoredIntegrity,
-    /// The file's modification time as the source recorded it, in UTC. Written by a
-    /// backup rebuild, so the report states the time each archive member must carry.
+    /// The file's modification time as the source recorded it, in UTC: the time its
+    /// archive member carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime_utc: Option<String>,
     /// Set on a file the export derived from `internal_path` rather than copied,
@@ -110,7 +110,7 @@ impl ExportedFile {
 }
 
 /// The export report: run metadata, an integrity summary, every written file with
-/// its hashes, and any files skipped for an over-length destination path.
+/// its hashes, and the notes.
 #[derive(Serialize)]
 struct ExportReport<'a> {
     run: &'a RunInfo,
@@ -125,17 +125,16 @@ struct ExportReport<'a> {
 /// from the JSON when empty, so a clean export's report stays short.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportNotes {
-    /// Files not written because their path could not exist on this platform.
+    /// Files written under a name too long to extract on Windows (or on any common
+    /// file system, for a single name over 255 characters).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skipped_too_long: Vec<SkippedFile>,
-    /// Files written but whose path is too long to move to Windows.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub portability_warnings: Vec<SkippedFile>,
+    pub portability_warnings: Vec<FileNote>,
     /// Files whose decrypted copy could not be made (the original was exported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub undecrypted: Vec<SkippedFile>,
-    /// Files written under another name because theirs was taken on disk: by a file
-    /// of an earlier export, or by one this file system treats as the same name.
+    pub undecrypted: Vec<FileNote>,
+    /// Files written under another name because theirs was taken in the archive, by
+    /// a name differing only in case or accent form (one file once extracted on
+    /// Windows or macOS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed: Vec<Renamed>,
 }
@@ -186,7 +185,7 @@ impl IntegritySummary {
 }
 
 /// Write the export report (run metadata + integrity summary + per-file hashes,
-/// plus any files skipped for an over-length path).
+/// plus the notes).
 pub fn write_export_report(
     run: &RunInfo,
     files: &[ExportedFile],

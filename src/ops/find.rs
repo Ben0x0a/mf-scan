@@ -19,7 +19,7 @@ use anyhow::{Result, bail};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 
-use crate::core::filter::matches;
+use crate::core::filter::{is_under, matches};
 use crate::core::models::Entry;
 use crate::core::models::TypeInfo;
 use crate::core::source::Source;
@@ -94,6 +94,9 @@ pub struct FindQuery {
     pub older: Option<u64>,
     /// Deepest level to list, where a source's top-level names are level 1.
     pub max_depth: Option<usize>,
+    /// `--app`: the path prefixes of the apps' containers; a path must be under one.
+    /// `None` without `--app`; empty when the apps were found nowhere.
+    pub scope: Option<Vec<String>>,
 }
 
 impl FindQuery {
@@ -132,6 +135,10 @@ impl FindQuery {
             || any_folded(&self.ipaths, path);
         name_ok
             && path_ok
+            && self
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.iter().any(|prefix| is_under(prefix, path)))
             && !self.not_names.iter().any(|g| matches(g, name))
             && !self.not_paths.iter().any(|g| matches(g, path))
             && (self.regexes.is_empty() || self.regexes.iter().any(|r| r.is_match(path)))

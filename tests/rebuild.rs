@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use mf_scan::core::source::Source;
 use mf_scan::core::source::folder::FolderSource;
+use mf_scan::core::source::zip::ZipSource;
 use mf_scan::ops::rebuild;
 use mf_scan::ops::search::MatchedFile;
 use mf_scan::platform::ios::backup::profile;
@@ -36,14 +37,25 @@ fn rebuild_fixture(
         .map(|e| MatchedFile::new(e.clone(), Vec::new()))
         .collect();
     let export_plan = export::plan_tree(&files, &plan.roots);
-    let outcome = export::export_files(&export_plan, &source, &files, dir, None, 0, None)
+    let archive = tempfile::tempdir().expect("tempdir");
+    let zip = archive.path().join("out.zip");
+    let run = mf_scan::core::models::RunInfo::default();
+    let outcome = export::export_files(&export_plan, &source, &files, &zip, &run, None, None)
         .expect("export succeeds");
     let written = match outcome {
-        ExportOutcome::Exported { report, .. } => {
-            report.iter().map(|f| f.output_path.clone()).collect()
+        ExportOutcome::Exported(done) => {
+            done.report.iter().map(|f| f.output_path.clone()).collect()
         }
         ExportOutcome::Refused { .. } => panic!("export refused unexpectedly"),
     };
+    // Unpack the archive into `dir`, so the tree can be checked as a device's.
+    let bytes = std::fs::read(&zip).expect("archive");
+    let unpacked = ZipSource::open(&bytes).expect("archive reads back");
+    for entry in unpacked.entries() {
+        let path = dir.join(&entry.name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("folder created");
+        std::fs::write(&path, unpacked.content(entry).expect("member")).expect("written");
+    }
     for directory in &plan.directories {
         std::fs::create_dir_all(dir.join(&directory.path)).expect("directory created");
     }

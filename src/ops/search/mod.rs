@@ -215,6 +215,10 @@ pub fn search_source(
                 stats.bytes_total += bytes;
                 stats.add_not_included(bytes);
             }
+            Class::SkippedNotInApp { bytes } => {
+                stats.bytes_total += bytes;
+                stats.add_not_in_app(bytes);
+            }
             Class::SkippedNotPath { glob_idx, bytes } => {
                 stats.bytes_total += bytes;
                 stats.add_not_path(&not_path_globs[glob_idx], bytes);

@@ -1,11 +1,12 @@
 //! Small crate-wide helpers with no domain logic.
 //!
-//! Defines: `sha256_hex` (the crate's single SHA-256-to-lowercase-hex helper) and the
-//! crate's single UTC calendar conversion ([`UtcTime`], [`unix_from_civil`],
-//! [`parse_utc`]).
+//! Defines: `sha256_hex` (the crate's single SHA-256-to-lowercase-hex helper),
+//! [`now_unix`] (the clock), and the crate's single UTC calendar conversion
+//! ([`UtcTime`], [`unix_from_civil`], [`parse_utc`]).
 //! Used by: `report::export` and `report::zip_writer` (hashes, member timestamps),
 //! `decrypt::context` (audit records), `core::source::zip` (DOS timestamps),
-//! `ops::find` (date tests), and the binary's `support::reporting`.
+//! `ops::find` (date tests), `report::publish`, `report::rebuild_zip`,
+//! `report::decrypted_zip`, and the binary's `support::{reporting, exporting}`.
 //! Uses: `sha2`.
 //!
 //! WHY a foundation module: these are needed below (`decrypt`, `core::source`) and
@@ -25,6 +26,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The current time, in Unix seconds (the epoch for a clock set before it).
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A calendar date and time in UTC.

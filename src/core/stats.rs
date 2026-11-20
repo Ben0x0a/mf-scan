@@ -79,6 +79,8 @@ pub struct ScanStats {
     pub archive_bytes: u64,
     /// Files skipped because `--path` was set and none of its globs matched.
     pub skipped_not_included: SkipTally,
+    /// Files skipped because `--app` was set and they are outside its containers.
+    pub skipped_not_in_app: SkipTally,
     /// Files skipped by the media skip (`--exclude-media`/`--fast`).
     pub skipped_media: SkipTally,
     /// Files skipped by the `--type` allowlist.
@@ -114,6 +116,13 @@ impl ScanStats {
         if let Some(name) = type_name {
             *self.scanned_by_type.entry(name.to_string()).or_default() += 1;
         }
+    }
+
+    /// Record a file skipped because `--app` was set and it is in none of the apps'
+    /// containers.
+    pub fn add_not_in_app(&mut self, bytes: u64) {
+        self.skipped_not_in_app.add(bytes);
+        self.files_skipped += 1;
     }
 
     /// Record a file skipped because `--path` was set and none of its globs matched.
@@ -175,6 +184,7 @@ impl ScanStats {
         self.bytes_scanned += other.bytes_scanned;
         self.archive_bytes += other.archive_bytes;
         self.skipped_not_included.merge(other.skipped_not_included);
+        self.skipped_not_in_app.merge(other.skipped_not_in_app);
         self.skipped_media.merge(other.skipped_media);
         self.skipped_type.merge(other.skipped_type);
         self.unreadable.merge(other.unreadable);

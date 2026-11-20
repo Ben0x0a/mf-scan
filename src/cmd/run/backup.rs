@@ -215,11 +215,11 @@ fn run_rebuild(args: BackupRebuildArgs) -> Result<()> {
                 eprintln!("    {} ({})", file.internal_path, file.reason);
             }
         }
-        if !outcome.non_portable.is_empty() {
+        if !outcome.portability_warnings.is_empty() {
             eprintln!(
                 "note: {} member(s) are complete in the archive but exceed Windows' path limit if \
                  extracted there (listed in {})",
-                outcome.non_portable.len(),
+                outcome.portability_warnings.len(),
                 rebuild_zip::TRACEABILITY_MEMBER
             );
         }

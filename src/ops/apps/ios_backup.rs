@@ -47,6 +47,7 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
                 file_count: 0,
                 total_size: 0,
                 group_link: None,
+                android_root: None,
             });
         }
     }

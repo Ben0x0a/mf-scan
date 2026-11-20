@@ -5,7 +5,8 @@
 //! manifest — the same export pipeline `grep` uses.
 //! Used by: `run` (dispatched from `main`).
 //! Uses: the `mf_scan` library (`diff`, `source`, `report`) plus the shared
-//! `crate::cmd::support` machinery (source resolution, the output sink, the export report).
+//! `crate::cmd::support` machinery (source resolution, the output sink, the export,
+//! and `scoping` for `--app` on both sides).
 //!
 //! Each side is a single source: an archive file, or a directory opened as a folder
 //! (`--dir-mode folder`). Type filtering (`--type`), intra-file diff (`--inspect`),
@@ -28,9 +29,11 @@ use mf_scan::report::diff::write_diff;
 use crate::cmd::cli::DiffArgs;
 use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
+use crate::cmd::support::scoping::{app_scope, scoped_run};
 use crate::cmd::support::sources::{
     BackupFacts, BackupOptions, IoMode, Operand, resolve_file, with_operand_source,
 };
+use crate::cmd::support::{Caveat, caveat};
 
 /// Run the `diff` subcommand.
 pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
@@ -75,7 +78,26 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
                 args.archive_depth,
                 &backup_opts,
                 |b_src| {
-                    let report = diff_sources(a_src, b_src, mode, &filter, args.inspect)?;
+                    // `--app`: the apps' containers on either side (a reinstall moves
+                    // them: the old files then show as removed, the new as added).
+                    let prefixes = (!args.filter.app.is_empty()).then(|| {
+                        let side = |path: &std::path::Path, name: &str| {
+                            format!("side {name} ({})", path.display())
+                        };
+                        let mut scope =
+                            app_scope(a_src, &args.filter.app, &side(&args.a, "A"), None)
+                                .unwrap_or_default();
+                        scope.extend(
+                            app_scope(b_src, &args.filter.app, &side(&args.b, "B"), None)
+                                .unwrap_or_default(),
+                        );
+                        scope.sort();
+                        scope.dedup();
+                        scope
+                    });
+                    let scoped = prefixes.clone().map(|p| filter.with_scope(p));
+                    let filter = scoped.as_ref().unwrap_or(&filter);
+                    let report = diff_sources(a_src, b_src, mode, filter, args.inspect)?;
 
                     emit(args.output.as_deref(), |w| {
                         write_diff(&report, args.format, w)
@@ -86,9 +108,10 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
                     eprintln!(
                         "diff: {added} added, {removed} removed, {modified} modified, {unchanged} unchanged"
                     );
+                    caveat(Caveat::Changes);
 
                     if want_export {
-                        export_changes(&args, &report, b_src)?;
+                        export_changes(&args, &report, b_src, prefixes.as_deref())?;
                     }
                     Ok(())
                 },
@@ -164,7 +187,12 @@ fn with_diff_side<R>(
 /// Export the added/modified files from side B and/or write a manifest, reusing the
 /// same export engine and manifest schema as `grep` (so `mf-scan export
 /// --from-manifest` re-ingests a diff result with no special-casing).
-fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> Result<()> {
+fn export_changes(
+    args: &DiffArgs,
+    report: &DiffReport,
+    b_src: &dyn Source,
+    scope: Option<&[String]>,
+) -> Result<()> {
     // Side B's entries by path, to fetch the ones that changed.
     let by_path: HashMap<&str, &Entry> = b_src
         .entries()
@@ -186,8 +214,9 @@ fn export_changes(args: &DiffArgs, report: &DiffReport, b_src: &dyn Source) -> R
         &args.sink,
         b_src,
         &files,
-        &diff_run_info(args),
+        &scoped_run(&diff_run_info(args), scope),
         "changed",
+        "diff",
         None,
     )
 }
@@ -200,6 +229,7 @@ fn diff_run_info(args: &DiffArgs) -> RunInfo {
         archives: vec![args.a.display().to_string(), args.b.display().to_string()],
         path_globs: args.filter.path.clone(),
         not_path_globs: args.filter.not_path.clone(),
+        app: (!args.filter.app.is_empty()).then(|| args.filter.app.join(", ")),
         ..RunInfo::default()
     }
 }

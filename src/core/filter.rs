@@ -1,12 +1,14 @@
 //! Entry filtering: decide which archive entries are worth searching.
 //!
-//! Defines: `EntryFilter`, which combines include globs (`--path`), exclude
-//! globs (`--not-path`), a file-type allowlist (`--type`), and the media skip.
-//! It splits into two predicates: `selects(path)` (path-only, applied before
-//! reading any bytes) and `accepts_type(TypeInfo)` (applied after detecting the
-//! format from the content header).
-//! Used by: `engine` (skips entries before/while searching) and `main` (builds
-//! it from the CLI flags).
+//! Defines: `EntryFilter`, which combines an app scope (`--app`, as path prefixes:
+//! `with_scope`), include globs (`--path`), exclude globs (`--not-path`), a file-type
+//! allowlist (`--type`), and the media skip; and `is_under` (a path is a prefix or
+//! inside it). It splits into two predicates: `select(path)` (path-only, applied
+//! before reading any bytes) and `accept_type(TypeInfo)` (applied after detecting
+//! the format from the content header).
+//! Used by: `engine` and `ops::search` (skip entries before/while searching), the
+//! binary (builds it from the CLI flags), and `is_under` by `ops::find`,
+//! `ops::apps` (`catalog`, `android`).
 //! Uses: `crate::core::models::TypeInfo` (the detected format/category — a
 //! foundation data shape the inspectors fill).
 //!
@@ -35,6 +37,8 @@ pub enum PathDecision {
     SkipNotIncluded,
     /// The path matched the `--not-path` glob at this index in the exclude list.
     SkipNotPath(usize),
+    /// `--app` was given and this path is under none of the app's containers.
+    SkipNotInApp,
 }
 
 /// Outcome of the type/media filter, applied once the content header is known.
@@ -63,6 +67,10 @@ pub struct EntryFilter {
     types: Vec<String>,
     /// Skip files whose detected category is `media` (when no `--type` is set).
     skip_media: bool,
+    /// `--app`: the path prefixes of the apps' containers; a path must be under one.
+    /// `None` without `--app`; empty when the apps were found nowhere (nothing then
+    /// passes, rather than everything).
+    scope: Option<Vec<String>>,
 }
 
 impl EntryFilter {
@@ -73,6 +81,7 @@ impl EntryFilter {
             exclude: exclude.to_vec(),
             types: types.to_vec(),
             skip_media,
+            scope: None,
         }
     }
 
@@ -83,6 +92,7 @@ impl EntryFilter {
             exclude: Vec::new(),
             types: Vec::new(),
             skip_media: false,
+            scope: None,
         }
     }
 
@@ -105,26 +115,29 @@ impl EntryFilter {
         !self.types.is_empty() || self.skip_media
     }
 
-    /// Classify `path` against the path-only filters (include/exclude globs).
+    /// A copy of this filter limited to paths under `prefixes` (`--app`).
+    ///
+    /// The prefixes are resolved outside (from the app catalog), so the filter, and
+    /// the search engine driving it, stay app-agnostic.
+    pub fn with_scope(&self, prefixes: Vec<String>) -> Self {
+        let mut limited = self.clone();
+        limited.scope = Some(prefixes);
+        limited
+    }
+
+    /// Classify `path` against the path-only filters (`--app` scope, then
+    /// include/exclude globs).
     ///
     /// This runs before any content is read; the type/media decision is made
     /// separately by [`accept_type`](Self::accept_type) once the header has been
     /// inspected. Exclude wins over include — a path matching both is skipped,
     /// attributed to the matching `--not-path` glob.
-    /// A copy of this filter with extra include/exclude globs appended.
-    ///
-    /// Used to fold in globs derived from something the filter itself must not
-    /// know about — currently the iOS container globs an app-identity `--path`
-    /// pattern resolves to. Keeping the derivation outside means the filter, and
-    /// the search engine driving it, stay app-agnostic.
-    pub fn with_extra_globs(&self, include: &[String], exclude: &[String]) -> Self {
-        let mut widened = self.clone();
-        widened.include.extend_from_slice(include);
-        widened.exclude.extend_from_slice(exclude);
-        widened
-    }
-
     pub fn select(&self, path: &str) -> PathDecision {
+        if let Some(scope) = &self.scope
+            && !scope.iter().any(|prefix| is_under(prefix, path))
+        {
+            return PathDecision::SkipNotInApp;
+        }
         if !self.include.is_empty() && !self.include.iter().any(|g| matches(g, path)) {
             return PathDecision::SkipNotIncluded;
         }
@@ -206,9 +219,39 @@ pub(crate) fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// Whether `path` is `prefix` itself or under it, on a path-segment boundary
+/// (`a/b` is under `a`, `a/bc` is not).
+pub fn is_under(prefix: &str, path: &str) -> bool {
+    crate::core::layout::relative_under(prefix, path).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_scope_keeps_only_paths_under_its_prefixes() {
+        let base = EntryFilter::new(&["*.db".to_string()], &[], &[], false);
+        let scoped = base.with_scope(vec!["/c/Data/AppX".into(), "/c/Group/G1".into()]);
+        assert_eq!(
+            scoped.select("/c/Data/AppX/Documents/a.db"),
+            PathDecision::Search
+        );
+        assert_eq!(scoped.select("/c/Group/G1/b.db"), PathDecision::Search);
+        // A sibling whose name only starts like the prefix is outside it.
+        assert_eq!(
+            scoped.select("/c/Data/AppXY/a.db"),
+            PathDecision::SkipNotInApp
+        );
+        // The scope and `--path` both apply.
+        assert_eq!(
+            scoped.select("/c/Data/AppX/notes.txt"),
+            PathDecision::SkipNotIncluded
+        );
+        // An app found nowhere limits to nothing, not to everything.
+        let nothing = EntryFilter::all().with_scope(Vec::new());
+        assert_eq!(nothing.select("/any/file"), PathDecision::SkipNotInApp);
+    }
 
     #[test]
     fn star_crosses_separators() {

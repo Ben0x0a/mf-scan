@@ -3,8 +3,8 @@
 //! Defines: the stderr status surfaces (skip rules, the coverage summary, the
 //! `--verify` integrity attestation), the sidecar scan-report writer, the SHA-256
 //! helper, and the result [`emit`] sink (file or stdout).
-//! Used by: `run::search` (all of it) and `run::export` (`sha256_hex`,
-//! `report_verify`).
+//! Used by: the `run` commands: `grep` (all of it), `find`, `diff`, `export` and
+//! `app` (`emit`, `sha256_hex`, `report_verify`).
 //! Uses: `mf_scan::{models, output, stats, decrypt}` and `crate::cmd::cli`.
 
 use std::fs::File;
@@ -28,6 +28,9 @@ use crate::cmd::cli::GrepArgs;
 /// acquisition; surfacing the rules first means the analyst is never surprised by
 /// silently missing data. Goes to stderr so it never mixes with results on stdout.
 pub(crate) fn log_skip_rules(run: &RunInfo) {
+    if let Some(app) = &run.app {
+        eprintln!("filter: --app limits to the containers of: {app}");
+    }
     if !run.path_globs.is_empty() {
         eprintln!(
             "filter: --path includes only: {}",
@@ -76,6 +79,13 @@ pub(crate) fn print_stats_summary(stats: &ScanStats, match_path: bool) {
         "matches: {} in {} file(s)",
         stats.total_matches, stats.files_with_matches
     );
+    if stats.skipped_not_in_app.count > 0 {
+        eprintln!(
+            "  skipped (not in --app): {} file(s), {}",
+            stats.skipped_not_in_app.count,
+            human_bytes(stats.skipped_not_in_app.bytes)
+        );
+    }
     if stats.skipped_not_included.count > 0 {
         eprintln!(
             "  skipped (not in --path): {} file(s), {}",
@@ -268,7 +278,7 @@ fn default_report_path(output: Option<&Path>, stamp: &str, attempt: u32) -> Path
 /// epoch (a badly wrong system clock) renders as the epoch.
 ///
 /// WHY UTC: it keeps evidence records from different machines comparable.
-fn utc_stamp(time: SystemTime) -> String {
+pub(crate) fn utc_stamp(time: SystemTime) -> String {
     let secs = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

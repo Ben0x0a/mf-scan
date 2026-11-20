@@ -3,7 +3,8 @@
 //! Defines: [`RebuildRequest`] and [`write()`] (the archive and its `.sha256` sidecar),
 //! and [`TRACEABILITY_MEMBER`].
 //! Used by: the binary's `backup rebuild` orchestrator (`cmd::run::backup`).
-//! Uses: `report::zip_writer` (the format), `report::export` (the plan and the per-file
+//! Uses: `report::zip_writer` (the format), `report::publish` (failing closed, and the
+//! replacing publish `--force` asks for), `report::export` (the plan and the per-file
 //! integrity records every export shares), `core::source`.
 //!
 //! WHY a ZIP and never a folder: a rebuilt device path is long before the operator's
@@ -19,24 +20,22 @@
 //! something that looks like a finished archive.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::core::models::RunInfo;
 use crate::core::source::Source;
-use crate::core::source::zip::ZipSource;
+use crate::core::util::now_unix;
 use crate::core::util::{UtcTime, sha256_hex};
 use crate::ops::rebuild::RebuildDirectory;
 use crate::ops::search::MatchedFile;
 use crate::platform::ios::backup::common::{ManifestDb, manifest_zip_paths_csv};
 use crate::report::export::{
-    DEFAULT_MAX_PATH_LEN, ExportPlan, ExportedFile, IntegritySummary, SkippedFile, StoredIntegrity,
+    ExportPlan, ExportedFile, FileNote, IntegritySummary, StoredIntegrity, extraction_warning,
 };
-use crate::report::export::{make_writable, set_read_only};
+use crate::report::publish::{check_and_hash, prepare, publish_replacing};
 use crate::report::zip_writer::ZipWriter;
 
 /// The traceability record's name inside the archive. No device path can take this or
@@ -110,9 +109,9 @@ pub struct RebuildOutcome {
     pub bytes: u64,
     pub directories: usize,
     /// Files that could not be read, with `continue_on_error`.
-    pub failed: Vec<SkippedFile>,
+    pub failed: Vec<FileNote>,
     /// Members that would exceed the Windows path limit if extracted there.
-    pub non_portable: Vec<SkippedFile>,
+    pub portability_warnings: Vec<FileNote>,
     /// What was written to the archive root for an iOS backup.
     pub manifest: ManifestMembers,
     /// SHA-256 of the finished archive.
@@ -133,60 +132,10 @@ struct Traceability<'a> {
     #[serde(flatten)]
     manifest: &'a ManifestMembers,
     files: &'a [ExportedFile],
-    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
-    failed: &'a [SkippedFile],
-    #[serde(skip_serializing_if = "<[SkippedFile]>::is_empty")]
-    non_portable: &'a [SkippedFile],
-}
-
-/// Removes the temporary archive unless it was moved into place.
-pub(crate) struct PartialFile(pub(crate) PathBuf);
-
-impl Drop for PartialFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// Move a finished archive from `partial` to `output`, write its `.sha256` sidecar,
-/// and make both read-only. Returns the sidecar's path.
-///
-/// An archive already at `output` (callers allow it only with `--force`) and its
-/// sidecar are removed first: they are read-only, and Windows refuses to replace a
-/// read-only file. Shared by the backup rebuild and `decrypt --to`.
-pub(crate) fn publish_archive(
-    partial: &Path,
-    output: &Path,
-    archive_sha256: &str,
-) -> Result<PathBuf> {
-    let sidecar = sidecar_path(output);
-    remove_read_only(output)?;
-    remove_read_only(&sidecar)?;
-    fs::rename(partial, output)
-        .with_context(|| format!("cannot move the archive to {}", output.display()))?;
-    set_read_only(output)?;
-    let file_name = output.file_name().unwrap_or_default().to_string_lossy();
-    // `sha256sum` format, verifiable with `sha256sum -c` or `shasum -a 256 -c`.
-    fs::write(&sidecar, format!("{archive_sha256}  {file_name}\n"))
-        .with_context(|| format!("cannot write {}", sidecar.display()))?;
-    set_read_only(&sidecar)?;
-    Ok(sidecar)
-}
-
-/// Remove `path` if it exists, read-only or not.
-fn remove_read_only(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    make_writable(path)?;
-    fs::remove_file(path).with_context(|| format!("cannot replace {}", path.display()))
-}
-
-/// Where the sidecar for `output` goes: `<name>.zip.sha256`.
-pub(crate) fn sidecar_path(output: &Path) -> PathBuf {
-    let mut name = output.file_name().unwrap_or_default().to_os_string();
-    name.push(".sha256");
-    output.with_file_name(name)
+    #[serde(skip_serializing_if = "<[FileNote]>::is_empty")]
+    failed: &'a [FileNote],
+    #[serde(skip_serializing_if = "<[FileNote]>::is_empty")]
+    portability_warnings: &'a [FileNote],
 }
 
 /// Write the archive described by `request`.
@@ -212,26 +161,7 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
              rebuild what could be read"
         );
     }
-    if output.is_dir() {
-        bail!(
-            "{} is a directory; --to takes a .zip file",
-            output.display()
-        );
-    }
-    if output.exists() && !force {
-        bail!(
-            "{} already exists; pass --force to replace it",
-            output.display()
-        );
-    }
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-
-    let mut partial_name = output.file_name().unwrap_or_default().to_os_string();
-    partial_name.push(format!(".partial-{}", std::process::id()));
-    let partial = PartialFile(output.with_file_name(partial_name));
+    let partial = prepare(output, Some(force))?;
     let mut zip = ZipWriter::create(&partial.0)?;
 
     // A directory that is also a file's path cannot exist on a file system, and on a
@@ -257,14 +187,14 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
 
     let mut report = Vec::with_capacity(files.len());
     let mut failed = Vec::new();
-    let mut non_portable = Vec::new();
+    let mut portability_warnings = Vec::new();
     let mut bytes = 0u64;
     for (item, file) in plan.items.iter().zip(files) {
         let output_path = item.output_path();
         let content = match source.content(&file.entry) {
             Ok(content) => content,
             Err(err) if continue_on_error => {
-                failed.push(SkippedFile {
+                failed.push(FileNote {
                     internal_path: file.entry.name.clone(),
                     output_path,
                     reason: format!("{err:#}"),
@@ -281,14 +211,11 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
                 });
             }
         };
-        if output_path.chars().count() > DEFAULT_MAX_PATH_LEN {
-            non_portable.push(SkippedFile {
+        if let Some(reason) = extraction_warning(&output_path) {
+            portability_warnings.push(FileNote {
                 internal_path: file.entry.name.clone(),
                 output_path: output_path.clone(),
-                reason: format!(
-                    "path length {} exceeds the Windows limit of {DEFAULT_MAX_PATH_LEN} if extracted",
-                    output_path.chars().count()
-                ),
+                reason,
             });
         }
         let member = zip.add_file(&output_path, file.entry.mtime, &content)?;
@@ -326,7 +253,7 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
         manifest: &root,
         files: &report,
         failed: &failed,
-        non_portable: &non_portable,
+        portability_warnings: &portability_warnings,
     };
     let record = serde_json::to_vec_pretty(&traceability).context("cannot encode the report")?;
     zip.add_file(TRACEABILITY_MEMBER, Some(now), &record)?;
@@ -335,14 +262,14 @@ pub fn write(request: RebuildRequest<'_>) -> Result<RebuildOutcome> {
     let expected = report.len() + directory_count + root.member_count() + 1;
     let archive_sha256 = check_and_hash(&partial.0, expected)?;
 
-    let sidecar = publish_archive(&partial.0, output, &archive_sha256)?;
+    let sidecar = publish_replacing(&partial.0, output, &archive_sha256)?;
 
     Ok(RebuildOutcome {
         report,
         bytes,
         directories: directory_count,
         failed,
-        non_portable,
+        portability_warnings,
         manifest: root,
         archive_sha256,
         sidecar,
@@ -377,26 +304,4 @@ fn write_manifest_members(
         Err(err) => members.zip_paths_csv_error = Some(format!("{err:#}")),
     }
     Ok(members)
-}
-
-/// Read the finished archive back with the tool's own reader, confirm it holds what was
-/// written, and hash it. Scoped so the map is gone before the file is moved: Windows
-/// refuses to rename a mapped file.
-pub(crate) fn check_and_hash(path: &Path, expected_members: usize) -> Result<String> {
-    let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    // SAFETY: a read-only map of a file this process just finished writing.
-    let map = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("cannot map {}", path.display()))?;
-    let source = ZipSource::open(&map).context("the written archive does not read back")?;
-    let members = source.entries().len();
-    if members != expected_members {
-        bail!("the written archive holds {members} members, expected {expected_members}");
-    }
-    Ok(sha256_hex(&map))
-}
-
-pub(crate) fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }

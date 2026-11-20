@@ -183,7 +183,23 @@ fn dash_l_can_still_export() {
         ],
     );
     assert_eq!(output.status.code(), Some(0));
-    assert!(dir.path().join("out/export-report.json").exists());
+    assert_one_export(&dir.path().join("out"), "-export-world.zip");
+}
+
+/// `dir` holds one export archive, named `mf-scan-<stamp>…<suffix>`, and its
+/// `.sha256` sidecar, and nothing else.
+fn assert_one_export(dir: &std::path::Path, suffix: &str) {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("export folder")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names[0].starts_with("mf-scan-") && names[0].ends_with(suffix),
+        "{names:?}"
+    );
+    assert_eq!(names[1], format!("{}.sha256", names[0]));
 }
 
 #[test]
@@ -382,6 +398,8 @@ fn stats_are_on_by_default_and_can_be_skipped() {
     let dir = case_dir();
     let default = run(dir.path(), &["grep", "world", "case.zip", "--no-report"]);
     assert!(stderr(&default).contains("scan statistics"));
+    // A result says what it may leave out.
+    assert!(stderr(&default).contains("when in doubt, check by hand"));
 
     let quiet = run(
         dir.path(),
@@ -697,7 +715,7 @@ fn find_walks_a_folder_without_being_told_and_exports_what_it_finds() {
         &["find", "tree", "--type", "sqlite", "--export", "out"],
     );
     assert_eq!(stdout(&by_format), "Library/SMS/sms.db\n");
-    assert!(dir.path().join("out/export-report.json").exists());
+    assert_one_export(&dir.path().join("out"), "-export-find.zip");
 }
 
 /// One help screen per command: `--help` adds nothing to `-h`.

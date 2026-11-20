@@ -1,10 +1,14 @@
 //! Tests for the export plan, writer, records and manifest.
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use super::plan::decrypted_name_numbered;
-use super::write::{PathCheck, check_export_path, safe_join};
+
+/// The first decrypted copy's name.
+fn decrypted_name(name: &str) -> String {
+    decrypted_name_numbered(name, 1)
+}
+use super::write::{extraction_warning, member_name};
 use crate::core::layout::tree_dir;
 #[test]
 fn decrypted_names_keep_a_usable_extension() {
@@ -25,7 +29,6 @@ fn decrypted_names_keep_a_usable_extension() {
 use super::*;
 use crate::core::models::{Entry, Location};
 use crate::ops::search::MatchedFile;
-use std::path::PathBuf;
 
 /// A loose-file [`MatchedFile`] at `name` of `size` bytes, for the planner tests.
 fn loose(name: &str, size: u64) -> MatchedFile {
@@ -276,77 +279,27 @@ fn plan_tree_preserves_tree_under_longest_root() {
     assert_eq!(plan.items[1].name, "y.db");
 }
 
-/// The path-length guard: a safe path passes, `0` disables it, a >255-char
-/// component is unwritable everywhere (`Skip`), and a long relative path is a
-/// portability warning on non-Windows (the host these tests run on).
+/// A member name is checked against what an extraction can hold: a name over 255
+/// characters anywhere, and a path over 260 on Windows. The file is written anyway.
 #[test]
-fn path_length_guard_classifies_paths() {
-    let dir = Path::new("/out");
-    assert!(matches!(
-        check_export_path(dir, "app/file.db", 260),
-        PathCheck::Ok
-    ));
-    // Disabled guard never flags anything.
-    assert!(matches!(
-        check_export_path(dir, &"a".repeat(300), 0),
-        PathCheck::Ok
-    ));
-    // A single component over 255 cannot exist on any filesystem.
+fn extraction_limits_are_flagged_not_enforced() {
+    assert!(extraction_warning("app/file.db").is_none());
     let long_component = format!("{}/f", "b".repeat(300));
-    assert!(matches!(
-        check_export_path(dir, &long_component, 100_000),
-        PathCheck::Skip(_)
-    ));
+    assert!(extraction_warning(&long_component).unwrap().contains("255"));
+    // 300 single-char segments: no name exceeds 255, but the whole path does.
+    let long_path = vec!["a"; 300].join("/");
+    assert!(extraction_warning(&long_path).unwrap().contains("Windows"));
 }
 
-/// On a non-Windows host, an over-limit RELATIVE path is exported but flagged
-/// as not Windows-portable (rather than skipped).
-#[cfg(not(target_os = "windows"))]
+/// A member name never escapes the folder it is extracted to, whatever a tampered
+/// manifest says: `..`, empty and `.` parts are dropped, and `\` splits as `/` does,
+/// as an extractor on Windows would resolve it.
 #[test]
-fn long_relative_path_is_a_portability_warning_off_windows() {
-    let dir = Path::new("/out");
-    // 300 single-char segments: no component exceeds 255, but the whole path does.
-    let rel = vec!["a"; 300].join("/");
-    assert!(matches!(
-        check_export_path(dir, &rel, 260),
-        PathCheck::NotPortable(_)
-    ));
-}
-
-/// `safe_join` must not let a backslash-encoded traversal escape the destination.
-///
-/// A tampered manifest entry like `a\..\..\evil.exe` contains no `/`, so a
-/// `/`-only split would pass it to the OS as one segment; on Windows the OS
-/// resolves the `..` components and escapes the destination directory.  Splitting
-/// on `\` too decomposes the payload so every `..` is dropped.
-#[test]
-fn safe_join_blocks_backslash_traversal() {
-    let dir = PathBuf::from("/export/out");
-
-    // Forward-slash traversal (already blocked before this fix).
-    let result = safe_join(&dir, "../../etc/passwd");
-    assert!(
-        result.starts_with(&dir),
-        "forward-slash traversal escaped: {result:?}"
-    );
-
-    // Backslash traversal — the fix under test.
-    let result = safe_join(&dir, r"a\..\..\evil.exe");
-    assert!(
-        result.starts_with(&dir),
-        "backslash traversal escaped: {result:?}"
-    );
-
-    // Mixed separators.
-    let result = safe_join(&dir, r"a\..\../secret");
-    assert!(
-        result.starts_with(&dir),
-        "mixed traversal escaped: {result:?}"
-    );
-
-    // A legitimate path must still resolve correctly under the dir.
-    let result = safe_join(&dir, "folder/file.db");
-    assert_eq!(result, dir.join("folder").join("file.db"));
+fn member_names_cannot_escape_the_extraction_folder() {
+    assert_eq!(member_name("../../etc/passwd"), "etc/passwd");
+    assert_eq!(member_name(r"a\..\..\evil.exe"), "a/evil.exe");
+    assert_eq!(member_name(r"a\..\../secret"), "a/secret");
+    assert_eq!(member_name("/folder//./file.db"), "folder/file.db");
 }
 
 #[test]
@@ -365,23 +318,4 @@ fn names_differing_only_in_accent_encoding_clash() {
         super::plan::fold_case(decomposed),
         "case and accent form fold together"
     );
-}
-
-#[test]
-fn an_export_never_overwrites_and_writes_read_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("a.db");
-    let first = super::write_read_only(&dest, b"first").unwrap();
-    let second = super::write_read_only(&dest, b"second").unwrap();
-    assert_eq!(first, dest);
-    assert_eq!(second, dir.path().join("a.db~1"));
-    assert_eq!(
-        std::fs::read(&first).unwrap(),
-        b"first",
-        "never overwritten"
-    );
-    assert_eq!(std::fs::read(&second).unwrap(), b"second");
-    for path in [&first, &second] {
-        assert!(std::fs::metadata(path).unwrap().permissions().readonly());
-    }
 }

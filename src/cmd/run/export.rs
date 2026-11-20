@@ -11,12 +11,10 @@ use std::io::BufReader;
 use anyhow::{Context, Result};
 
 use mf_scan::core::source::Source;
-use mf_scan::report::export::{self, ExportOutcome};
+use mf_scan::report::export;
 
 use crate::cmd::cli::ExportArgs;
-use crate::cmd::support::exporting::{
-    report_export_notes, work_copy_if_requested, write_export_report_file,
-};
+use crate::cmd::support::exporting::{export_archive_path, export_subject, report_outcome};
 use crate::cmd::support::reporting::{report_verify, sha256_hex};
 use crate::cmd::support::sources::{
     BackupOptions, BackupProvenance, IoMode, resolve_file, with_operand_source,
@@ -60,40 +58,15 @@ fn run_manifest_export(
     manifest: &export::Manifest,
     source: &dyn Source,
 ) -> Result<()> {
-    match export::export_from_manifest(
-        manifest,
-        source,
-        &args.to,
-        Some(args.max_size),
-        args.max_path_len,
-    )? {
-        ExportOutcome::Exported {
-            files,
-            bytes,
-            skipped,
-            report,
-            notes,
-        } => {
-            let note = if skipped > 0 {
-                format!("; {skipped} listed file(s) not found in archive")
-            } else {
-                String::new()
-            };
-            // Per-file integrity record beside the exported artefacts. Reuses the
-            // manifest's run metadata so the report says what produced it.
-            write_export_report_file(&args.to, &manifest.run, &report, &notes)?;
-            eprintln!(
-                "exported {files} files ({bytes} bytes, read-only) to {}{note}",
-                args.to.display()
-            );
-            report_export_notes(&report, &notes);
-            work_copy_if_requested(args.work_copy, &args.to)?;
-        }
-        ExportOutcome::Refused { total_size, cap } => {
-            eprintln!(
-                "refusing to export: manifest total {total_size} bytes exceeds --max-size {cap}; nothing written"
-            );
-        }
-    }
+    // Named after the manifest, whose run record the report inside reuses.
+    // Named as the export the manifest's run would have made, else after the manifest.
+    let stem = args
+        .from_manifest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let archive = export_archive_path(&args.to, &export_subject(&manifest.run, &stem))?;
+    let outcome = export::export_from_manifest(manifest, source, &archive, Some(args.max_size))?;
+    report_outcome(&outcome, "listed");
     Ok(())
 }

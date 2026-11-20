@@ -30,7 +30,7 @@ Examples:
   mf-scan grep -e 'imei' -e 'imsi' ./extracted --dir-mode
   mf-scan grep '07700900000' case.zip --type database --inspect --fast
   mf-scan grep -F 'a@b.com' case.zip --all-encodings --keyfile keychain.plist
-  mf-scan grep 'token' case.zip --path '*com.whatsapp*' --export ./out --max-size 5G
+  mf-scan grep 'token' case.zip --app com.whatsapp --export ./out --max-size 5G
 
 ^ and $ match at each line; \\A and \\z at the file's start and end. Results are
 path:0xOFFSET:line. Exit status: 0 match, 1 no match, 2 error or some files unsearched.";
@@ -42,7 +42,7 @@ Examples:
   mf-scan find case.zip --iname 'sms*' --type f --long
   mf-scan find case.zip --type sqlite --size +1M --not-path '*/Caches/*'
   mf-scan find ./extracted --newer 2026-01-01 --older 2026-02-01
-  mf-scan find case.zip --path '*com.whatsapp*' --export ./out --max-size 5G
+  mf-scan find case.zip --app com.whatsapp --export ./out --max-size 5G
 
 Different tests must all hold; repeating one means either. Only --type with a format
 reads file contents. Exit status: 0 even with no results, as find; 2 on error.";

@@ -5,8 +5,9 @@
 //! helpers that attribute a path to an output root and make each component safe on
 //! every host (`attribute`, `relative_under`, `sanitise_label`, `split_dir_base`,
 //! `sanitise_segment`, `sanitise_basename`).
-//! Used by: `report::export` (planning a tree export) and `ops::rebuild` (placing a
-//! backup's directory records where its files land).
+//! Used by: `report::export` (planning a tree export), `ops::rebuild` (placing a
+//! backup's directory records where its files land), and `core::filter::is_under`
+//! (`relative_under`: one segment-boundary rule).
 //! Uses: nothing beyond `std`.
 //!
 //! WHY in `core`: both an operation (`ops::rebuild`) and the export writer

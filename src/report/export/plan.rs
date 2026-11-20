@@ -63,18 +63,14 @@ pub struct Renamed {
     pub used: String,
 }
 
-/// The file name of a decrypted copy: `.decrypted` before the extension, so the copy
-/// keeps the extension tools open it by (`signal.sqlite` → `signal.decrypted.sqlite`).
-/// A name with no extension, or only a leading dot, gets the suffix at the end.
-pub fn decrypted_name(name: &str) -> String {
-    decrypted_name_numbered(name, 1)
-}
-
-/// [`decrypted_name`], numbered after the first: `x.decrypted-2.db` for `n` = 2.
+/// The file name of the `n`th decrypted copy: `.decrypted` before the extension, so
+/// the copy keeps the extension tools open it by (`signal.sqlite` →
+/// `signal.decrypted.sqlite`), numbered after the first (`x.decrypted-2.db` for `n` =
+/// 2). A name with no extension, or only a leading dot, gets the suffix at the end.
 ///
 /// An encryption suffix such as `.crypt14` is dropped first, so WhatsApp's
 /// `msgstore.db.crypt14` becomes `msgstore.decrypted.db`, a name tools open as SQLite.
-pub(super) fn decrypted_name_numbered(name: &str, n: usize) -> String {
+pub(crate) fn decrypted_name_numbered(name: &str, n: usize) -> String {
     let tag = if n > 1 {
         format!(".decrypted-{n}")
     } else {
@@ -155,7 +151,7 @@ pub fn plan(files: &[MatchedFile]) -> ExportPlan {
 ///     combining accent (U+0301, NFD) is one name on macOS.
 /// HOW: decompose, lowercase, recompose, so both spellings of an accented letter
 /// reach the same canonical string whatever case or form they started in.
-pub(super) fn fold_case(path: &str) -> String {
+pub(crate) fn fold_case(path: &str) -> String {
     path.nfd()
         .collect::<String>()
         .to_lowercase()
@@ -221,9 +217,10 @@ fn disambiguate(items: &mut [ExportItem]) -> Vec<Renamed> {
 /// WHY longest-prefix wins: containers can nest (an extension container may sit
 /// inside another registered directory), so the most specific owner must claim the
 /// file — the same rule [`crate::platform::ios::containers::AppContainerMap::resolve`] uses.
-/// WHY per-segment sanitisation (not a single `safe_join` at write time): the tree
-/// is reconstructed here, so each component must be made host-safe as it is built;
-/// re-ingestion still passes through `safe_join`, which rejects any `..`.
+/// WHY per-segment sanitisation (not only the member-name cleaning at write time):
+/// the tree is reconstructed here, so each component must be made safe to extract on
+/// any host as it is built; every member name, a re-ingested manifest's included,
+/// still passes through `write::member_name`, which drops any `..`.
 pub fn plan_tree(files: &[MatchedFile], roots: &[(String, String)]) -> ExportPlan {
     let mut total_size = 0u64;
     let mut items: Vec<ExportItem> = files

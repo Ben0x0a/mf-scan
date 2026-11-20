@@ -117,13 +117,18 @@ fn search_and_export_run_over_a_folder_source() {
 
     // Export the matched loose file out of the folder source.
     let out = tempdir().unwrap();
+    let zip = out.path().join("out.zip");
     let plan = export::plan(&findings.files);
-    match export::export_files(&plan, &src, &findings.files, out.path(), None, 0, None).unwrap() {
-        ExportOutcome::Exported { files, .. } => assert_eq!(files, 1),
+    let run = mf_scan::core::models::RunInfo::default();
+    match export::export_files(&plan, &src, &findings.files, &zip, &run, None, None).unwrap() {
+        ExportOutcome::Exported(done) => assert_eq!(done.files, 1),
         ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
     }
-    let written = fs::read(out.path().join(&plan.items[0].folder).join("hit.txt")).unwrap();
-    assert_eq!(written, b"find SECRET here");
+    let bytes = fs::read(&zip).unwrap();
+    let archive = mf_scan::core::source::zip::ZipSource::open(&bytes).unwrap();
+    let member = format!("{}/hit.txt", plan.items[0].folder);
+    let entry = archive.entries().iter().find(|e| e.name == member).unwrap();
+    assert_eq!(&*archive.content(entry).unwrap(), b"find SECRET here");
 }
 
 /// One unreadable file must not abort the scan: it is tallied as unreadable

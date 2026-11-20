@@ -41,6 +41,10 @@ pub(crate) struct FindArgs {
     #[arg(long = "ipath", value_name = "GLOB", help_heading = "Tests")]
     pub(crate) ipath: Vec<String>,
 
+    /// Only this app: its containers, extensions, groups (repeatable).
+    #[arg(long = "app", value_name = "ID", help_heading = "Tests")]
+    pub(crate) app: Vec<String>,
+
     /// Whole path matches this regex.
     #[arg(long = "regex", value_name = "REGEX", help_heading = "Tests")]
     pub(crate) regex: Vec<String>,

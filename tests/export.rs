@@ -1,17 +1,21 @@
-//! Tests for export: planning, manifest, and exporting to disk.
+//! Tests for export: planning, manifest, and exporting into a ZIP archive.
 //!
 //! Defines: tests for folder naming (basename + stable path hash), manifest
-//! content + total size, export layout/content, and the --max-size refusal.
+//! content + total size, the archive's members, report and sidecar, and the
+//! --max-size refusal.
 //! Uses: `common` (fixture builder), `mf_scan::{engine, export}`,
 //! `serde_json`, `tempfile`.
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use common::{FileSpec, build_zip};
 use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::models::RunInfo;
+use mf_scan::core::source::Source;
 use mf_scan::core::source::zip::ZipSource;
 use mf_scan::engine::NoProgress;
 use mf_scan::ops::search::{MatchOn, Query, search_with_query};
@@ -42,6 +46,39 @@ fn run_info() -> RunInfo {
         app_group_links: vec![],
         loose_files_skipped: 0,
     }
+}
+
+/// Export `files` (planned as `plan`) out of `zip` into `<tmp>/out.zip`.
+fn export_to_zip(
+    plan: &export::ExportPlan,
+    zip: &[u8],
+    files: &[mf_scan::ops::search::MatchedFile],
+    cap: Option<u64>,
+) -> (tempfile::TempDir, PathBuf, ExportOutcome) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.zip");
+    let outcome = export::export_files(
+        plan,
+        &ZipSource::open(zip).unwrap(),
+        files,
+        &out,
+        &run_info(),
+        cap,
+        None,
+    )
+    .unwrap();
+    (dir, out, outcome)
+}
+
+/// Every member of the archive at `path`, read with the tool's own reader.
+fn members(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    let bytes = fs::read(path).unwrap();
+    let source = ZipSource::open(&bytes).unwrap();
+    source
+        .entries()
+        .iter()
+        .map(|e| (e.name.clone(), source.content(e).unwrap().to_vec()))
+        .collect()
 }
 
 /// Build a two-file archive (same basename, different dirs) and search it.
@@ -117,32 +154,56 @@ fn manifest_lists_files_with_total_size() {
 }
 
 #[test]
-fn export_writes_files_under_their_folders() {
+fn export_writes_one_archive_with_its_report_and_sidecar() {
+    let (zip, findings) = findings_two_infoplists();
+    let plan = export::plan(&findings.files);
+    let (_dir, out, outcome) = export_to_zip(&plan, &zip, &findings.files, None);
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse without a cap");
+    };
+    assert_eq!(done.files, 2);
+    assert_eq!(done.archive, out);
+
+    // Each file is the member <folder>/Info.plist with its real content, and the
+    // report sits at the root.
+    let members = members(&out);
+    assert_eq!(members.len(), 3);
+    for item in &plan.items {
+        let content = &members[&format!("{}/Info.plist", item.folder)];
+        assert!(content.starts_with(b"key TARGET"));
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&members[export::REPORT_MEMBER]).unwrap();
+    assert_eq!(report["file_count"], 2);
+
+    // The archive is read-only, and its sidecar holds its SHA-256.
+    assert!(fs::metadata(&out).unwrap().permissions().readonly());
+    let sidecar = fs::read_to_string(&done.sidecar).unwrap();
+    assert!(sidecar.starts_with(&done.archive_sha256));
+    assert_eq!(
+        done.archive_sha256,
+        mf_scan::core::util::sha256_hex(&fs::read(&out).unwrap())
+    );
+}
+
+#[test]
+fn an_export_never_replaces_an_existing_archive() {
     let (zip, findings) = findings_two_infoplists();
     let plan = export::plan(&findings.files);
     let dir = tempfile::tempdir().unwrap();
-
-    let outcome = export::export_files(
+    let out = dir.path().join("out.zip");
+    fs::write(&out, b"earlier export").unwrap();
+    let result = export::export_files(
         &plan,
         &ZipSource::open(&zip).unwrap(),
         &findings.files,
-        dir.path(),
+        &out,
+        &run_info(),
         None,
-        0,
         None,
-    )
-    .unwrap();
-    match outcome {
-        ExportOutcome::Exported { files, .. } => assert_eq!(files, 2),
-        ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
-    }
-
-    // Each file lands at DIR/<folder>/Info.plist with its real content.
-    for item in &plan.items {
-        let path = dir.path().join(&item.folder).join("Info.plist");
-        let content = fs::read(&path).unwrap();
-        assert!(content.starts_with(b"key TARGET"));
-    }
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read(&out).unwrap(), b"earlier export");
 }
 
 #[test]
@@ -168,27 +229,50 @@ fn export_includes_sqlite_sidecars() {
     assert_eq!(findings.files.len(), 1); // only sms.db matched
 
     let plan = export::plan(&findings.files);
-    let dir = tempfile::tempdir().unwrap();
-    let outcome = export::export_files(
-        &plan,
-        &ZipSource::open(&zip).unwrap(),
-        &findings.files,
-        dir.path(),
-        None,
-        0,
-        None,
-    )
-    .unwrap();
-    match outcome {
-        ExportOutcome::Exported { files, .. } => assert_eq!(files, 3), // db + wal + shm
-        ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
-    }
+    let (_dir, out, outcome) = export_to_zip(&plan, &zip, &findings.files, None);
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse without a cap");
+    };
+    assert_eq!(done.files, 3); // db + wal + shm
 
     // The sidecars land in the same folder as the database, beside it.
-    let folder = dir.path().join(&plan.items[0].folder);
-    assert!(folder.join("sms.db").exists());
-    assert_eq!(fs::read(folder.join("sms.db-wal")).unwrap(), b"wal-bytes");
-    assert!(folder.join("sms.db-shm").exists());
+    let members = members(&out);
+    let folder = &plan.items[0].folder;
+    assert!(members.contains_key(&format!("{folder}/sms.db")));
+    assert_eq!(members[&format!("{folder}/sms.db-wal")], b"wal-bytes");
+    assert!(members.contains_key(&format!("{folder}/sms.db-shm")));
+}
+
+/// `--max-size` holds for what is written, sidecars included, which the plan's total
+/// leaves out: over it, the export stops and leaves nothing.
+#[test]
+fn the_size_cap_counts_sidecars_and_leaves_nothing_when_exceeded() {
+    let files = [
+        FileSpec::stored("Library/sms.db", b"row with TARGET"),
+        FileSpec::stored("Library/sms.db-wal", b"wal-bytes"),
+    ];
+    let zip = build_zip(&files, false);
+    let re = Regex::new("TARGET").unwrap();
+    let findings = search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        MatchOn::Content,
+        &EntryFilter::all(),
+        None,
+        &NoProgress,
+    )
+    .unwrap();
+    let plan = export::plan(&findings.files);
+    assert_eq!(plan.total_size, 15);
+    let (dir, _out, outcome) = export_to_zip(&plan, &zip, &findings.files, Some(20));
+    match outcome {
+        ExportOutcome::Refused { total_size, cap } => {
+            assert_eq!((total_size, cap), (24, 20));
+        }
+        ExportOutcome::Exported(_) => panic!("the -wal takes it over the cap"),
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -197,22 +281,11 @@ fn export_report_attests_copy_and_zip_crc() {
     // source-vs-copy hash and the central-directory CRC for every file.
     let (zip, findings) = findings_two_infoplists();
     let plan = export::plan(&findings.files);
-    let dir = tempfile::tempdir().unwrap();
-
-    let outcome = export::export_files(
-        &plan,
-        &ZipSource::open(&zip).unwrap(),
-        &findings.files,
-        dir.path(),
-        None,
-        0,
-        None,
-    )
-    .unwrap();
-    let report = match outcome {
-        ExportOutcome::Exported { report, .. } => report,
-        ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
+    let (_dir, _out, outcome) = export_to_zip(&plan, &zip, &findings.files, None);
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse without a cap");
     };
+    let report = done.report;
 
     assert_eq!(report.len(), 2);
     for f in &report {
@@ -235,6 +308,36 @@ fn export_report_attests_copy_and_zip_crc() {
     assert_eq!(summary.intact, 2);
     assert_eq!(summary.stored_digest_verified, 2);
     assert!(!summary.has_failures());
+}
+
+/// A path too long to extract on Windows is exported all the same, and listed.
+#[test]
+fn a_long_path_is_exported_and_flagged() {
+    let long = format!("{}/file.db", vec!["folder_name"; 30].join("/"));
+    let files = [FileSpec::stored(&long, b"TARGET")];
+    let zip = build_zip(&files, false);
+    let re = Regex::new("TARGET").unwrap();
+    let findings = search_with_query(
+        &zip,
+        &Query::plain(&re),
+        false,
+        MatchOn::Content,
+        &EntryFilter::all(),
+        None,
+        &NoProgress,
+    )
+    .unwrap();
+    let roots = vec![("folder_name".to_string(), "app".to_string())];
+    let plan = export::plan_tree(&findings.files, &roots);
+    let (_dir, out, outcome) = export_to_zip(&plan, &zip, &findings.files, None);
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse without a cap");
+    };
+    assert_eq!(done.files, 1);
+    assert_eq!(done.notes.portability_warnings.len(), 1);
+    let name = &done.report[0].output_path;
+    assert!(name.chars().count() > export::WINDOWS_MAX_PATH);
+    assert_eq!(members(&out)[name], b"TARGET");
 }
 
 #[test]
@@ -280,25 +383,15 @@ fn zip_integrity_check_detects_corruption() {
 fn export_refuses_when_over_max_size() {
     let (zip, findings) = findings_two_infoplists();
     let plan = export::plan(&findings.files);
-    let dir = tempfile::tempdir().unwrap();
 
     // Cap below the 28-byte total.
-    let outcome = export::export_files(
-        &plan,
-        &ZipSource::open(&zip).unwrap(),
-        &findings.files,
-        dir.path(),
-        Some(10),
-        0,
-        None,
-    )
-    .unwrap();
+    let (dir, _out, outcome) = export_to_zip(&plan, &zip, &findings.files, Some(10));
     match outcome {
         ExportOutcome::Refused { total_size, cap } => {
             assert_eq!(total_size, 28);
             assert_eq!(cap, 10);
         }
-        ExportOutcome::Exported { .. } => panic!("should have refused"),
+        ExportOutcome::Exported(_) => panic!("should have refused"),
     }
     // Nothing was written.
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -315,29 +408,24 @@ fn export_from_manifest_round_trips() {
     let manifest = export::read_manifest(&buf[..]).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let outcome = export::export_from_manifest(
-        &manifest,
-        &ZipSource::open(&zip).unwrap(),
-        dir.path(),
-        None,
-        0,
-    )
-    .unwrap();
-    match outcome {
-        ExportOutcome::Exported { files, skipped, .. } => {
-            assert_eq!(files, 2);
-            assert_eq!(skipped, 0);
-        }
-        ExportOutcome::Refused { .. } => panic!("should not refuse without a cap"),
-    }
+    let out = dir.path().join("out.zip");
+    let outcome =
+        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), &out, None)
+            .unwrap();
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse without a cap");
+    };
+    assert_eq!(done.files, 2);
+    assert_eq!(done.skipped, 0);
 
-    // Each file exists at the path the manifest recorded.
+    // Each file is a member at the path the manifest recorded.
+    let members = members(&out);
     for entry in &manifest.files {
-        let mut path = dir.path().to_path_buf();
-        for seg in entry.output_path.split('/') {
-            path.push(seg);
-        }
-        assert!(path.exists(), "missing {}", path.display());
+        assert!(
+            members.contains_key(&entry.output_path),
+            "missing {}",
+            entry.output_path
+        );
     }
 }
 
@@ -358,29 +446,22 @@ fn export_from_manifest_skips_missing_entries() {
         }],
     };
     let dir = tempfile::tempdir().unwrap();
-
-    let outcome = export::export_from_manifest(
-        &manifest,
-        &ZipSource::open(&zip).unwrap(),
-        dir.path(),
-        None,
-        0,
-    )
-    .unwrap();
-    match outcome {
-        ExportOutcome::Exported { files, skipped, .. } => {
-            assert_eq!(files, 0);
-            assert_eq!(skipped, 1);
-        }
-        ExportOutcome::Refused { .. } => panic!("should not refuse"),
-    }
+    let out = dir.path().join("out.zip");
+    let outcome =
+        export::export_from_manifest(&manifest, &ZipSource::open(&zip).unwrap(), &out, None)
+            .unwrap();
+    let ExportOutcome::Exported(done) = outcome else {
+        panic!("should not refuse");
+    };
+    assert_eq!(done.files, 0);
+    assert_eq!(done.skipped, 1);
 }
 
 #[test]
 fn a_sidecar_planned_as_its_own_item_is_written_once() {
     // A tree export plans a database and its -wal side by side. The -wal must not
-    // also be written as the database's sidecar: with an export that never
-    // overwrites, the second copy would land as `sms.db-wal~1`.
+    // also be written as the database's sidecar: the second copy would land as
+    // `sms.db-wal~1`.
     let files = [
         FileSpec::stored("App/Library/sms.db", b"row with TARGET"),
         FileSpec::stored("App/Library/sms.db-wal", b"wal with TARGET"),
@@ -401,20 +482,10 @@ fn a_sidecar_planned_as_its_own_item_is_written_once() {
 
     let roots = vec![("App".to_string(), "app".to_string())];
     let plan = export::plan_tree(&findings.files, &roots);
-    let dir = tempfile::tempdir().unwrap();
-    let outcome = export::export_files(
-        &plan,
-        &ZipSource::open(&zip).unwrap(),
-        &findings.files,
-        dir.path(),
-        None,
-        0,
-        None,
-    )
-    .unwrap();
-    let ExportOutcome::Exported { files, notes, .. } = outcome else {
+    let (_dir, _out, outcome) = export_to_zip(&plan, &zip, &findings.files, None);
+    let ExportOutcome::Exported(done) = outcome else {
         panic!("should not refuse without a cap");
     };
-    assert_eq!(files, 2, "the db and its -wal, each once");
-    assert!(notes.renamed.is_empty(), "{:?}", notes.renamed);
+    assert_eq!(done.files, 2, "the db and its -wal, each once");
+    assert!(done.notes.renamed.is_empty(), "{:?}", done.notes.renamed);
 }

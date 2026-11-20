@@ -6,7 +6,8 @@
 //! shared per-source search skeleton (`with_searched_source`).
 //! Used by: `run` (dispatched from `main`).
 //! Uses: the `mf_scan` library plus the `crate::cmd::support::{sources, presets,
-//! decryption, progress, reporting, exporting}` modules — each owning one concern.
+//! decryption, progress, reporting, exporting, scoping}` modules — each owning one
+//! concern.
 
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -22,7 +23,6 @@ use mf_scan::core::source::Source;
 use mf_scan::core::stats::ScanStats;
 use mf_scan::decrypt::DecryptionRecord;
 use mf_scan::formats::inspect::{is_known_type, type_names};
-use mf_scan::ops::apps::expand_app_globs;
 use mf_scan::ops::search::{MatchOn, Query, encodings};
 use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::preset::fast::FAST_EXCLUDE_GLOBS;
@@ -41,10 +41,12 @@ use crate::cmd::support::reporting::{
     emit, log_skip_rules, print_coverage_gaps, print_stats_summary, report_verify, sha256_hex,
     write_scan_report_if_enabled,
 };
+use crate::cmd::support::scoping::{app_scope, scoped_run};
 use crate::cmd::support::sources::{
     BackupFacts, BackupOptions, BackupProvenance, IoMode, ResolvedKind, ResolvedSource,
     ResolvedSources, STDIN_OPERAND, resolve_sources, with_operand_source,
 };
+use crate::cmd::support::{Caveat, caveat};
 
 /// Exit status: at least one match, and everything selected was searched.
 const EXIT_MATCH: u8 = 0;
@@ -171,28 +173,33 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, source, _containers, source_ctx| {
-                for f in &findings.files {
-                    let path = if multi {
-                        format!("{}/{}", src.label, f.entry.name)
-                    } else {
-                        f.entry.name.clone()
-                    };
-                    let listed = ListedFile {
-                        path,
-                        size: f.entry.uncompressed_size,
-                        mtime: f.entry.mtime,
-                        encodings: f.encodings.clone(),
-                    };
-                    counts.push((listed, f.offsets.len()));
-                }
-                if !multi {
-                    // --manifest/--export only apply to a single source (guarded
-                    // above), and --count rejects them, so this is -l's export path.
-                    export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
-                }
-                Ok(())
-            })?;
+            with_searched_source(
+                src,
+                ctx,
+                |findings, source, _containers, source_ctx, scope| {
+                    for f in &findings.files {
+                        let path = if multi {
+                            format!("{}/{}", src.label, f.entry.name)
+                        } else {
+                            f.entry.name.clone()
+                        };
+                        let listed = ListedFile {
+                            path,
+                            size: f.entry.uncompressed_size,
+                            mtime: f.entry.mtime,
+                            encodings: f.encodings.clone(),
+                        };
+                        counts.push((listed, f.offsets.len()));
+                    }
+                    if !multi {
+                        // --manifest/--export only apply to a single source (guarded
+                        // above), and --count rejects them, so this is -l's export path.
+                        let run = scoped_run(&run, scope);
+                        export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         emit(cli.output.as_deref(), |w| {
             if cli.files_with_matches {
@@ -217,36 +224,41 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
                 backup_opts: &backup_opts,
                 backup_record: backup_prov.sink(),
             };
-            with_searched_source(src, ctx, |findings, source, container_map, source_ctx| {
-                // Every record carries its source's full path (for JSON); multi-source
-                // runs also get the short display label (for txt/csv).
-                let full = src.path.display().to_string();
-                for r in &mut findings.records {
-                    r.archive_path = Some(full.clone());
-                    if multi {
-                        r.archive = Some(src.label.clone());
-                    }
-                }
-
-                // iOS container annotation: set bundle_id on every record whose
-                // path falls inside a known container directory. The map was built
-                // before the search (it also widens the path filter), so this is a
-                // cheap sequential pass.
-                // WHY post-search, not in the hot parallel path: the parallel engine
-                // must remain oblivious to iOS-specific enrichment.
-                if !container_map.is_empty() {
+            with_searched_source(
+                src,
+                ctx,
+                |findings, source, container_map, source_ctx, scope| {
+                    // Every record carries its source's full path (for JSON); multi-source
+                    // runs also get the short display label (for txt/csv).
+                    let full = src.path.display().to_string();
                     for r in &mut findings.records {
-                        r.bundle_id = container_map.resolve(&r.path).map(str::to_string);
+                        r.archive_path = Some(full.clone());
+                        if multi {
+                            r.archive = Some(src.label.clone());
+                        }
                     }
-                }
 
-                if !multi {
-                    // --manifest/--export only apply to a single source (guarded above).
-                    export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
-                }
-                records.append(&mut findings.records);
-                Ok(())
-            })?;
+                    // iOS container annotation: set bundle_id on every record whose
+                    // path falls inside a known container directory. The map was built
+                    // before the search (it also widens the path filter), so this is a
+                    // cheap sequential pass.
+                    // WHY post-search, not in the hot parallel path: the parallel engine
+                    // must remain oblivious to iOS-specific enrichment.
+                    if !container_map.is_empty() {
+                        for r in &mut findings.records {
+                            r.bundle_id = container_map.resolve(&r.path).map(str::to_string);
+                        }
+                    }
+
+                    if !multi {
+                        // --manifest/--export only apply to a single source (guarded above).
+                        let run = scoped_run(&run, scope);
+                        export_if_requested(&cli.sink, source, findings, &run, source_ctx)?;
+                    }
+                    records.append(&mut findings.records);
+                    Ok(())
+                },
+            )?;
         }
         let style = if cli.match_path {
             TxtStyle::PathOnly
@@ -271,6 +283,10 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
         print_stats_summary(&stats, cli.match_path);
     }
     report_decryptions(&decryptions);
+    // With the statistics: `-q` and `--no-stats` ask for nothing but results.
+    if !cli.quiet && !cli.no_stats {
+        caveat(Caveat::Matches);
+    }
 
     // Surface the backup-decryption provenance: a loud stderr line at run time
     // (so the use of a DEFAULT password is impossible to miss) and the record in
@@ -364,7 +380,7 @@ fn encoding_set(cli: &GrepArgs) -> encodings::EncodingSet {
     if cli.all_encodings || asked(EncodingArg::All) {
         return encodings::EncodingSet::all();
     }
-    let utf16 = cli.utf16 || asked(EncodingArg::Utf16);
+    let utf16 = asked(EncodingArg::Utf16);
     encodings::EncodingSet {
         normal_forms: asked(EncodingArg::Nfd),
         utf16le: utf16 || asked(EncodingArg::Utf16le),
@@ -530,7 +546,8 @@ fn build_run_info(
     sources: &[ResolvedSource],
     wanted: encodings::EncodingSet,
 ) -> RunInfo {
-    // Search runs are not app-selected; the `app export` path fills the app fields.
+    // `--app` is recorded here; the containers it resolved to, per source, by
+    // `scoped_run` on the export's copy.
     RunInfo {
         pattern: cli.regexps.join(" | "),
         patterns: if cli.regexps.len() > 1 {
@@ -548,6 +565,7 @@ fn build_run_info(
             .collect(),
         path_globs: cli.filter.path.clone(),
         not_path_globs: cli.filter.not_path.clone(),
+        app: (!cli.filter.app.is_empty()).then(|| cli.filter.app.join(", ")),
         types: cli.filter.file_type.clone(),
         exclude_media: cli.filter.exclude_media,
         encodings: wanted.names(),
@@ -609,6 +627,7 @@ fn with_searched_source(
         &dyn Source,
         &AppContainerMap,
         Option<&mf_scan::decrypt::DecryptionContext>,
+        Option<&[String]>,
     ) -> Result<()>,
 ) -> Result<()> {
     with_source(
@@ -620,13 +639,17 @@ fn with_searched_source(
         |source, raw| {
             let verify_before = (ctx.cli.verify).then(|| raw.map(sha256_hex)).flatten();
 
-            // Build the container map BEFORE the search: it both widens the path
-            // filter (an app-identity `--path` glob names a GUID-named container)
-            // and annotates the records afterwards, so it is built once and used
-            // twice rather than rebuilt.
+            // The container map annotates the records afterwards (owning app).
             let container_map = AppContainerMap::build(source);
-            let widened = widen_filter_for_apps(ctx.filter, &container_map, ctx.cli);
-            let filter = widened.as_ref().unwrap_or(ctx.filter);
+            // `--app`: only the apps' containers, resolved from this source's catalog.
+            let prefixes = app_scope(
+                source,
+                &ctx.cli.filter.app,
+                &src.label,
+                Some(&container_map),
+            );
+            let scoped = prefixes.clone().map(|p| ctx.filter.with_scope(p));
+            let filter = scoped.as_ref().unwrap_or(ctx.filter);
 
             // Keys a dump inside the source carries join those found beside it.
             let source_ctx = context_for_source(ctx.decrypt_ctx, source);
@@ -639,49 +662,19 @@ fn with_searched_source(
                 source_ctx.as_deref(),
                 !ctx.cli.quiet,
             )?;
-            handle(&mut findings, source, &container_map, source_ctx.as_deref())?;
+            handle(
+                &mut findings,
+                source,
+                &container_map,
+                source_ctx.as_deref(),
+                prefixes.as_deref(),
+            )?;
             ctx.decryptions.append(&mut findings.decryptions);
             ctx.stats.merge(findings.stats);
             report_verify_for(ctx.cli.verify, verify_before, raw);
             Ok(())
         },
     )
-}
-
-/// Widen the path filter with the containers an app-identity `--path`/`--not-path`
-/// glob names, or `None` when nothing resolved.
-///
-/// On a full-filesystem acquisition an app's container is named by a GUID, so
-/// `--path '*com.burbn.instagram*'` matches nothing even though the identifier is
-/// recorded in the container's metadata plist. Resolving it here — once, before the
-/// search — keeps the engine and the filter app-agnostic.
-///
-/// What was added is reported, because a filter that quietly matches more than it
-/// was asked to is worse than one that matches less.
-fn widen_filter_for_apps(
-    filter: &EntryFilter,
-    map: &AppContainerMap,
-    cli: &GrepArgs,
-) -> Option<EntryFilter> {
-    if map.is_empty() || (cli.filter.path.is_empty() && cli.filter.not_path.is_empty()) {
-        return None;
-    }
-    let include = expand_app_globs(map, &cli.filter.path);
-    let exclude = expand_app_globs(map, &cli.filter.not_path);
-    if include.is_empty() && exclude.is_empty() {
-        return None;
-    }
-    for (resolved, flag) in [(&include, "--path"), (&exclude, "--not-path")] {
-        for g in resolved {
-            eprintln!(
-                "{flag} {:?} resolved to app {} -> {}",
-                g.pattern, g.bundle_id, g.glob
-            );
-        }
-    }
-    let include: Vec<String> = include.into_iter().map(|g| g.glob).collect();
-    let exclude: Vec<String> = exclude.into_iter().map(|g| g.glob).collect();
-    Some(filter.with_extra_globs(&include, &exclude))
 }
 
 /// Adapt a pre-resolved [`ResolvedSource`] onto the shared [`with_operand_source`]

@@ -29,6 +29,8 @@ const MCM_FIXTURE: &str = "tests/fixtures/mcm_references.sqlite3";
 
 const CROSS_BRAND_GROUP: &str = "group.com.othervendor.crossbrand";
 const VENDOR_GROUP: &str = "group.com.example.shared";
+/// Entitled to the app's extension `com.example.full.Widget` only.
+const WIDGET_GROUP: &str = "group.com.example.widgetonly";
 
 /// Write a container's metadata plist: the identifier, and optionally the
 /// authoritative parent-app link that only extension containers carry.
@@ -86,6 +88,7 @@ fn build_ffs(with_mcm_db: bool) -> TempDir {
     );
     write_metadata(&shared.join("DDDD4444-0000"), VENDOR_GROUP, None);
     write_metadata(&shared.join("EEEE5555-0000"), CROSS_BRAND_GROUP, None);
+    write_metadata(&shared.join("FFFF6666-0000"), WIDGET_GROUP, None);
 
     if with_mcm_db {
         let mcm = root.join("mobile/Library/MobileContainerManager");
@@ -114,9 +117,10 @@ fn groups_for(tmp: &TempDir, id: &str) -> Vec<(String, &'static str)> {
     out
 }
 
-/// With the MCM database present, both declared groups are attributed and tagged
-/// as coming from it — including the cross-brand group whose name shares no token
-/// with the app, which is precisely what the heuristic cannot find.
+/// With the MCM database present, the declared groups are attributed and tagged as
+/// coming from it — including the cross-brand group whose name shares no token with
+/// the app, which is precisely what the heuristic cannot find, and the group only
+/// the app's extension (`child_bundles`) is entitled to.
 #[test]
 fn app_groups_come_from_container_manager_when_available() {
     let tmp = build_ffs(true);
@@ -124,6 +128,7 @@ fn app_groups_come_from_container_manager_when_available() {
         groups_for(&tmp, "com.example.full"),
         vec![
             (VENDOR_GROUP.to_string(), "ContainerManager"),
+            (WIDGET_GROUP.to_string(), "ContainerManager"),
             (CROSS_BRAND_GROUP.to_string(), "ContainerManager"),
         ]
     );
@@ -137,7 +142,10 @@ fn without_the_database_the_vendor_heuristic_still_runs() {
     let tmp = build_ffs(false);
     assert_eq!(
         groups_for(&tmp, "com.example.full"),
-        vec![(VENDOR_GROUP.to_string(), "VendorHeuristic")]
+        vec![
+            (VENDOR_GROUP.to_string(), "VendorHeuristic"),
+            (WIDGET_GROUP.to_string(), "VendorHeuristic"),
+        ]
     );
 }
 
@@ -181,4 +189,40 @@ fn wal_replay_is_reported_only_when_it_happens() {
         let source = FolderSource::open(tmp.path(), 0).unwrap();
         assert!(!AppCatalog::build(&source).mcm_wal_replayed());
     }
+}
+
+/// `--app` (grep, find, diff) limits a search to exactly what `app paths` lists: the
+/// scope is those containers' prefixes, and an id with no container is named.
+#[test]
+fn app_scope_is_the_app_paths_footprint() {
+    let tmp = build_ffs(true);
+    let source = FolderSource::open(tmp.path(), 0).unwrap();
+    let catalog = AppCatalog::build(&source);
+    let ids = [
+        "com.example.full".to_string(),
+        "org.nowhere.absent".to_string(),
+    ];
+    let scope = catalog.scope(&ids);
+    let mut expected: Vec<String> = catalog
+        .containers_for("com.example.full", true)
+        .into_iter()
+        .map(|c| c.prefix)
+        .collect();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(scope.prefixes, expected);
+    assert!(
+        scope.prefixes.len() >= 3,
+        "data and both groups: {:?}",
+        scope.prefixes
+    );
+    assert_eq!(scope.missing, ["org.nowhere.absent"]);
+
+    // No container of its own, but entitlements on record (an Apple system app, an
+    // extension without a data container): its recorded groups are its scope.
+    let entitled = catalog.scope(&["com.example.full.Widget".to_string()]);
+    assert!(entitled.missing.is_empty());
+    assert_eq!(entitled.apps[0].containers.len(), 1);
+    assert_eq!(entitled.apps[0].containers[0].id, WIDGET_GROUP);
+    assert!(entitled.apps[0].only_groups());
 }

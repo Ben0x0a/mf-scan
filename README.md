@@ -64,7 +64,7 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 - **Find a term in every encoding at once** (`--all-encodings`: UTF-8, UTF-16, JSON
   escapes, URL encoding, Java's CESU-8, both Unicode forms, base64), **decrypt app databases** (`--keyfile`,
   or a dump found beside the source). `--export` writes each decrypted database beside
-  its original, and `mf-scan decrypt --to OUT.zip` writes the whole acquisition with
+  its original in the export zip, and `mf-scan decrypt --to OUT.zip` writes the whole acquisition with
   the decrypted copies added. See [Decryption](#decryption).
 - **Transparent coverage**: every run logs what it skipped and why, prints a
   scanned/skipped summary, and writes a scan-report sidecar.
@@ -148,7 +148,7 @@ with worked examples:
 |---|---|
 | `grep PATTERN [SOURCE]...` | Search archives, files, folders, backups or standard input; print/record matches; optionally export files. |
 | `find SOURCE... [tests]` | List files by name, path, size, date and type; optionally export them. |
-| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep`, `find` or `diff`) and copy the listed files out (no search). |
+| `export ARCHIVE --from-manifest FILE --to DIR` | Re-ingest a manifest (from `grep`, `find` or `diff`) and export the listed files into a zip in `DIR` (no search). |
 | `diff A B` | Compare two sources (archives or folders): report added / removed / modified files, optionally what changed inside them, and optionally export the changed files. |
 | `app {grep\|paths\|export}` | Locate and export an application's data (iOS FFS / iOS backup / Android) — by bundle id / package, including widgets/extensions and App Groups. |
 | `backup {info\|rebuild}` | Inspect an iOS or Android backup, or rebuild it into one `.zip` of the device's directory tree. |
@@ -224,13 +224,14 @@ With more than one source, each result is tagged with its origin (see
 | `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
 | `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
 | `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.ab`), each its own source. Skipped loose files are counted and reported. |
-| `--path GLOB` | Only handle files whose internal path matches the wildcard. Repeatable. |
+| `--path GLOB` | Only handle files whose whole internal path matches the wildcard: `*` any run of characters, `/` included; `?` one byte; case-sensitive. Repeatable. |
+| `--app ID` | Only this app's data: its data container, extensions and widgets, bundle and App Groups (as `app paths` lists them), on an iOS file system, an iOS backup or Android. App Groups come from the entitlements of the app and its extensions where the iOS file system records them, else by name (a guess, named in the output). On Android: every user (`/data/user/<n>`) and every mount alias a capture holds (`/data_mirror`, `/mnt/…`), also below an extraction folder (`Dump/`). What each id resolved to is printed; an id with no data is reported and adds nothing. Apple apps also keep data outside their containers (Messages in `Library/SMS`): use `--path` for it. Repeatable; combines with `--path`. |
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |
 | `-t`, `--type TYPE` | Only handle files of a format (`sqlite`, `jpeg`, …) or category (`media`, `database`, `structured`, `text`). Header-first, then extension. Repeatable. |
 | `--match-path` | Match the PATTERN against each file's internal path instead of its content. |
 | `--and-paths` | Match the PATTERN against contents **and** paths in one pass (grep + find). A path hit prints as the bare path (JSON/CSV: `path_match: true`); a file can have both. |
 | `--encoding <ENC>` | Also search the literal in another encoding (repeatable): `utf16le`, `utf16be`, `utf16` (both), `json` (`\u00e9`, `\ud83d\ude02`), `url` (`%C3%A9`, space as `+`), `cesu8` (Java's modified UTF-8: an emoji as two surrogates), `nfd` (the other Unicode normal form: `é` as one character or `e` + accent), `base64`, `base64url` (any alignment), or `all`. An encoding whose form of the literal is its plain form is skipped. Requires `-F`; not with `--match-path` or `-w`. `-i` covers every encoding but base64. |
-| `--utf16` / `--all-encodings` | Shorthands for `--encoding utf16` / `--encoding all`: every encoding above in one pass. |
+| `--all-encodings` | Shorthand for `--encoding all`: every encoding above in one pass. |
 | `--exclude-media` | Skip image/video/audio files (searched by default). |
 | `--fast` | Speed preset: exclude media + a customisable exclude list. |
 | `--inspect` | Resolve matches inside recognised formats (see [Inspection](#deep-inspection)). |
@@ -240,10 +241,8 @@ With more than one source, each result is tagged with its origin (see
 | `--output FILE` | Write results to a file instead of stdout. |
 | `--colour[=auto\|always\|never]` | Highlight matches (txt to a terminal). `--color` also accepted. |
 | `-j`, `--threads N` | Search threads (default: one per CPU core). |
-| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest / also copy matched files out, **read-only**. `--export` writes `DIR/export-report.json` (run metadata + per-file integrity, see [Export integrity](#export-integrity)). |
-| `--work-copy` | With `--export`, also write `DIR.work/`: the same files, writable, each checked identical. |
+| `--manifest FILE` / `--export DIR` | Write a re-ingestable manifest (a new file: an existing one is never replaced) / also export the matched files as **one zip** in `DIR`: `mf-scan-<UTC time>-export-<pattern>.zip`, read-only, with `export-report.json` inside (run metadata + per-file integrity) and a `.sha256` sidecar beside it. See [Export integrity](#export-integrity). |
 | `--max-size SIZE` | Refuse to export if the matched total exceeds SIZE (e.g. `200MB`, `1G`). Default `1G`. |
-| `--max-path-len N` | Path-length guard for the export (default `260`, Windows `MAX_PATH`). On Windows an over-limit path is skipped+recorded; elsewhere it is exported but flagged non-portable. `0` disables. See [`app`](#app). |
 | `--verify` | SHA-256 the archive before and after the run; report whether it changed (archive sources only). |
 | `--io-mode auto\|mmap\|ranged` | How to read an archive: `auto` (default) memory-maps a local archive but uses **positioned reads** for a remote SMB/NFS source; `ranged` forces positioned reads, `mmap` forces mapping. See [Remote / network sources](#remote--network-sources). |
 | `--report FILE` / `--no-report` | Where to write / suppress the scan-report sidecar. Default: a new timestamped file on every run, beside `--output`, else `mf-scan-report-<UTC time>.json` in the current directory. |
@@ -287,13 +286,14 @@ mf-scan find case.zip -name '*.db'
 mf-scan find case.zip --iname 'sms*' --type f --long
 mf-scan find case.zip --type sqlite --size +1M --not-path '*/Caches/*'
 mf-scan find ./extracted --newer 2026-01-01 --older 2026-02-01
-mf-scan find case.zip --path '*com.whatsapp*' --export ./out --max-size 5G
+mf-scan find case.zip --app com.whatsapp --export ./out --max-size 5G
 ```
 
 | Test | Meaning |
 |---|---|
 | `--name GLOB` / `--iname GLOB` | The file name matches this wildcard (`*`, `?`); `i` ignores case. |
-| `--path GLOB` / `--ipath GLOB` | The whole path matches, where `*` also crosses `/`. A pattern naming an iOS bundle identifier also matches that app's GUID-named container. |
+| `--path GLOB` / `--ipath GLOB` | The whole path matches, where `*` also crosses `/`. |
+| `--app ID` | Only this app's containers, as for `grep`. |
 | `--regex RE` / `--iregex RE` | The whole path matches this regex, anchored at both ends as in `find`. |
 | `--not-name GLOB` / `--not-path GLOB` | The file name or path does not match. |
 | `--type TYPE` | `f`, `d`, or a detected format or category (`sqlite`, `media`, ...). Only a format reads a file, and then only its header. |
@@ -316,12 +316,12 @@ is no summary and no scan report. It exits `0` with or without results, as `find
 ### `export`
 
 ```
-mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE] [--max-path-len N]
+mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE]
 ```
 
-Re-ingests a manifest written by `grep`, `find` or `diff --manifest` and copies
-the listed files out of the archive — **without searching again**. Honours
-`--max-size` and the `--max-path-len` guard (see [`app`](#app)).
+Re-ingests a manifest written by `grep`, `find` or `diff --manifest` and exports
+the listed files into a zip in `DIR`, named after the manifest — **without searching
+again**. Honours `--max-size`.
 
 > **Vocabulary:** *export* = copy files out; *extract* is reserved for extracting
 > *meaning* (the `--inspect` analysis).
@@ -341,6 +341,7 @@ may be an archive or a `--dir-mode` directory.
 | `--exact` | Compare file **content** with SHA-256 instead of the default mtime+size check (catches edits that preserve the timestamp). |
 | `--inspect` | For a modified file of a recognised format, also report **what changed inside** it (SQLite table row-counts, plist/JSON key paths, text line counts). |
 | `--path` / `--not-path` | Restrict which files are compared. |
+| `--app ID` | Compare only the app's containers, on either side (a reinstall shows its old files removed and its new ones added). |
 | `--manifest FILE` / `--export DIR` | Write a manifest of / export the added+modified files from side B, through the same pipeline as `grep` — so `mf-scan export` can re-ingest a diff. |
 | `--archive-depth N` / `--dir-mode` | As for `grep`, applied to each side. |
 | `-f`, `--format` / `--output FILE` | Output format / sink. |
@@ -359,7 +360,7 @@ its extension/**widget** containers, and its shared **App Groups**.
 ```
 mf-scan app list   [PATTERN] SOURCE [options]     # the installed-app inventory
 mf-scan app paths  BUNDLE_ID SOURCE [options]     # list every data location of one app
-mf-scan app export BUNDLE_ID SOURCE --to DIR [options]   # copy one app's data out
+mf-scan app export BUNDLE_ID SOURCE --to DIR [options]   # one app's data, as a zip
 ```
 
 > As with `grep`, the app comes first and the **SOURCE last**. Open a directory
@@ -368,20 +369,19 @@ mf-scan app export BUNDLE_ID SOURCE --to DIR [options]   # copy one app's data o
 
 | Verb | What it does |
 |---|---|
-| `list` | Lists one line per installed app: bundle id, display name, size of its own data container, signing team (extensions and groups: see `paths`). An optional `PATTERN` filters by a substring of the id/name. `--format json` adds the full signing record (team, signer identity/organisation, App Groups, keychain groups). |
+| `list` | Lists one line per app with a container of its own: bundle id, display name, size of its own data container (`-` when it has none here, e.g. Photos, whose data is in `Media/`), signing team (extensions and groups: see `paths`). An optional `PATTERN` filters by a substring of the id/name. `--format json` adds the full signing record (team, signer identity/organisation, App Groups, keychain groups). |
 | `paths` | Lists every container the app or its dependencies can write to, tagged by kind (`AppData` / `Extension` / `AppGroup` / `Bundle`, or the Android storage root) and — for groups — by how it was attributed (`ContainerManager` vs `VendorHeuristic`). |
-| `export` | Copies all of the app's data out, **one subfolder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain), and writes `export-report.json` with per-file integrity. Excludes the `.app` bundle (binary, not data). |
+| `export` | Exports all of the app's data as one zip in `DIR` (`mf-scan-<UTC time>-export-<id>.zip`), **one folder per container** with the on-device tree preserved (`<id>/<Kind>_<guid>/…`, groups under their own id, a backup under its domain, an Android container under its kind and user: `<pkg>/data_u10/…`, a mount alias tagged `data_u0~mirror`, so two users or two copies never merge), with `export-report.json` (per-file integrity) inside. Excludes the `.app` bundle (binary, not data). |
 
 Common `app` flags: `--dir-mode`, `--archive-depth N`, `--io-mode`,
 `--backup-password`, `-f/--format txt|json`, `--output FILE`; for `paths`/`export`
-also `--no-groups`; for `export` also `--to DIR`, `--max-size SIZE`,
-`--max-path-len N`, `--verify`.
+also `--no-groups`; for `export` also `--to DIR`, `--max-size SIZE`, `--verify`.
 
 **App Group attribution.** On an iOS full-file-system extraction, an app's App
 Groups are read **authoritatively** from the entitlements iOS itself recorded when
 it provisioned the app's containers, in
 `/private/var/mobile/Library/MobileContainerManager/references.sqlite3`
-(`com.apple.security.application-groups`). A cross-brand shared group — e.g.
+(`com.apple.security.application-groups`), the app's own and its extensions' (a widget may be entitled to a group the app is not). A cross-brand shared group — e.g.
 `group.com.facebook.family` used by Instagram — is therefore found even though its
 name shares no token with the app, and an app that was provisioned with **no** App
 Groups is reported as having none rather than being guessed at. Such inclusions are
@@ -408,13 +408,14 @@ Two details worth knowing when reconciling against another tool:
   `com.apple.siri.SiriGeo` are separate apps, and only the latter owns
   `com.apple.siri.SiriGeo.SiriGeoIntentExtension`.
 
-**Path-length guard (`--max-path-len`, default 260).** Deep on-device trees can
-produce paths longer than Windows' `MAX_PATH`. On Windows an over-limit path cannot
-be written, so the file is **skipped and recorded** (`skipped_too_long` in the
-report). On macOS/Linux the file **is** exported, but if its path is too long to
-survive a move to Windows it is flagged as a **portability warning**
-(`portability_warnings`). `--max-path-len 0` disables the guard. The same flag
-applies to `grep`/`diff` `--export` and to the `export` subcommand.
+**Why a zip.** Deep on-device trees produce paths longer than Windows' 260-character
+`MAX_PATH`, which a folder on disk cannot hold for tools that do not handle long
+paths. Inside a zip a path is only a member name, so **every file is exported, under
+its exact name, on every platform**; the zip is written member by member, never as a
+folder zipped afterwards. A member whose path would be too long to extract on Windows
+is still exported, and listed as a **portability warning** (`portability_warnings` in
+the report, and on stderr). The same applies to `grep`/`find`/`diff --export` and to
+the `export` subcommand.
 
 ---
 
@@ -574,22 +575,24 @@ for an encrypted backup, of the *file content* for an unencrypted one (see
 
 ## Export integrity
 
-Every exported file is **read-only**, and an export **never overwrites** a file: if a
-name is taken (an earlier export's file, or a name the file system treats as the same,
-such as `Été.jpg` / `été.jpg`, or `é` stored composed / decomposed on macOS), the file is
-written as `name~1` and listed under `renamed` in the report. Name clashes the export
-can foresee are renamed the same way before anything is written, so the result does
-not depend on the host. `--work-copy` adds `DIR.work/`, an identical, writable copy for
-tools that open databases read-write. `backup rebuild` and `decrypt --to` archives and
-their `.sha256` sidecars are read-only too.
+An export is **one zip**, STORED (uncompressed, so `mf-scan` reads it back zero-copy
+and any carving tool sees the original bytes), each member keeping its file's
+modification time. The zip and its `.sha256` sidecar are **read-only**, and an export
+**never replaces** an earlier one: each is named after its UTC time (`-2`, `-3`, … when
+two land in the same second). It is written under a temporary name, read back with
+mf-scan's own reader and only then moved into place, so a failed run leaves nothing
+that looks finished. Two names that would be one file once extracted on Windows or
+macOS (`Été.jpg` / `été.jpg`, or `é` composed / decomposed) never merge: the second is
+written as `name~1` and listed under `renamed` in the report. `backup rebuild` and
+`decrypt --to` archives are written the same way.
 
-`--export` writes `DIR/export-report.json` with an `integrity` summary and, per file,
+The zip holds `export-report.json` with an `integrity` summary and, per file,
 **two independent SHA-256 hashes** plus any source-recorded digest check:
 
 | Field | Meaning |
 |---|---|
 | `source_sha256` | SHA-256 of the bytes read **out of the source**. |
-| `sha256` | SHA-256 of the bytes **read back from the written file** on disk. |
+| `sha256` | SHA-256 of the bytes **read back from the zip** once written. |
 | `copy_verified` | `true` when the two match — catches a **silent copy error** (a bad/truncated write). |
 | `stored_integrity` | The source's own digest check, when it records one (see below): `verified`, `mismatch`, or `unrecorded`. |
 
@@ -668,10 +671,15 @@ no-single-archive-byte cases; CRC-32 export integrity still applies.
   mf-scan never writes to it. Loose files are read read-only. `--verify` adds a SHA-256
   attestation (mmap archive sources only); the hash matches the system `shasum -a 256`.
 - Offsets are **byte-accurate** for STORED entries (verifiable with `dd`/a hex editor).
-- On `--export`, every copied file is **hashed at the source and re-hashed off disk** and
+- On `--export`, every exported file is **hashed at the source and re-hashed from the zip** and
   the two are compared (silent-copy-error check); ZIP entries are additionally checked
   against their central-directory CRC-32 and encrypted-backup files against their
   `Manifest.db` SHA-1. See [Export integrity](#export-integrity).
+- **Every result says what it may leave out**: grep, find (at a terminal), diff and
+  the `app` commands end with a `note: …; when in doubt, check by hand` line. mf-scan
+  guides an examination; it does not close it. Other matches (formats, encodings or
+  compression it does not read, encrypted data), files, changes, apps or containers
+  may exist beyond what it reports.
 - Search is case-sensitive unless `-i`; `--path`/`--not-path` matching is case-sensitive.
 - **All files are searched by default**, including media — completeness is the forensic
   default, so nothing is silently skipped. `--exclude-media` (or `--fast`) skips

@@ -23,7 +23,7 @@ pub(crate) struct ExportArgs {
     #[arg(long = "from-manifest", value_name = "FILE")]
     pub(crate) from_manifest: PathBuf,
 
-    /// Destination directory.
+    /// Folder for the export zip (created if needed).
     #[arg(long = "to", value_name = "DIR")]
     pub(crate) to: PathBuf,
 
@@ -31,15 +31,7 @@ pub(crate) struct ExportArgs {
     #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
 
-    /// Skip and record longer paths (default 260, Windows); 0 is off.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
-    pub(crate) max_path_len: usize,
-
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
-
-    /// Also write DIR.work/: a writable copy of the read-only export.
-    #[arg(long = "work-copy")]
-    pub(crate) work_copy: bool,
 }

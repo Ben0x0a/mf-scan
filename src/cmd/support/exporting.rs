@@ -1,30 +1,35 @@
-//! Export-during-search machinery: write a manifest and/or export matched files.
+//! Export machinery shared by the commands: write a manifest and/or an export archive,
+//! name the archive, and announce what was written.
 //!
 //! Defines: [`run_export_sink`] (the one manifest/export/status pipeline),
-//! [`export_if_requested`] (the search-time wrapper over it), and
-//! [`write_export_report_file`] (the per-export SHA-256 integrity report),
-//! [`report_export_notes`] and [`work_copy_if_requested`].
+//! [`export_if_requested`] (the search-time wrapper over it), [`export_subject`] and
+//! [`export_archive_path`] (what an export is named, where it goes), and
+//! [`report_outcome`] (what it says on stderr).
 //! Used by: `run::grep` (`export_if_requested`), `run::diff`/`run::find`
-//! (`run_export_sink`), and `run::export`/`run::app` (the report, notes, work copy).
+//! (`run_export_sink`), and `run::export`/`run::app` (the naming and the outcome).
 //! Uses: `mf_scan::report::export` (the library export engine) and `crate::cmd::cli`.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
+use mf_scan::core::util::{UtcTime, now_unix};
 use mf_scan::decrypt::DecryptionContext;
 use mf_scan::ops::decrypting::{DerivedCopy, SourceDecryptor};
 use mf_scan::ops::search::{Findings, MatchedFile};
 use mf_scan::report::export::{
-    self, ExportNotes, ExportOutcome, ExportedFile, IntegritySummary, Renamed, SkippedFile,
+    self, ExportArchive, ExportOutcome, ExportedFile, FileNote, IntegritySummary, Renamed,
     StoredIntegrity,
 };
 
 use crate::cmd::cli::ExportSink;
+
+/// The longest subject kept in an archive's name, in characters.
+const SUBJECT_LEN: usize = 40;
 
 /// Write a manifest and/or export matched files, if requested.
 ///
@@ -36,16 +41,25 @@ pub(crate) fn export_if_requested(
     run: &RunInfo,
     decrypt: Option<&DecryptionContext>,
 ) -> Result<()> {
-    run_export_sink(sink, source, &findings.files, run, "matched", decrypt)
+    run_export_sink(
+        sink,
+        source,
+        &findings.files,
+        run,
+        "matched",
+        &run.pattern,
+        decrypt,
+    )
 }
 
 /// Honour an export sink (`--manifest`/`--export`) for a list of files.
 ///
-/// The single pipeline behind both `grep` (matched files) and `diff` (changed
-/// files): write the manifest, copy the files (honouring the size cap), write
-/// the export report, and announce each step on stderr. `what` qualifies the
-/// files in the status lines ("matched" / "changed") so the cap/refusal
-/// behaviour can evolve in one place without the wordings drifting.
+/// The single pipeline behind `grep` (matched files), `find` (found files) and
+/// `diff` (changed files): write the manifest, write the archive into the
+/// `--export` folder (honouring the size cap), and announce each step on stderr.
+/// `what` qualifies the files in the status lines ("matched" / "changed"), and the
+/// archive is named by [`export_subject`] (`fallback`: when the run has no app or
+/// patterns).
 ///
 /// With `decrypt`, each exported database that decrypts also gets its decrypted copy
 /// written beside it (`name.decrypted.ext`).
@@ -55,6 +69,7 @@ pub(crate) fn run_export_sink(
     files: &[MatchedFile],
     run: &RunInfo,
     what: &str,
+    fallback: &str,
     decrypt: Option<&DecryptionContext>,
 ) -> Result<()> {
     if sink.manifest.is_none() && sink.export.is_none() {
@@ -64,8 +79,17 @@ pub(crate) fn run_export_sink(
     let plan = export::plan(files);
 
     if let Some(path) = &sink.manifest {
-        let file =
-            File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+        // Never over an earlier manifest: it may be the record an export was made from.
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "cannot create {} (an existing manifest is never replaced)",
+                    path.display()
+                )
+            })?;
         let mut w = BufWriter::new(file);
         export::write_manifest(&plan, run, &mut w)?;
         w.flush().context("failed flushing manifest")?;
@@ -79,45 +103,133 @@ pub(crate) fn run_export_sink(
 
     if let Some(dir) = &sink.export {
         let decryptor = decrypt.map(|ctx| SourceDecryptor::new(ctx, source));
-        match export::export_files(
+        let archive = export_archive_path(dir, &export_subject(run, fallback))?;
+        let outcome = export::export_files(
             &plan,
             source,
             files,
-            dir,
+            &archive,
+            run,
             Some(sink.max_size),
-            sink.max_path_len,
             decryptor.as_ref().map(|d| d as &dyn DerivedCopy),
-        )? {
-            ExportOutcome::Exported {
-                files: n,
-                bytes,
-                report,
-                notes,
-                ..
-            } => {
-                write_export_report_file(dir, run, &report, &notes)?;
-                eprintln!(
-                    "exported {n} {what} file(s) ({bytes} bytes, read-only) to {}",
-                    dir.display()
-                );
-                report_export_notes(&report, &notes);
-                work_copy_if_requested(sink.work_copy, dir)?;
-            }
-            ExportOutcome::Refused { total_size, cap } => {
-                eprintln!(
-                    "refusing to export: {what} total {total_size} bytes exceeds --max-size {cap}; \
-                     nothing written (use the manifest to review)"
-                );
-            }
-        }
+        )?;
+        report_outcome(&outcome, what);
     }
 
     Ok(())
 }
 
+/// What an export archive is named after: the run's apps (`--app`, `app export`),
+/// else its search patterns, else `fallback`.
+///
+/// WHY one rule: exports of one app accumulate in one case folder; named by the app
+/// whichever command made them, they sort together.
+pub(crate) fn export_subject(run: &RunInfo, fallback: &str) -> String {
+    if let Some(app) = &run.app {
+        return app.replace(", ", "+");
+    }
+    if !run.patterns.is_empty() {
+        return run.patterns.join("+");
+    }
+    fallback.to_string()
+}
+
+/// Announce an export's outcome on stderr: the archive written and all it has to
+/// report, or why nothing was written. The same lines for every command.
+pub(crate) fn report_outcome(outcome: &ExportOutcome, what: &str) {
+    match outcome {
+        ExportOutcome::Exported(done) => {
+            let missing = if done.skipped > 0 {
+                format!("; {} listed file(s) not found in the source", done.skipped)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "exported {} {what} file(s) ({} bytes) -> {}{missing}",
+                done.files,
+                done.bytes,
+                done.archive.display()
+            );
+            report_export(done);
+        }
+        ExportOutcome::Refused { total_size, cap } => eprintln!(
+            "refusing to export: {what} files, {total_size} bytes or more (with sidecars), \
+             exceed --max-size {cap}; nothing written"
+        ),
+    }
+}
+
+/// Where a new export archive goes: `DIR/mf-scan-<UTC stamp>-export-<subject>.zip`,
+/// with `-2`, `-3`, … after the stamp when that name is taken. `DIR` is created.
+///
+/// WHY the stamp and subject: exports of one case accumulate in one folder, and each
+/// must say when it was made and what for without opening it. The subject is the app
+/// id or the search, cut to its file-name-safe characters.
+pub(crate) fn export_archive_path(dir: &Path, subject: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let stamp = UtcTime::from_unix(now_unix()).compact();
+    let subject = safe_subject(subject);
+    for attempt in 1u32.. {
+        let stamp = if attempt > 1 {
+            format!("{stamp}-{attempt}")
+        } else {
+            stamp.clone()
+        };
+        let name = if subject.is_empty() {
+            format!("mf-scan-{stamp}-export.zip")
+        } else {
+            format!("mf-scan-{stamp}-export-{subject}.zip")
+        };
+        // A name is taken by its archive or by its sidecar alone (an archive moved
+        // away): the export claims both, so it would be refused at the start.
+        let sidecar = dir.join(format!("{name}.sha256"));
+        let path = dir.join(name);
+        if !path.exists() && !sidecar.exists() {
+            return Ok(path);
+        }
+    }
+    unreachable!("the attempt counter is unbounded, so the loop only exits by returning")
+}
+
+/// `subject` cut to letters, digits, `.`, `-` and `_` (anything else becomes one `_`),
+/// trimmed of separators at either end, at most [`SUBJECT_LEN`] characters.
+fn safe_subject(subject: &str) -> String {
+    let mut out = String::new();
+    for c in subject.chars() {
+        let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+            c
+        } else {
+            '_'
+        };
+        if !(c == '_' && out.ends_with('_')) {
+            out.push(c);
+        }
+    }
+    let cut: String = out
+        .trim_matches(['_', '.', '-'])
+        .chars()
+        .take(SUBJECT_LEN)
+        .collect();
+    cut.trim_end_matches(['_', '.', '-']).to_string()
+}
+
+/// Announce what a finished export has to report: the archive's hash, decrypted
+/// copies, integrity, and the files renamed or too long to extract on Windows.
+fn report_export(done: &ExportArchive) {
+    eprintln!(
+        "sha256 {} -> {} (export-report.json inside)",
+        done.archive_sha256,
+        done.sidecar.display()
+    );
+    report_decrypted_copies(&done.report, &done.notes.undecrypted);
+    report_integrity(&done.report);
+    report_portability_warnings(&done.notes.portability_warnings);
+    report_renamed(&done.notes.renamed);
+}
+
 /// Announce the decrypted copies an export wrote beside their originals, and loudly
 /// the databases that should have had one but did not decrypt.
-fn report_decrypted_copies(report: &[ExportedFile], undecrypted: &[SkippedFile]) {
+fn report_decrypted_copies(report: &[ExportedFile], undecrypted: &[FileNote]) {
     let copies: Vec<&ExportedFile> = report.iter().filter(|f| f.derived.is_some()).collect();
     if !copies.is_empty() {
         eprintln!(
@@ -186,41 +298,14 @@ pub(crate) fn report_integrity(report: &[ExportedFile]) {
     }
 }
 
-/// Announce, loudly, any files that were not written because their destination
-/// path exceeded the length guard — one line per file, so a portability problem
-/// (typically Windows `MAX_PATH`) cannot pass unnoticed. The files are also listed
-/// in `export-report.json`.
-fn report_skipped_too_long(skipped: &[SkippedFile]) {
-    if skipped.is_empty() {
-        return;
-    }
-    eprintln!(
-        "⚠ {} file(s) NOT exported — destination path too long (raise --max-path-len, or export to a shorter directory):",
-        skipped.len()
-    );
-    for f in skipped {
-        eprintln!("  ⚠ skipped: {} ({})", f.internal_path, f.reason);
-    }
-}
-
-/// Announce everything an export has to report besides its files: decrypted copies,
-/// integrity, and the files skipped, renamed or not portable.
-pub(crate) fn report_export_notes(report: &[ExportedFile], notes: &ExportNotes) {
-    report_decrypted_copies(report, &notes.undecrypted);
-    report_integrity(report);
-    report_skipped_too_long(&notes.skipped_too_long);
-    report_portability_warnings(&notes.portability_warnings);
-    report_renamed_on_disk(&notes.renamed);
-}
-
-/// Announce files written under another name because theirs was taken on disk.
-fn report_renamed_on_disk(renamed: &[Renamed]) {
+/// Announce files written under another name because theirs was taken in the archive.
+fn report_renamed(renamed: &[Renamed]) {
     if renamed.is_empty() {
         return;
     }
     eprintln!(
-        "⚠ {} file(s) written under another name, never over an existing file \
-         (a file this file system treats as the same name, or one already in the folder):",
+        "⚠ {} file(s) written under another name: a name differing only in case or \
+         accent form would be the same file once extracted on Windows or macOS:",
         renamed.len()
     );
     for r in renamed {
@@ -228,34 +313,20 @@ fn report_renamed_on_disk(renamed: &[Renamed]) {
     }
 }
 
-/// With `--work-copy`, copy the finished export to `<dir>.work/`, writable.
-pub(crate) fn work_copy_if_requested(wanted: bool, dir: &Path) -> Result<()> {
-    if !wanted {
-        return Ok(());
-    }
-    let copy = export::work_copy(dir)?;
-    eprintln!(
-        "work copy: {} file(s), writable, each checked identical -> {}",
-        copy.files,
-        copy.path.display()
-    );
-    Ok(())
-}
-
-/// Announce files that were exported but whose path is too long to survive a move
-/// to Windows — a warning (the files ARE on disk here), so an analyst who will hand
-/// the export to a Windows examiner knows which files would be unreachable there.
-fn report_portability_warnings(warnings: &[SkippedFile]) {
+/// Announce files whose name in the archive is too long to extract on Windows — all
+/// exported, so an analyst who hands the archive to a Windows examiner knows which
+/// files need a long-path-aware extractor.
+fn report_portability_warnings(warnings: &[FileNote]) {
     if warnings.is_empty() {
         return;
     }
     eprintln!(
-        "⚠ {} file(s) exported but NOT Windows-portable (path too long for MAX_PATH); \
-         they are present here but would be unreachable on Windows:",
+        "⚠ {} file(s) in the archive have a path too long to extract on Windows \
+         (all exported; listed in the report):",
         warnings.len()
     );
     for f in warnings {
-        eprintln!("  ⚠ not portable: {} ({})", f.internal_path, f.reason);
+        eprintln!("    {} ({})", f.output_path, f.reason);
     }
 }
 
@@ -275,24 +346,27 @@ fn stored_algorithms(report: &[ExportedFile]) -> String {
     algos.join(", ")
 }
 
-/// Write `export-report.json` (run metadata + per-file SHA-256) into the export
-/// destination directory, beside the exported artefacts.
-pub(crate) fn write_export_report_file(
-    dir: &Path,
-    run: &RunInfo,
-    report: &[export::ExportedFile],
-    notes: &ExportNotes,
-) -> Result<()> {
-    // Like the files it describes, the report is read-only and never replaces an
-    // earlier one in the same folder.
-    let mut bytes = Vec::new();
-    export::write_export_report(run, report, notes, &mut bytes)?;
-    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = export::write_read_only(&dir.join("export-report.json"), &bytes)?;
-    eprintln!(
-        "export report: {} files -> {}",
-        report.len(),
-        path.display()
-    );
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subjects_keep_only_file_name_safe_characters() {
+        assert_eq!(safe_subject("com.whatsapp"), "com.whatsapp");
+        assert_eq!(safe_subject("+41 79 123/45*"), "41_79_123_45");
+        assert_eq!(safe_subject("café"), "caf");
+        assert_eq!(safe_subject("***"), "");
+        assert_eq!(safe_subject(&"a".repeat(80)).len(), SUBJECT_LEN);
+    }
+
+    #[test]
+    fn archive_names_never_take_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = export_archive_path(dir.path(), "com.x").unwrap();
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("mf-scan-") && name.ends_with("-export-com.x.zip"));
+        std::fs::write(&first, b"").unwrap();
+        let second = export_archive_path(dir.path(), "com.x").unwrap();
+        assert_ne!(first, second);
+    }
 }

@@ -126,7 +126,7 @@ mf-scan export acquisition.zip --from-manifest hits.json --to ./exported --max-s
   path, its assigned output path, size, compressed flag, and match offsets, plus
   a precomputed `total_size`.
 - `export` does **not** search again — it locates each listed file by path and
-  copies it out, reusing the recorded output path.
+  exports it into a zip, reusing the recorded output path as its member name.
 - `--max-size` makes `export` (and inline `--export`) **refuse** if the total
   exceeds the cap (it writes nothing), so you never accidentally explode a
   hundred gigabytes onto disk.
@@ -157,10 +157,12 @@ single source.
 
 ## 7. Output layout of exported files
 
-Each matched file is written to:
+The export is one zip in `DIR` (`mf-scan-<UTC time>-export-<pattern>.zip`), with
+`export-report.json` inside and a `.sha256` sidecar beside it. Inside, each matched file
+is the member:
 
 ```
-DIR/<basename>_<hash>/<basename>
+<basename>_<hash>/<basename>
 ```
 
 - The file **keeps its real name** inside the folder, so extensions and
@@ -174,9 +176,10 @@ DIR/<basename>_<hash>/<basename>
 Example:
 
 ```
-exported/
+exported/mf-scan-20261120T102502Z-export-private_key.zip
   sms.db_a3f2c1d0e5/sms.db
   Info.plist_7b1c9e4f02/Info.plist
+  export-report.json
 ```
 
 When a matched file is a SQLite database, its **sidecars** (`-wal`, `-shm`,

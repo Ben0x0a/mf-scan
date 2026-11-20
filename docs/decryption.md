@@ -243,7 +243,7 @@ Every decryption attempt is recorded:
 
 | Want | Command | Output |
 |---|---|---|
-| decrypted copies in a folder | `find`, `grep` or `app export` with `--export DIR` | each original, its `-wal`/`-shm`, and `name.decrypted.ext` beside it |
+| decrypted copies of the files selected | `find` or `grep` with `--export DIR`, or `app export --to DIR` | one zip in `DIR`: each original, its `-wal`/`-shm`, and `name.decrypted.ext` beside it |
 | the whole acquisition with decrypted copies | `mf-scan decrypt SOURCE --to OUT.zip` | one `.zip` and its `.sha256` sidecar |
 | only a list of what decrypts | `mf-scan decrypt SOURCE` | nothing written |
 

@@ -2,8 +2,9 @@
 //!
 //! Defines: [`ZipWriter`] (add files and directories, read a member back, finish), and
 //! [`ZipWriter::extend`] (an existing archive, kept verbatim, plus new members).
-//! Used by: `report::rebuild_zip` (the one archive a backup rebuild writes) and
-//! `report::decrypted_zip` (an acquisition with decrypted databases added).
+//! Used by: `report::export` (every export), `report::rebuild_zip` (the one archive a
+//! backup rebuild writes) and `report::decrypted_zip` (an acquisition with decrypted
+//! databases added).
 //! Uses: `crc32fast`, `sha2`, and `core::util` (the UTC calendar); the format follows
 //! PKWARE APPNOTE.TXT, with the extended-timestamp extra field from Info-ZIP's
 //! `extrafld.txt`.

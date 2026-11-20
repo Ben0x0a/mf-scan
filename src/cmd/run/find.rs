@@ -3,8 +3,8 @@
 //! Defines: [`run_find`], which builds the query, runs it over each source, renders the
 //! results, and optionally exports what it found.
 //! Used by: `main` (the `Find` dispatch arm).
-//! Uses: `mf_scan::ops::find` (the listing), `mf_scan::ops::apps` (the bundle-identifier
-//! form of `--path`), and `cmd::support::{sources, exporting, reporting}`.
+//! Uses: `mf_scan::ops::find` (the listing), and `cmd::support::{sources, exporting,
+//! reporting, scoping}` (`scoping`: `--app`).
 //!
 //! Unlike `grep` there is no coverage summary and no scan report: a listing reads no
 //! content (bar a header for `--type`), and a `find` user expects only paths. An export
@@ -18,10 +18,8 @@ use serde::Serialize;
 
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::util::{UtcTime, parse_utc};
-use mf_scan::ops::apps::expand_app_globs;
 use mf_scan::ops::find::{FindQuery, Found, SizeTest, find};
 use mf_scan::ops::search::MatchedFile;
-use mf_scan::platform::ios::containers::AppContainerMap;
 use mf_scan::report::output::OutputFormat;
 
 use crate::cmd::cli::FindArgs;
@@ -29,9 +27,11 @@ use crate::cmd::run::EXIT_ERROR;
 use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
 use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
+use crate::cmd::support::scoping::{app_scope, scoped_run};
 use crate::cmd::support::sources::{
     BackupOptions, BackupProvenance, resolve_sources, with_operand_source,
 };
+use crate::cmd::support::{Caveat, caveat};
 
 /// One listed path, as rendered in every format.
 #[derive(Serialize)]
@@ -101,6 +101,7 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
         newer: date("--newer", &args.newer)?,
         older: date("--older", &args.older)?,
         max_depth: args.maxdepth,
+        scope: None,
     };
     for kind in &args.file_type {
         if kind != "f" && kind != "d" && !mf_scan::formats::inspect::is_known_type(kind) {
@@ -136,6 +137,7 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
             .collect(),
         path_globs: args.path.clone(),
         not_path_globs: args.not_path.clone(),
+        app: (!args.app.is_empty()).then(|| args.app.join(", ")),
         types: args.file_type.clone(),
         ..RunInfo::default()
     };
@@ -150,23 +152,9 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
             args.io_mode.to_io_mode(),
             prov.sink(),
             |source, _raw| {
-                // A bundle identifier in --path also names the app's GUID-named container.
-                let extra = if args.path.is_empty() {
-                    Vec::new()
-                } else {
-                    expand_app_globs(&AppContainerMap::build(source), &args.path)
-                };
-                for glob in &extra {
-                    eprintln!(
-                        "--path {:?} resolved to app {} -> {}",
-                        glob.pattern, glob.bundle_id, glob.glob
-                    );
-                }
-                let added = extra.len();
-                query.paths.extend(extra.into_iter().map(|g| g.glob));
-
+                // `--app`: only the apps' containers, resolved from this source.
+                query.scope = app_scope(source, &args.app, &src.label, None);
                 let outcome = find(source, &query)?;
-                query.paths.truncate(query.paths.len() - added);
 
                 if outcome.undated > 0 {
                     eprintln!(
@@ -195,12 +183,14 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
                         .map(|entry| MatchedFile::new(entry.clone(), Vec::new()))
                         .collect();
                     let source_ctx = context_for_source(decrypt_ctx.as_ref(), source);
+                    let run = scoped_run(&run, query.scope.as_deref());
                     run_export_sink(
                         &args.sink,
                         source,
                         &files,
                         &run,
                         "found",
+                        "find",
                         source_ctx.as_deref(),
                     )?;
                 }
@@ -213,6 +203,11 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
     emit(args.output.as_deref(), |w| {
         write_rows(&rows, args.format, args.long, w)
     })?;
+    // A listing stays quiet in a script, as `find`'s does; a person at a terminal is
+    // told what it may miss.
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        caveat(Caveat::Files);
+    }
     Ok(if incomplete {
         ExitCode::from(EXIT_ERROR)
     } else {

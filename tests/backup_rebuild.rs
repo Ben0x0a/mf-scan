@@ -142,7 +142,7 @@ fn an_android_backup_rebuilds_to_device_paths_with_device_timestamps() {
             record.contains(r#""mtime_utc": "2023-11-14T22:13:21Z""#),
             "{record}"
         );
-        assert!(record.contains(r#""non_portable""#), "{record}");
+        assert!(record.contains(r#""portability_warnings""#), "{record}");
     });
     assert!(stderr(&output).contains("exceed Windows' path limit"));
 

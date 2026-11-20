@@ -31,6 +31,8 @@ pub(super) enum Class {
     Directory,
     /// `--path` was set and none of its globs matched this path.
     SkippedNotIncluded { bytes: u64 },
+    /// `--app` was set and this path is outside its containers.
+    SkippedNotInApp { bytes: u64 },
     /// The `--not-path` glob at this index matched this path.
     SkippedNotPath { glob_idx: usize, bytes: u64 },
     /// The media skip dropped this file.
@@ -112,6 +114,14 @@ pub(super) fn classify_entry(
                 records: Vec::new(),
                 file: None,
                 class: Class::SkippedNotPath { glob_idx, bytes },
+                decryption: None,
+            });
+        }
+        PathDecision::SkipNotInApp => {
+            return Ok(EntryResult {
+                records: Vec::new(),
+                file: None,
+                class: Class::SkippedNotInApp { bytes },
                 decryption: None,
             });
         }

@@ -76,6 +76,10 @@ pub(crate) struct FilterArgs {
     #[arg(long = "not-path", value_name = "GLOB")]
     pub(crate) not_path: Vec<String>,
 
+    /// Only this app: its containers, extensions, groups (repeatable).
+    #[arg(long = "app", value_name = "ID")]
+    pub(crate) app: Vec<String>,
+
     /// Only this type: sqlite, jpeg, database, media, ... (repeatable).
     #[arg(short = 't', long = "type", value_name = "TYPE")]
     pub(crate) file_type: Vec<String>,
@@ -137,21 +141,13 @@ pub(crate) struct ExportSink {
     #[arg(long = "manifest", value_name = "FILE")]
     pub(crate) manifest: Option<PathBuf>,
 
-    /// Copy the selected files here, with integrity hashes.
+    /// Export the selected files as a zip in DIR, with integrity hashes.
     #[arg(long = "export", value_name = "DIR")]
     pub(crate) export: Option<PathBuf>,
 
     /// Refuse to export more than this (default 1G), e.g. 5G.
     #[arg(long = "max-size", value_name = "SIZE", value_parser = parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
-
-    /// Skip and record longer paths (default 260, Windows); 0 is off.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = mf_scan::report::export::DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
-    pub(crate) max_path_len: usize,
-
-    /// Also write DIR.work/: a writable copy of the read-only export.
-    #[arg(long = "work-copy")]
-    pub(crate) work_copy: bool,
 }
 
 /// Parse a human size like `1024`, `200KB`, `50M`, `2G` into bytes (1024-based).

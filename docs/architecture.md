@@ -25,12 +25,14 @@ src/
     run/          one orchestrator per command (grep.rs / find.rs / export.rs / diff.rs /
                   app.rs / backup.rs)
     support/      machinery the commands share — sources (resolve operands), presets,
-                  decryption setup, progress reporter, reporting, exporting
+                  decryption setup, progress reporter, reporting, exporting (the
+                  export zip's name and report), scoping (--app → container prefixes)
 
   core/         FOUNDATION — shared primitives every layer depends on (a leaf itself)
     models.rs     data containers: Method, Entry+Location, SearchHit, MatchRecord,
                   Inspection, ContentDiff, RunInfo
-    filter.rs     EntryFilter: path globs (--path/--not-path) + --type / media skip
+    filter.rs     EntryFilter: --app scope (path prefixes) + path globs (--path/--not-path)
+                  + --type / media skip
     util.rs       tiny crate-wide helpers (sha256_hex, the UTC calendar)
     source/       the container abstraction the engine reads through (see ADR 0002)
       mod.rs        Source trait: entries() + content() + byte_size() + integrity_check();
@@ -92,16 +94,24 @@ src/
     apps/         locate & export an app's data across acquisition types (the `app`
                   subcommand). Layered ON TOP of a Source — search stays app-agnostic.
       mod.rs        thin dispatcher: re-exports the surface below
-      types.rs      Platform, ContainerKind, GroupLink, AppContainer, AppSummary
-      catalog.rs    AppCatalog (build/inventory/containers_for) + detect + tally
+      types.rs      Platform, ContainerKind, GroupLink, AppContainer, AndroidRoot, AppSummary
+      catalog.rs    AppCatalog (build/inventory/containers_for/resolve/scope/matching_ids)
+      groups.rs     App Group attribution: entitlements (app + extensions), the name
+                    heuristic, unclaimed groups
+      detect.rs     the platform sniffer + each container's file tally
       ios_ffs.rs    iOS-FFS containers (reuses platform::ios::containers)
       ios_backup.rs iOS-backup domains (over platform::ios::backup's domain/relativePath view)
-      android.rs    Android package-under-storage-root resolution
-  report/       output.rs (matches txt/json/csv) · stats.rs · export.rs (copy +
-                stored-digest integrity; flat `plan` for search hits + tree-preserving
-                `plan_tree` for `app export`; the --max-path-len guard) · diff.rs ·
-                zip_writer.rs (STORED ZIP that keeps timestamps) · rebuild_zip.rs (a
-                backup rebuild's one archive, its record and its .sha256)
+      android.rs    Android package-under-storage-root resolution (extraction folders,
+                    mount aliases, removable volumes)
+  report/       output.rs (matches txt/json/csv) · export/ (plan.rs: flat `plan` for
+                search hits + tree-preserving `plan_tree` for `app export`; write.rs:
+                the export as one STORED zip; record.rs: per-file integrity and the
+                report; manifest.rs: the re-ingestable list) · diff.rs ·
+                zip_writer.rs (STORED ZIP that keeps timestamps) · publish.rs (partial
+                file, read-back, move into place with its .sha256: an export never
+                replaces anything, --force may for a rebuild or decrypt) ·
+                rebuild_zip.rs (a backup rebuild's one archive and its record) ·
+                decrypted_zip.rs (an acquisition with decrypted copies added)
   preset/       behaviour presets behind one flag; fast.rs is the --fast exclude list
 ```
 

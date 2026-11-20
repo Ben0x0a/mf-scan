@@ -72,7 +72,7 @@ full-filesystem acquisition is delivered in. `mf-scan` and other forensic tools 
 it like one.
 
 A member that would exceed the limit if later *extracted* on Windows is still written,
-and is listed under `non_portable` in the traceability record.
+and is listed under `portability_warnings` in the traceability record.
 
 ### Timestamps
 

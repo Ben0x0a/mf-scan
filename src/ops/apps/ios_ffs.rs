@@ -32,11 +32,10 @@ use crate::platform::ios::domains::{
     FRAGMENT_APPGROUP, FRAGMENT_BUNDLE_APPLICATION, FRAGMENT_PLUGINKIT,
 };
 
-/// Resolve every iOS container in `source` into an [`AppContainer`] (file counts
-/// are filled by the caller's tally pass).
-pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
-    AppContainerMap::build(source)
-        .containers()
+/// Resolve every iOS container in a source's container `map` into an
+/// [`AppContainer`] (file counts are filled by the caller's tally pass).
+pub fn resolve(map: &AppContainerMap) -> Vec<AppContainer> {
+    map.containers()
         .map(|(dir, meta)| {
             let (kind, guid) = classify(dir);
             AppContainer {
@@ -48,6 +47,7 @@ pub fn resolve(source: &dyn Source) -> Vec<AppContainer> {
                 file_count: 0,
                 total_size: 0,
                 group_link: None,
+                android_root: None,
             }
         })
         .collect()

@@ -21,7 +21,7 @@
 //! omitted at the source rather than stripped later.
 
 /// Path fragments that identify a container's kind inside a full-filesystem
-/// acquisition. Shared with [`crate::ops::apps::ios_ffs`] so the paths a rebuild
+/// acquisition. Shared with `crate::ops::apps::ios_ffs` so the paths a rebuild
 /// writes and the paths the classifier recognises cannot drift apart.
 pub const FRAGMENT_PLUGINKIT: &str = "/PluginKitPlugin/";
 pub const FRAGMENT_APPGROUP: &str = "/AppGroup/";

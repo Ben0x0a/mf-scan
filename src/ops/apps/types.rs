@@ -1,14 +1,16 @@
 //! The data types of the app catalogue.
 //!
-//! Defines: [`Platform`] (the recognised acquisition layouts), [`ContainerKind`]
-//! (what a container is / which Android root it sits under), [`GroupLink`] (how a
-//! group was attributed), [`AppContainer`] (one resolved container with its tally),
+//! Defines: [`Platform`] (the recognised acquisition layouts, and what each keeps
+//! outside app containers), [`ContainerKind`]
+//! (what a container is / which Android root it sits under), [`AndroidRoot`] (the
+//! root's path and the storage it is a view of), [`GroupLink`] (how a group was
+//! attributed), [`AppContainer`] (one resolved container with its tally),
 //! and [`AppSummary`] (one installed app, for the inventory).
 //! Used by: [`crate::ops::apps::catalog`] (builds and queries these) and the per-platform
 //! resolvers ([`crate::ops::apps::ios_ffs`], [`crate::ops::apps::ios_backup`],
 //! [`crate::ops::apps::android`], which construct [`AppContainer`]s).
 //! Uses: `std`, `serde` (the two output types derive `Serialize` so the
-//! `app grep`/`app paths` JSON is the struct itself, not a hand-mirrored field
+//! `app list`/`app paths` JSON is the struct itself, not a hand-mirrored field
 //! list), and [`crate::platform::ios::references::SigningRecord`], re-exported here
 //! so consumers of this namespace have one import path for it and the type keeps a
 //! single definition beside the artefact it is parsed from — otherwise plain data
@@ -30,6 +32,35 @@ pub enum Platform {
     Android,
     /// No recognised app-data layout (e.g. a generic archive).
     Unknown,
+}
+
+impl Platform {
+    /// What app `id` may keep outside its containers on this platform, which no
+    /// container, and so no `--app` or `app paths`, reaches.
+    ///
+    /// WHY said every time: a short footprint must not read as the app's whole data.
+    /// Apple's own apps keep much of theirs outside any container (Messages in
+    /// `Library/SMS`, Photos in `Media/`), and iOS keeps data about every app in
+    /// system stores (its delivered notifications, keychain items, usage databases);
+    /// any Android app can write to shared storage outside `Android/` (`DCIM`,
+    /// `Download`, a folder of its own).
+    pub fn outside_containers(self, id: &str) -> Option<&'static str> {
+        match self {
+            Platform::Android => Some(
+                "Android apps can also write to shared storage outside Android/ (DCIM, \
+                 Download, ...); use --path for it",
+            ),
+            Platform::Unknown => None,
+            _ if id.starts_with("com.apple.") => Some(
+                "Apple apps also keep data outside their containers (Messages in \
+                 Library/SMS, Photos in Media/); use --path for it",
+            ),
+            _ => Some(
+                "iOS also keeps data about each app outside its containers \
+                 (notifications, keychain, usage databases); use --path for it",
+            ),
+        }
+    }
 }
 
 /// The kind of container a path belongs to — both *what* it is (app data, an
@@ -74,7 +105,7 @@ impl ContainerKind {
     }
 
     /// Whether this kind represents a *primary* installed app (vs an extension,
-    /// group, bundle, or secondary Android storage) — the unit `app grep`'s
+    /// group, bundle, or secondary Android storage) — the unit `app list`'s
     /// inventory lists one line per.
     pub(crate) fn is_primary(self) -> bool {
         matches!(self, ContainerKind::AppData | ContainerKind::AndroidData)
@@ -106,6 +137,21 @@ impl GroupLink {
     }
 }
 
+/// The Android storage root a container sits under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidRoot {
+    /// The root as the path names it, below any extraction folder and without the
+    /// package: `data/data`, `data/user/10`, `data_mirror/data_ce/null/0`.
+    pub path: String,
+    /// The storage it is a view of: `ce/<n>` (credential-encrypted data of user
+    /// `n`), `de/<n>` (device-encrypted), `ext/<n>/<dir>` (external `Android/<dir>`).
+    /// `/data/data` and `/data/user/0` are both `ce/0`: one storage, two paths.
+    pub storage: String,
+    /// The export folder name: kind and user, and a tag for a mount alias
+    /// (`data_u10`, `data_u0~mirror`).
+    pub label: String,
+}
+
 /// One resolved container: an app/extension/group/bundle data location, with its
 /// file tally and (for a group attributed to an app) how it was attributed.
 ///
@@ -135,6 +181,9 @@ pub struct AppContainer {
     /// Set only on a group container included in an app's selection.
     #[serde(serialize_with = "serialize_group_link")]
     pub group_link: Option<GroupLink>,
+    /// Android only: the storage root. Internal-only (the prefix shows it).
+    #[serde(skip)]
+    pub android_root: Option<AndroidRoot>,
 }
 
 /// Serialise a [`ContainerKind`] as its short label (its [`ContainerKind::as_str`]),
@@ -153,12 +202,18 @@ fn serialize_group_link<S: Serializer>(link: &Option<GroupLink>, s: S) -> Result
 
 impl AppContainer {
     /// The export sub-folder name for this container (without the top-level folder):
-    /// `"<Kind>_<guid8>"` for iOS, `"<kind>"` for Android, empty for a backup
-    /// domain (which uses the domain itself as the whole label).
+    /// `"<Kind>_<guid8>"` for iOS, [`AndroidRoot::label`] for Android (`data_u10`),
+    /// empty for a backup domain (which uses the domain itself as the whole label).
+    ///
+    /// WHY the Android label and not the kind alone: one package has several
+    /// containers of a kind (`/data/data`, `/data/user/10` for a second profile,
+    /// mount aliases); labelled by kind they would merge into one folder, and a file
+    /// of profile 10 would read as profile 0's.
     fn sublabel(&self) -> String {
-        match &self.guid {
-            Some(guid) => format!("{}_{}", self.kind.as_str(), guid),
-            None => self.kind.as_str().to_string(),
+        match (&self.guid, &self.android_root) {
+            (Some(guid), _) => format!("{}_{}", self.kind.as_str(), guid),
+            (None, Some(root)) => root.label.clone(),
+            (None, None) => self.kind.as_str().to_string(),
         }
     }
 
@@ -168,8 +223,8 @@ impl AppContainer {
     /// Layout rules (see the module doc / the approved design): a backup uses one
     /// subfolder per domain (the domain itself); an App Group uses its own group id
     /// (it is shared, so labelling it by the requesting app would mislead); an
-    /// Android container uses `<pkg>/<kind>`; an app's own data / extension / bundle
-    /// uses `<requested-id>/<Kind>_<guid8>` so all of one app's own containers nest
+    /// Android container uses `<pkg>/<label>` (`com.x/data_u10`); an app's own
+    /// data / extension / bundle uses `<requested-id>/<Kind>_<guid8>` so all of one app's own containers nest
     /// under the id the analyst asked for.
     pub fn export_label(&self, requested_id: &str, platform: Platform) -> String {
         if platform == Platform::IosBackup {
@@ -193,19 +248,20 @@ impl AppContainer {
     }
 }
 
-/// One installed app, for the `app grep` inventory.
+/// One installed app, for the `app list` inventory.
 ///
-/// The field order is the `app grep --format json` output (a plain derive matches
+/// The field order is the `app list --format json` output (a plain derive matches
 /// the previous hand-written object).
 #[derive(Debug, Clone, Serialize)]
 pub struct AppSummary {
     pub id: String,
     /// Human display name, best-effort (iOS only); `None` when unavailable.
     pub name: Option<String>,
-    /// Bytes in the app's own data container(s). Extensions and App Groups are not
-    /// counted: resolving them for every app would make the listing slow; `app paths`
-    /// lists them for one app.
-    pub total_size: u64,
+    /// Bytes in the app's own data container(s); `None` when it has none here (an
+    /// Apple app keeping its data elsewhere, a container not captured), which is not
+    /// the same as an empty one. Extensions and App Groups are not counted: resolving
+    /// them for every app would make the listing slow; `app paths` lists them.
+    pub total_size: Option<u64>,
     /// The app's code-signing record from MobileContainerManager (iOS FFS only);
     /// `None` when the source carries no such record.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +282,7 @@ mod tests {
             file_count: 0,
             total_size: 0,
             group_link: None,
+            android_root: None,
         }
     }
 
@@ -254,15 +311,21 @@ mod tests {
             "group.com.x/AppGroup_7E82ADBC"
         );
 
-        let android = container(
+        // An Android container is labelled by its root: two users stay apart.
+        let mut android = container(
             "com.whatsapp",
-            ContainerKind::AndroidExternal,
-            "/sdcard/Android/data/com.whatsapp",
+            ContainerKind::AndroidData,
+            "Dump/data/user/10/com.whatsapp",
             None,
         );
+        android.android_root = Some(AndroidRoot {
+            path: "data/user/10".into(),
+            storage: "ce/10".into(),
+            label: "data_u10".into(),
+        });
         assert_eq!(
             android.export_label("com.whatsapp", Platform::Android),
-            "com.whatsapp/external_data"
+            "com.whatsapp/data_u10"
         );
 
         // A backup uses one subfolder per domain.

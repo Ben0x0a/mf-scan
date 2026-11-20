@@ -5,7 +5,7 @@
 //! Used by: the binary's `decrypt` orchestrator (`cmd::run::decrypt`).
 //! Uses: `report::zip_writer` (the format, including extending an archive verbatim),
 //! `report::export` (the derived-copy hook, the naming rule, the per-file records), and
-//! `report::rebuild_zip` (the fail-closed temporary file, read-back check and sidecar).
+//! `report::publish` (the fail-closed temporary file, read-back check and sidecar).
 //!
 //! ── Two ways to build it ─────────────────────────────────────────────────────
 //!   • The source is a ZIP on disk (the usual full-filesystem acquisition): the output
@@ -29,11 +29,11 @@ use serde::Serialize;
 
 use crate::core::models::RunInfo;
 use crate::core::source::Source;
-use crate::core::source::zip::ZipSource;
+use crate::core::util::now_unix;
 use crate::core::util::{UtcTime, sha256_hex};
 use crate::ops::decrypting::DerivedCopy;
-use crate::report::export::decrypted_name;
-use crate::report::rebuild_zip::{PartialFile, check_and_hash, now_unix, publish_archive};
+use crate::report::export::{decrypted_name_numbered, fold_case};
+use crate::report::publish::{check_and_hash, member_count, prepare, publish_replacing};
 use crate::report::zip_writer::ZipWriter;
 
 /// The record of what was decrypted, inside the archive. No device path starts with
@@ -110,37 +110,18 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
         run,
     } = request;
 
-    if output.is_dir() {
-        bail!(
-            "{} is a directory; --to takes a .zip file",
-            output.display()
-        );
-    }
-    if output.exists() && !force {
-        bail!(
-            "{} already exists; pass --force to replace it",
-            output.display()
-        );
-    }
     if let Some(original) = original_zip
         && same_file(original, output)
     {
         bail!("--to must not be the source archive itself");
     }
-    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-
-    let mut partial_name = output.file_name().unwrap_or_default().to_os_string();
-    partial_name.push(format!(".partial-{}", std::process::id()));
-    let partial = PartialFile(output.with_file_name(partial_name));
+    let partial = prepare(output, Some(force))?;
 
     // Start with the original members: copied verbatim, or written one by one.
     let (mut zip, original_members, layout) = match original_zip {
         Some(original) => {
             let zip = ZipWriter::extend(original, &partial.0)?;
-            (zip, count_members(original)?, "extended")
+            (zip, member_count(original)?, "extended")
         }
         None => {
             let mut zip = ZipWriter::create(&partial.0)?;
@@ -150,7 +131,11 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
     };
 
     // Then each decrypted database, beside its original.
-    let taken: HashSet<&str> = source.entries().iter().map(|e| e.name.as_str()).collect();
+    let taken: HashSet<String> = source
+        .entries()
+        .iter()
+        .map(|e| fold_case(&e.name))
+        .collect();
     let mut names: Vec<String> = Vec::new();
     let mut decrypted = Vec::new();
     let mut failed = Vec::new();
@@ -199,7 +184,7 @@ pub fn write(request: DecryptedZipRequest<'_>) -> Result<DecryptedZipOutcome> {
 
     let expected = original_members + decrypted.len() + 1;
     let archive_sha256 = check_and_hash(&partial.0, expected)?;
-    let sidecar = publish_archive(&partial.0, output, &archive_sha256)?;
+    let sidecar = publish_replacing(&partial.0, output, &archive_sha256)?;
 
     Ok(DecryptedZipOutcome {
         decrypted,
@@ -227,36 +212,35 @@ fn repack(zip: &mut ZipWriter, source: &dyn Source) -> Result<usize> {
     Ok(n)
 }
 
-/// How many members the tool's reader sees in the ZIP at `path`: the same count the
-/// read-back check applies to the output, so the two agree by construction.
-fn count_members(path: &Path) -> Result<usize> {
-    let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    // SAFETY: a read-only map, dropped before this function returns.
-    let map = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("cannot map {}", path.display()))?;
-    Ok(ZipSource::open(&map)?.entries().len())
-}
-
 /// The decrypted copy's member name: `name.decrypted.ext` in the original's directory,
-/// numbered if a member already has that name.
-fn free_name(original: &str, taken: &HashSet<&str>, added: &[String]) -> String {
+/// then `name.decrypted-2.ext`, … when a member has that name, as an export names it.
+fn free_name(original: &str, taken: &HashSet<String>, added: &[String]) -> String {
     let (dir, base) = match original.rsplit_once('/') {
         Some((dir, base)) => (format!("{dir}/"), base),
         None => (String::new(), original),
     };
-    numbered_free(format!("{dir}{}", decrypted_name(base)), taken, added)
+    (1..)
+        .map(|n| format!("{dir}{}", decrypted_name_numbered(base, n)))
+        .find(|name| is_free(name, taken, added))
+        .expect("an unbounded range always yields a free name")
 }
 
 /// `first`, or `first-2`, `first-3`… : the first name no member has.
-fn numbered_free(first: String, taken: &HashSet<&str>, added: &[String]) -> String {
-    let free = |name: &str| !taken.contains(name) && !added.iter().any(|a| a == name);
-    if free(&first) {
+fn numbered_free(first: String, taken: &HashSet<String>, added: &[String]) -> String {
+    if is_free(&first, taken, added) {
         return first;
     }
     (2..)
         .map(|n| format!("{first}-{n}"))
-        .find(|name| free(name))
+        .find(|name| is_free(name, taken, added))
         .expect("an unbounded range always yields a free name")
+}
+
+/// Whether no member has `name`, compared as [`fold_case`] does: two names differing
+/// only in case or accent form would be one file once extracted on Windows or macOS.
+fn is_free(name: &str, taken: &HashSet<String>, added: &[String]) -> bool {
+    let folded = fold_case(name);
+    !taken.contains(&folded) && !added.iter().any(|a| fold_case(a) == folded)
 }
 
 /// Whether two paths name the same file (both must exist for a `true`).
@@ -271,8 +255,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::core::models::Entry;
+    use crate::core::source::zip::ZipSource;
     use crate::ops::decrypting::Derived;
-    use crate::report::rebuild_zip::sidecar_path;
+    use crate::report::publish::sidecar_path;
 
     /// "Decrypts" any member named `*.enc` by upper-casing it; fails on `bad.enc`.
     struct Upper;
@@ -378,8 +363,8 @@ mod tests {
 
     #[test]
     fn a_taken_name_gets_a_number() {
-        let taken: HashSet<&str> = ["a/x.decrypted.db"].into_iter().collect();
-        assert_eq!(free_name("a/x.db", &taken, &[]), "a/x.decrypted.db-2");
+        let taken: HashSet<String> = [fold_case("a/X.Decrypted.db")].into_iter().collect();
+        assert_eq!(free_name("a/x.db", &taken, &[]), "a/x.decrypted-2.db");
         assert_eq!(free_name("y", &HashSet::new(), &[]), "y.decrypted");
     }
 }

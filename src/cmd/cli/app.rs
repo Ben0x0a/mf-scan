@@ -6,8 +6,7 @@
 //! in [`AppSourceArgs`], flattened into each verb.
 //! Used by: `cli` (the `App` variant) and `run::app` (reads the fields).
 //! Uses: `clap` (derive), the shared `IoModeArg` from `common`, and
-//! `mf_scan::report::output::OutputFormat` (the `--format` value) /
-//! `mf_scan::report::export::DEFAULT_MAX_PATH_LEN` (the path-guard default).
+//! `mf_scan::report::output::OutputFormat` (the `--format` value).
 //!
 //! WHY the app comes first and `SOURCE` last in every verb: it is `grep`'s order
 //! (what to look for, then where). `list`'s pattern is optional, and clap cannot
@@ -19,7 +18,6 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::cmd::cli::common::{IoModeArg, KeyArgs};
-use mf_scan::report::export::DEFAULT_MAX_PATH_LEN;
 use mf_scan::report::output::OutputFormat;
 
 /// Arguments for `app`.
@@ -134,7 +132,7 @@ pub(crate) struct AppExportArgs {
     #[command(flatten)]
     pub(crate) source: AppSourceArgs,
 
-    /// Destination directory.
+    /// Folder for the export zip (created if needed).
     #[arg(long = "to", value_name = "DIR")]
     pub(crate) to: PathBuf,
 
@@ -146,17 +144,9 @@ pub(crate) struct AppExportArgs {
     #[arg(long = "max-size", value_name = "SIZE", value_parser = crate::cmd::cli::common::parse_size, default_value = "1G", hide_default_value = true)]
     pub(crate) max_size: u64,
 
-    /// Skip and record longer paths (default 260, Windows); 0 is off.
-    #[arg(long = "max-path-len", value_name = "N", default_value_t = DEFAULT_MAX_PATH_LEN, hide_default_value = true)]
-    pub(crate) max_path_len: usize,
-
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
-
-    /// Also write DIR.work/: a writable copy of the read-only export.
-    #[arg(long = "work-copy")]
-    pub(crate) work_copy: bool,
 
     /// Keychain/keystore dump: each app database it decrypts is also written
     /// decrypted, beside the original. A dump beside the source is found on its own.

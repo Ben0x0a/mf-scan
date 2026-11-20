@@ -65,7 +65,7 @@ pub struct RunInfo {
     pub types: Vec<String>,
     /// Media files were excluded (`--exclude-media` or `--fast`).
     pub exclude_media: bool,
-    /// Every encoding searched besides plain UTF-8 (`--encoding`, `--utf16`,
+    /// Every encoding searched besides plain UTF-8 (`--encoding`,
     /// `--all-encodings`): `nfd`, `utf16le`, `utf16be`, `cesu8`, `json`, `url`, `base64`,
     /// `base64url`.
     /// Absent from manifests written before it existed.
@@ -75,18 +75,19 @@ pub struct RunInfo {
     pub keyfiles: Vec<String>,
     /// Platform scope for decryption profiles (`--platform`), if set.
     pub platform: Option<String>,
-    /// The application identifier an `app export` was selected by (e.g.
-    /// `com.whatsapp.WhatsApp`). `None` for a search/diff-driven run.
+    /// The application identifier(s) the run was limited to: an `app export`'s, or
+    /// a search's or diff's `--app` (comma-separated). `None` for a run not limited
+    /// to apps.
     ///
     /// WHY `#[serde(default)]` on this and the two fields below: they were added
     /// after the manifest/report format was already in use, so an older manifest
     /// (written without them) must still deserialise — `default` supplies the empty
-    /// value rather than failing the parse. A search/diff run leaves them empty, so
-    /// existing output is byte-identical apart from the new keys.
+    /// value rather than failing the parse.
     #[serde(default)]
     pub app: Option<String>,
     /// The source path prefixes the app's data was resolved to (one per container:
-    /// the app's own data, its extension/widget containers, and any App Groups).
+    /// the app's own data, its extension/widget containers, and any App Groups); for
+    /// a search, those of the source an export came from.
     #[serde(default)]
     pub app_containers: Vec<String>,
     /// How each included App Group was attributed, as `"<group-id> -> <link>"`

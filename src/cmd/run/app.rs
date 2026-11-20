@@ -2,11 +2,12 @@
 //!
 //! Defines: [`run_app`] (dispatches the three verbs) and a private helper per verb
 //! — `app list` (inventory), `app paths` (per-app data locations), `app export`
-//! (copy one app's data out, kind-labelled).
+//! (one app's data as an export zip, one folder per container).
 //! Used by: `run` (dispatched from `main`).
 //! Uses: `mf_scan::ops::apps` (the platform-agnostic catalogue and selection),
 //! `mf_scan::report::export` (the shared export engine, reused via `plan_tree`),
-//! and the `crate::cmd::support` modules (`sources`, `reporting`, `exporting`).
+//! and the `crate::cmd::support` modules (`sources`, `reporting`, `exporting`,
+//! `scoping` for the note on data outside containers).
 
 use std::io::Write;
 
@@ -24,13 +25,13 @@ use crate::cmd::cli::{
     AppArgs, AppCommand, AppExportArgs, AppListArgs, AppPathsArgs, AppSourceArgs,
 };
 use crate::cmd::support::decryption::{build_decryption_context, context_for_source};
-use crate::cmd::support::exporting::{
-    report_export_notes, work_copy_if_requested, write_export_report_file,
-};
+use crate::cmd::support::exporting::{export_archive_path, export_subject, report_outcome};
 use crate::cmd::support::reporting::{emit, report_verify, sha256_hex};
+use crate::cmd::support::scoping::report_resolution;
 use crate::cmd::support::sources::{
     BackupOptions, BackupProvenance, resolve_sources, with_operand_source,
 };
+use crate::cmd::support::{Caveat, caveat};
 
 /// Run the `app` subcommand.
 pub(crate) fn run_app(args: AppArgs) -> Result<()> {
@@ -54,9 +55,23 @@ fn run_list(args: AppListArgs) -> Result<()> {
         warn_if_unknown(catalog.platform);
         note_mcm_wal(&catalog);
         let apps = catalog.inventory(source, pattern.as_deref());
+        let unclaimed = catalog.unclaimed_groups();
+        if !unclaimed.is_empty() {
+            let mut ids: Vec<&str> = unclaimed.iter().map(|c| c.id.as_str()).collect();
+            ids.sort_unstable();
+            eprintln!(
+                "note: {} App Group container(s) are named by no entitlement record here \
+                 (system services, or an app whose record is unreadable): an app's paths \
+                 include them only by name, if at all: {}",
+                ids.len(),
+                ids.join(", ")
+            );
+        }
         emit(args.output.as_deref(), |w| {
             write_inventory(&apps, args.format, w)
-        })
+        })?;
+        caveat(Caveat::Apps);
+        Ok(())
     })
 }
 
@@ -67,13 +82,10 @@ fn run_paths(args: AppPathsArgs) -> Result<()> {
         let catalog = AppCatalog::build(source);
         warn_if_unknown(catalog.platform);
         note_mcm_wal(&catalog);
-        let containers = catalog.containers_for(&args.bundle_id, !args.no_groups);
-        if containers.is_empty() {
-            eprintln!(
-                "no containers found for '{}' in this source",
-                args.bundle_id
-            );
-        }
+        let resolved = catalog.resolve(&args.bundle_id, !args.no_groups);
+        report_resolution(&resolved, catalog.platform, "this source");
+        caveat(Caveat::Containers);
+        let containers = resolved.containers;
         let signing = catalog.signing_record(&args.bundle_id);
         emit(args.output.as_deref(), |w| {
             write_paths(&args.bundle_id, signing, &containers, args.format, w)
@@ -95,7 +107,10 @@ fn run_export(args: AppExportArgs) -> Result<()> {
         // The app's own data + extensions/widgets + (default) its App Groups, minus
         // the Bundle container — the `.app` is the installed binary/resources, not
         // user data, so it is excluded from a data export.
-        let mut containers = catalog.containers_for(&args.bundle_id, !args.no_groups);
+        let resolved = catalog.resolve(&args.bundle_id, !args.no_groups);
+        report_resolution(&resolved, catalog.platform, "this source");
+        caveat(Caveat::Containers);
+        let mut containers = resolved.containers;
         containers.retain(|c| c.kind != ContainerKind::Bundle);
         if containers.is_empty() {
             bail!(
@@ -139,39 +154,21 @@ fn run_export(args: AppExportArgs) -> Result<()> {
             .as_deref()
             .filter(|ctx| ctx.has_secrets())
             .map(|ctx| SourceDecryptor::new(ctx, source));
-        match export::export_files(
+        let archive = export_archive_path(&args.to, &export_subject(&run, &args.bundle_id))?;
+        let outcome = export::export_files(
             &plan,
             source,
             &files,
-            &args.to,
+            &archive,
+            &run,
             Some(args.max_size),
-            args.max_path_len,
             decryptor.as_ref().map(|d| d as &dyn DerivedCopy),
-        )? {
-            ExportOutcome::Exported {
-                files: n,
-                bytes,
-                report,
-                notes,
-                ..
-            } => {
-                write_export_report_file(&args.to, &run, &report, &notes)?;
-                eprintln!(
-                    "exported {n} file(s) ({bytes} bytes, read-only) for {} from {} container(s) to {}",
-                    args.bundle_id,
-                    containers.len(),
-                    args.to.display()
-                );
-                report_group_attribution(&containers);
-                report_export_notes(&report, &notes);
-                work_copy_if_requested(args.work_copy, &args.to)?;
-            }
-            ExportOutcome::Refused { total_size, cap } => {
-                eprintln!(
-                    "refusing to export: {total_size} bytes exceeds --max-size {cap}; nothing written"
-                );
-            }
+        )?;
+        if matches!(outcome, ExportOutcome::Exported(_)) {
+            report_group_attribution(&containers);
         }
+        let what = format!("{} ({} container(s))", args.bundle_id, containers.len());
+        report_outcome(&outcome, &what);
 
         if let Some(before) = verify_before
             && let Some(bytes) = raw
@@ -292,10 +289,11 @@ fn write_inventory(
             for s in apps {
                 writeln!(
                     w,
-                    "{}\t{}\t{} bytes\t{}",
+                    "{}\t{}\t{}\t{}",
                     s.id,
                     s.name.as_deref().unwrap_or("-"),
-                    s.total_size,
+                    s.total_size
+                        .map_or_else(|| "-".to_string(), |n| format!("{n} bytes")),
                     s.signing
                         .as_ref()
                         .and_then(|r| r.team_identifier.as_deref())
@@ -394,6 +392,7 @@ mod tests {
                 file_count: 3,
                 total_size: 42,
                 group_link: None,
+                android_root: None,
             },
             AppContainer {
                 id: "group.x".into(),
@@ -404,6 +403,7 @@ mod tests {
                 file_count: 1,
                 total_size: 7,
                 group_link: Some(GroupLink::ContainerManager),
+                android_root: None,
             },
         ];
         let signing = SigningRecord {
@@ -465,7 +465,7 @@ mod tests {
         let apps = vec![AppSummary {
             id: "com.x.App".into(),
             name: Some("App".into()),
-            total_size: 10,
+            total_size: Some(10),
             signing: Some(SigningRecord {
                 team_identifier: Some("TEAMID1234".into()),
                 ..SigningRecord::default()
@@ -486,7 +486,7 @@ mod tests {
         let apps = vec![AppSummary {
             id: "com.whatsapp".into(),
             name: None,
-            total_size: 10,
+            total_size: Some(10),
             signing: None,
         }];
         let v = to_json(|w| write_inventory(&apps, OutputFormat::Json, w));

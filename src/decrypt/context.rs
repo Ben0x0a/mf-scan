@@ -354,7 +354,6 @@ mod tests {
         CipherSpec, DbBinding, HashAlgorithm, KeyEncoding, KeySpec, KeychainMatch, Profile,
         SqlCipherParams,
     };
-    use crate::ops::search::search_bytes;
     use regex::bytes::Regex;
 
     const PAGE_SIZE: usize = 1024;
@@ -442,9 +441,9 @@ mod tests {
         assert!(d.verified);
         // The needle inside the encrypted DB is found once decrypted.
         let re = Regex::new("FINDME-secret!!").unwrap();
-        assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
+        assert_eq!(re.find_iter(&d.plaintext).count(), 1);
         // ...and not in the ciphertext.
-        assert_eq!(search_bytes(&blob, &re).len(), 0);
+        assert_eq!(re.find_iter(&blob).count(), 0);
     }
 
     #[test]
@@ -513,7 +512,7 @@ mod tests {
         };
         assert!(d.verified && d.wal_replayed);
         let re = Regex::new("FROM-THE-WAL!!!").unwrap();
-        assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
+        assert_eq!(re.find_iter(&d.plaintext).count(), 1);
     }
 
     #[test]
@@ -538,7 +537,7 @@ mod tests {
         };
         assert!(d.verified && !d.wal_replayed);
         let re = Regex::new("FINDME-secret!!").unwrap();
-        assert_eq!(search_bytes(&d.plaintext, &re).len(), 1);
+        assert_eq!(re.find_iter(&d.plaintext).count(), 1);
     }
 
     #[test]

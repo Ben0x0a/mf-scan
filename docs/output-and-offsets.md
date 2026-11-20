@@ -55,7 +55,7 @@ path:0x<file_offset>[:line][  [format  labelled summary]]
   show just `path:0x<offset>`.
 - `--colour` wraps the matched bytes in ANSI bold-red (terminal only).
 - With `--inspect`, a labelled `  [format  key: value  …]` tag is appended.
-- With other encodings (`--encoding`, `--utf16`, `--all-encodings`), an encoded hit
+- With other encodings (`--encoding`, `--all-encodings`), an encoded hit
   appends `  [<encoding> → "decoded value"]` (`nfc`, `nfd`, `utf16le`, `utf16be`,
   `cesu8`, `json`, `url`, `base64`) so it is
   flagged and its text shown (see [base64 search](#base64-search---encoding-base64)).
@@ -310,12 +310,12 @@ does not prevent the rest of the scan from completing (degrade-don't-die).
 ## Export report (`export-report.json`)
 
 Every export (`grep`/`find`/`diff --export DIR`, `app export`, or the `export`
-subcommand) writes `DIR/export-report.json`, read-only like the files, and never over
-an earlier report (that one stays; the new one is `export-report.json~1`): the `run`
+subcommand) is one zip in `DIR`, `mf-scan-<UTC time>-export-<subject>.zip`, with a
+`.sha256` sidecar beside it. The zip holds `export-report.json` at its root: the `run`
 metadata plus one entry per written file —
-its `internal_path`, `output_path` (relative to `DIR`), `size`, and `sha256`.
-This records the integrity hash of each exported artefact (main files and
-SQLite sidecars alike) beside the artefacts themselves.
+its `internal_path`, `output_path` (its member name in the zip), `size`, and `sha256`
+(read back from the zip). This records the integrity hash of each exported artefact
+(main files and SQLite sidecars alike) beside the artefacts themselves.
 
 ```json
 {

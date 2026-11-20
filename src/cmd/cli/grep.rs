@@ -105,10 +105,6 @@ pub(crate) struct GrepArgs {
     )]
     pub(crate) encodings: Vec<EncodingArg>,
 
-    /// Also find the pattern's UTF-16 forms, both byte orders (requires -F).
-    #[arg(long = "utf16", help_heading = "Matching")]
-    pub(crate) utf16: bool,
-
     /// Find it in every encoding at once: UTF-8, UTF-16, JSON, URL, … (-F).
     #[arg(long = "all-encodings", help_heading = "Matching")]
     pub(crate) all_encodings: bool,

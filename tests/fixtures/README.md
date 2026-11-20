@@ -11,13 +11,14 @@ A miniature of iOS's `/private/var/mobile/Library/MobileContainerManager/referen
 built on that database's real schema (`code_signing_info`, `code_signing_data`,
 `child_bundles`). Read by `platform::ios::references` and `tests/apps.rs`.
 
-Three identities, chosen to exercise the reader's failure modes:
+Four identities, chosen to exercise the reader's failure modes:
 
 | `code_signing_id_text` | row id | blob |
 |---|---|---|
 | `com.example.full` | 7 | full record: two App Groups (one cross-brand), keychain groups, team, signer |
 | `com.example.nogroups` | 11 | entitlements dictionary present but naming no App Groups |
 | `com.example.corrupt` | 23 | deliberately not a property list |
+| `com.example.full.Widget` | 31 | an extension of `com.example.full` (`child_bundles`), entitled to `group.com.example.widgetonly`, which the app itself is not |
 
 Two properties are load-bearing and must be preserved if it is regenerated:
 

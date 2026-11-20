@@ -1,24 +1,71 @@
 //! The app catalogue: build it from a source, then search/select app data.
 //!
-//! Defines: [`AppCatalog`] (build, [`AppCatalog::inventory`] for `app grep`,
-//! [`AppCatalog::containers_for`] for `app paths`/`app export`), [`detect`] (the
-//! platform sniffer), and [`entries_under`] (gather a selection's files for export).
-//! Used by: the binary's `app` subcommand (`run::app`).
+//! Defines: [`AppCatalog`] (build, [`AppCatalog::inventory`] for `app list`,
+//! [`AppCatalog::containers_for`] for `app paths`/`app export`,
+//! [`AppCatalog::scope`] and [`AppScope`] for `--app`, [`AppCatalog::matching_ids`]
+//! (an id across case and a team-id prefix)), and [`entries_under`] (gather a
+//! selection's files for export). Group attribution is in `groups`, platform
+//! detection and the tally in `detect`.
+//! Used by: the binary's `app` subcommand (`run::app`) and `--app`
+//! (`cmd::support::scoping`).
 //! Uses: the data types in [`super::types`], the per-platform resolvers
 //! ([`super::ios_ffs`], [`super::ios_backup`], [`super::android`]),
 //! [`crate::platform::ios::references::McmReferences`] (the App Group source on an
-//! iOS FFS), and [`crate::core::source::Source`] / [`crate::core::models::Entry`].
+//! iOS FFS), [`crate::core::filter::is_under`], and [`crate::core::source::Source`] /
+//! [`crate::core::models::Entry`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
+use crate::core::filter::is_under;
 use crate::core::models::Entry;
 use crate::core::source::Source;
-use crate::platform::android::paths::is_backup_member;
-use crate::platform::ios::domains;
+use crate::platform::ios::containers::AppContainerMap;
 use crate::platform::ios::references::McmReferences;
 
+use super::detect::{detect, tally};
 use super::types::{AppContainer, AppSummary, ContainerKind, GroupLink, Platform, SigningRecord};
 use super::{android, ios_backup, ios_ffs};
+
+/// What an app id, as an operator typed it, resolved to (see [`AppCatalog::resolve`]).
+#[derive(Debug, Clone)]
+pub struct AppResolution {
+    /// The id as typed.
+    pub id: String,
+    /// The other ids it matched ([`AppCatalog::matching_ids`]): case, team-id prefix.
+    pub aliases: Vec<String>,
+    /// Its containers, as `app paths` lists them.
+    pub containers: Vec<AppContainer>,
+}
+
+impl AppResolution {
+    /// Containers were found, all of them App Groups: the app has none of its own
+    /// here (not installed, or not captured).
+    pub fn only_groups(&self) -> bool {
+        !self.containers.is_empty()
+            && self
+                .containers
+                .iter()
+                .all(|c| c.kind == ContainerKind::AppGroup)
+    }
+
+    /// The App Groups attributed by name only (a guess).
+    pub fn guessed_groups(&self) -> impl Iterator<Item = &AppContainer> {
+        self.containers
+            .iter()
+            .filter(|c| c.group_link == Some(GroupLink::VendorHeuristic))
+    }
+}
+
+/// What `--app` limits a search to (see [`AppCatalog::scope`]).
+#[derive(Debug, Default, Clone)]
+pub struct AppScope {
+    /// The containers' path prefixes, sorted, each once.
+    pub prefixes: Vec<String>,
+    /// Each id, as it resolved; one with no container is in [`missing`](Self::missing).
+    pub apps: Vec<AppResolution>,
+    /// The ids with no container in the source.
+    pub missing: Vec<String>,
+}
 
 /// Every app container found in a source, plus the platform it was read as and
 /// the MobileContainerManager signing records that go with it.
@@ -28,16 +75,26 @@ pub struct AppCatalog {
     /// MCM's code-signing/entitlement records, read once per source. Empty for
     /// every platform but iOS FFS, and for an FFS that did not capture the
     /// database — in which case group attribution falls back to the heuristic.
-    references: McmReferences,
+    pub(super) references: McmReferences,
 }
 
 impl AppCatalog {
     /// Detect the platform and resolve every app container, tallying each
     /// container's file count and total size in a single pass over the entries.
     pub fn build(source: &dyn Source) -> Self {
+        Self::build_with(source, None)
+    }
+
+    /// [`build`](Self::build), reusing the source's container `map` when the caller
+    /// already built one (grep, for its records' owning app), so an iOS file system's
+    /// metadata plists are read once.
+    pub fn build_with(source: &dyn Source, map: Option<&AppContainerMap>) -> Self {
         let platform = detect(source);
         let mut containers = match platform {
-            Platform::IosFfs => ios_ffs::resolve(source),
+            Platform::IosFfs => match map {
+                Some(map) => ios_ffs::resolve(map),
+                None => ios_ffs::resolve(&AppContainerMap::build(source)),
+            },
             Platform::IosBackup => ios_backup::resolve(source),
             Platform::Android => android::resolve(source),
             Platform::Unknown => Vec::new(),
@@ -63,31 +120,70 @@ impl AppCatalog {
     }
 
     /// The MobileContainerManager signing record for an app, when the source has one.
+    /// `id` stands for every id [`matching_ids`](Self::matching_ids) gives.
     pub fn signing_record(&self, id: &str) -> Option<&SigningRecord> {
-        self.references.get(id)
+        self.matching_ids(id)
+            .iter()
+            .find_map(|i| self.references.get(i))
     }
 
-    /// `app grep`: one [`AppSummary`] per installed (primary) app, optionally
+    /// `app list`: one [`AppSummary`] per installed (primary) app, optionally
     /// filtered by a case-insensitive substring over the id and display name.
     /// Sorted by id for stable output.
     pub fn inventory(&self, source: &dyn Source, pattern: Option<&str>) -> Vec<AppSummary> {
         // Aggregate primary containers by id (an app usually has one, but multi-user
-        // Android can have several).
-        let mut by_id: BTreeMap<&str, u64> = BTreeMap::new();
+        // Android can have several). An Android storage captured under several mount
+        // aliases (`/data/data` and `/data/user/0`) is one storage: counted once, at
+        // its largest copy.
+        //
+        // WHY every id with a container of its own is listed, and not only those with
+        // a data container: an app whose data container was not captured (or an
+        // Android package with only external or device-encrypted data) still has data
+        // here; left out of the list, it would not be looked at. Only data containers
+        // count toward the size.
+        //
+        // WHY one row per app across case and a team-id prefix ([`normal_id`]): the
+        // container manager may record an app's data under `5Q4J53EFRC.com.sbb.ch`
+        // and its bundle under `com.sbb.ch`; two rows, one sized and one `-`, would
+        // read as two apps, one without data. The row shows the data container's id.
+        let mut by_storage: BTreeMap<(String, &str), u64> = BTreeMap::new();
+        // Normal id → the id shown, whether it is a data container's, and the size.
+        let mut rows: BTreeMap<String, (&str, bool, Option<u64>)> = BTreeMap::new();
         for c in &self.containers {
-            if !c.kind.is_primary() {
+            if matches!(c.kind, ContainerKind::AppGroup | ContainerKind::Extension) {
                 continue;
             }
-            *by_id.entry(c.id.as_str()).or_default() += c.total_size;
+            let key = normal_id(&c.id);
+            let primary = c.kind.is_primary();
+            let row = rows
+                .entry(key.clone())
+                .or_insert((c.id.as_str(), primary, None));
+            if primary && !row.1 {
+                (row.0, row.1) = (c.id.as_str(), true);
+            }
+            if !primary {
+                continue;
+            }
+            let storage = c
+                .android_root
+                .as_ref()
+                .map_or(c.prefix.as_str(), |r| r.storage.as_str());
+            let size = by_storage.entry((key, storage)).or_default();
+            *size = (*size).max(c.total_size);
+        }
+        for ((key, _), size) in by_storage {
+            if let Some(row) = rows.get_mut(&key) {
+                *row.2.get_or_insert(0) += size;
+            }
         }
 
-        by_id
-            .into_iter()
-            .map(|(id, size)| AppSummary {
+        let mut apps: Vec<AppSummary> = rows
+            .into_values()
+            .map(|(id, _, size)| AppSummary {
                 id: id.to_string(),
                 name: self.display_name(source, id),
                 total_size: size,
-                signing: self.references.get(id).cloned(),
+                signing: self.signing_record(id).cloned(),
             })
             .filter(|s| match pattern {
                 None => true,
@@ -99,23 +195,30 @@ impl AppCatalog {
                             .is_some_and(|n| n.to_lowercase().contains(&p))
                 }
             })
-            .collect()
+            .collect();
+        apps.sort_by(|a, b| a.id.cmp(&b.id));
+        apps
     }
 
     /// `app paths` / `app export`: every container the app `id` or its dependencies
     /// can write — the app's own data (`id`), its extensions/widgets (`id.*`), the
     /// app bundle, and, when `with_groups`, its App Groups (each tagged with how it
     /// was attributed). Returned in a stable, grouped order.
+    ///
+    /// `id` stands for every id [`matching_ids`](Self::matching_ids) gives.
     pub fn containers_for(&self, id: &str, with_groups: bool) -> Vec<AppContainer> {
+        let ids = self.matching_ids(id);
         let mut out: Vec<AppContainer> = self
             .containers
             .iter()
+            // One pass: every matching id has the same normal form, which the test
+            // compares.
             .filter(|c| is_app_or_extension(c, id))
             .cloned()
             .collect();
 
         if with_groups {
-            let links = self.resolve_group_links(id);
+            let links = self.resolve_group_links(&ids);
             for c in &self.containers {
                 if c.kind == ContainerKind::AppGroup
                     && let Some(&link) = links.get(c.id.as_str())
@@ -127,6 +230,72 @@ impl AppCatalog {
             }
         }
         out
+    }
+
+    /// `--app` on grep, find and diff: the path prefixes of every container of each
+    /// app in `ids` — its data, extensions and widgets, bundle, and App Groups, as
+    /// `app paths` lists them — and the ids found nowhere in this source.
+    ///
+    /// An id with no container of its own (data, extension, bundle) keeps its groups:
+    /// an Apple system app may have no data container and still write to its groups.
+    /// WHY even the groups matched by name only: a group left out is data silently
+    /// not searched; one wrongly in is named as a guess by the caller. An id with
+    /// nothing at all is missing.
+    pub fn scope(&self, ids: &[String]) -> AppScope {
+        let mut scope = AppScope::default();
+        for id in ids {
+            let resolved = self.resolve(id, true);
+            if resolved.containers.is_empty() {
+                scope.missing.push(id.clone());
+                continue;
+            }
+            scope
+                .prefixes
+                .extend(resolved.containers.iter().map(|c| c.prefix.clone()));
+            scope.apps.push(resolved);
+        }
+        scope.prefixes.sort();
+        scope.prefixes.dedup();
+        scope
+    }
+
+    /// What `id`, as an operator typed it, resolves to: the other ids it matched and
+    /// its containers ([`containers_for`](Self::containers_for)).
+    pub fn resolve(&self, id: &str, with_groups: bool) -> AppResolution {
+        AppResolution {
+            id: id.to_string(),
+            aliases: self
+                .matching_ids(id)
+                .into_iter()
+                .filter(|m| m != id)
+                .collect(),
+            containers: self.containers_for(id, with_groups),
+        }
+    }
+
+    /// The ids in this source that `id`, as an operator typed it, stands for: `id`
+    /// itself, and the ids of containers and entitlement records equal to it but for
+    /// case or an Apple team-id prefix (`5Q4J53EFRC.com.sbb.ch` for `com.sbb.ch`).
+    ///
+    /// WHY: the container manager records some apps under their team-prefixed id
+    /// (seen on a real iPhone), and an id typed in the wrong case is still the
+    /// operator asking for that app. Matched exactly, both found only the groups a
+    /// name guess attached, which reads as "this app has almost no data".
+    pub fn matching_ids(&self, id: &str) -> Vec<String> {
+        let wanted = normal_id(id);
+        let mut ids: Vec<String> = self
+            .containers
+            .iter()
+            .filter(|c| c.kind != ContainerKind::AppGroup)
+            .map(|c| c.id.as_str())
+            .chain(self.references.ids())
+            .filter(|candidate| normal_id(candidate) == wanted)
+            .map(str::to_string)
+            .chain(std::iter::once(id.to_string()))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// An app's display name, looked up via its bundle container (iOS only).
@@ -142,44 +311,8 @@ impl AppCatalog {
     fn bundle_prefix(&self, id: &str) -> Option<&str> {
         self.containers
             .iter()
-            .find(|c| c.kind == ContainerKind::Bundle && c.id == id)
+            .find(|c| c.kind == ContainerKind::Bundle && normal_id(&c.id) == normal_id(id))
             .map(|c| c.prefix.as_str())
-    }
-
-    /// Resolve which App Groups belong to app `id`, and how each was attributed.
-    ///
-    /// Authoritative path: the app's entitlements as MobileContainerManager
-    /// recorded them (`references.sqlite3`). When the source records no
-    /// entitlements for this app — always the case for an iOS backup, which ships
-    /// no MCM database — fall back to the reverse-DNS vendor-token heuristic.
-    ///
-    /// WHY a recorded-but-empty entitlement list ends the search rather than
-    /// falling through: it says the app was provisioned with no App Groups, which
-    /// is an answer. Running the heuristic anyway would re-add exactly the
-    /// false positives this source exists to remove — measured at 518 spurious
-    /// group inclusions across 7 apps on one real device.
-    fn resolve_group_links(&self, id: &str) -> HashMap<String, GroupLink> {
-        match self.references.get(id) {
-            Some(record) if record.entitlements_recorded => record
-                .application_groups
-                .iter()
-                .map(|g| (g.clone(), GroupLink::ContainerManager))
-                .collect(),
-            _ => self.vendor_heuristic_groups(id),
-        }
-    }
-
-    /// Fallback group attribution: App Group containers whose `group.*` id shares a
-    /// reverse-DNS vendor token with the app id (e.g. `group.com.burbn.*` for
-    /// `com.burbn.instagram`). Best-effort — it cannot find a cross-brand shared
-    /// group whose id carries no token of the app (the documented limitation).
-    fn vendor_heuristic_groups(&self, id: &str) -> HashMap<String, GroupLink> {
-        let tokens = vendor_tokens(id);
-        self.containers
-            .iter()
-            .filter(|c| c.kind == ContainerKind::AppGroup && group_matches_tokens(&c.id, &tokens))
-            .map(|c| (c.id.clone(), GroupLink::VendorHeuristic))
-            .collect()
     }
 }
 
@@ -194,91 +327,22 @@ pub fn entries_under<'s>(source: &'s dyn Source, prefixes: &[String]) -> Vec<&'s
         .collect()
 }
 
-/// Detect the acquisition layout from the shape of the entry paths.
-///
-/// Counts the distinctive signal of each platform across the entries and picks the
-/// strongest: iOS containers (`/Containers/…`), iOS-backup domains
-/// (`AppDomain-…`), or Android data roots (`/data/data/…`). WHY argmax over a few
-/// cheap path checks rather than a definitive probe: it is robust to stray paths,
-/// needs no file reads, and the three layouts' path shapes do not overlap.
-pub fn detect(source: &dyn Source) -> Platform {
-    let (mut ios_ffs, mut backup, mut android) = (0usize, 0usize, 0usize);
-    for entry in source.entries() {
-        let name = &entry.name;
-        if name.contains("/Containers/Data/") || name.contains("/Containers/Bundle/") {
-            ios_ffs += 1;
-        } else if is_backup_domain(name) {
-            backup += 1;
-        }
-        // A leading slash is optional: a rebuilt archive's paths are relative.
-        if name.contains("/data/data/")
-            || name.contains("/data/user/")
-            || name.starts_with("data/data/")
-            || name.starts_with("data/user/")
-            || is_backup_member(name)
+/// `id` lower-cased, without an Apple team-id prefix (ten upper-case letters or
+/// digits, then a dot: `5Q4J53EFRC.com.sbb.ch` → `com.sbb.ch`).
+pub(super) fn normal_id(id: &str) -> String {
+    let unprefixed = match id.split_once('.') {
+        Some((team, rest))
+            if team.len() == 10
+                && team
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                && rest.contains('.') =>
         {
-            android += 1;
+            rest
         }
-    }
-    let max = ios_ffs.max(backup).max(android);
-    if max == 0 {
-        Platform::Unknown
-    } else if max == ios_ffs {
-        Platform::IosFfs
-    } else if max == backup {
-        Platform::IosBackup
-    } else {
-        Platform::Android
-    }
-}
-
-/// Whether an entry name's first segment is an app-scoped iOS-backup domain.
-///
-/// Delegates to [`crate::platform::ios::domains`] so the prefix set is defined
-/// once. NOTE this counts only APP-SCOPED domains, so a backup holding no
-/// third-party app data scores zero here and [`detect`] reports
-/// `Platform::Unknown` for it. That is the long-standing behaviour and is left
-/// deliberately unchanged: `detect` drives every `app` subcommand, and widening
-/// it is a behavioural change that belongs in its own commit.
-fn is_backup_domain(name: &str) -> bool {
-    let domain = name.split('/').next().unwrap_or("");
-    domains::parse(domain).is_some_and(|d| d.is_app_scoped())
-}
-
-/// Tally each container's file count and total size in one pass: every
-/// non-directory entry is charged to the longest container prefix that contains
-/// it (an entry deep in a nested container counts toward the innermost one).
-fn tally(source: &dyn Source, containers: &mut [AppContainer]) {
-    // Owned keys: the index outlives the immutable borrow so the tally below can
-    // mutate `containers` (a `&str`-keyed index would borrow it for the whole loop).
-    let index: HashMap<String, usize> = containers
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.prefix.clone(), i))
-        .collect();
-    for entry in source.entries() {
-        if entry.is_dir() {
-            continue;
-        }
-        if let Some(idx) = longest_container(&entry.name, &index) {
-            containers[idx].file_count += 1;
-            containers[idx].total_size += entry.uncompressed_size;
-        }
-    }
-}
-
-/// Find the index of the longest container prefix that is an ancestor of `path`,
-/// by walking the path's parent directories from longest to shortest.
-fn longest_container(path: &str, index: &HashMap<String, usize>) -> Option<usize> {
-    let mut cur = path;
-    // Start one level up: a file is never itself a container prefix.
-    while let Some(pos) = cur.rfind('/') {
-        cur = &cur[..pos];
-        if let Some(&idx) = index.get(cur) {
-            return Some(idx);
-        }
-    }
-    None
+        _ => id,
+    };
+    unprefixed.to_lowercase()
 }
 
 /// Whether container `c` is the app `id`'s own data, an extension/widget of it, or
@@ -295,47 +359,25 @@ fn longest_container(path: &str, index: &HashMap<String, usize>) -> Option<usize
 /// extension's bundle id extends the app's (`com.app.Widget`); a sibling Android
 /// package (`com.app.helper`) is a *different* app, so Android containers match by
 /// exact package only.
-fn is_app_or_extension(c: &AppContainer, id: &str) -> bool {
+///
+/// Ids compare as [`normal_id`]s: across case and an Apple team-id prefix, so an
+/// app recorded as `5Q4J53EFRC.com.sbb.ch` keeps a widget named `com.sbb.ch.Widget`.
+pub(super) fn is_app_or_extension(c: &AppContainer, id: &str) -> bool {
+    let id = normal_id(id);
+    let own = normal_id(&c.id);
     match c.kind {
-        ContainerKind::AppData | ContainerKind::Bundle => c.id == id,
+        ContainerKind::AppData | ContainerKind::Bundle => own == id,
         ContainerKind::Extension => match &c.parent_id {
-            Some(parent) => parent == id,
-            None => c.id == id || c.id.starts_with(&format!("{id}.")),
+            Some(parent) => normal_id(parent) == id,
+            None => own == id || own.starts_with(&format!("{id}.")),
         },
         ContainerKind::AndroidData
         | ContainerKind::AndroidUserDe
         | ContainerKind::AndroidExternal
         | ContainerKind::AndroidObb
-        | ContainerKind::AndroidMedia => c.id == id,
+        | ContainerKind::AndroidMedia => own == id,
         ContainerKind::AppGroup => false,
     }
-}
-
-/// Whether `path` is `prefix` itself or a descendant of it (segment-boundary safe).
-fn is_under(prefix: &str, path: &str) -> bool {
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The distinctive reverse-DNS tokens of a bundle id / package, for the group
-/// heuristic — every dotted component except a leading common TLD-ish token and
-/// very short fragments. `com.burbn.instagram` → `["burbn", "instagram"]`.
-fn vendor_tokens(id: &str) -> Vec<String> {
-    const STOPWORDS: &[&str] = &["com", "org", "net", "io", "co", "app", "apps"];
-    id.split('.')
-        .map(|s| s.to_lowercase())
-        .filter(|s| s.len() > 2 && !STOPWORDS.contains(&s.as_str()))
-        .collect()
-}
-
-/// Whether a `group.*` id shares any vendor token with the app (component match).
-fn group_matches_tokens(group_id: &str, tokens: &[String]) -> bool {
-    let group_id = group_id.to_lowercase();
-    group_id
-        .split('.')
-        .any(|seg| tokens.iter().any(|t| t == seg))
 }
 
 #[cfg(test)]
@@ -352,6 +394,7 @@ mod tests {
             file_count: 0,
             total_size: 0,
             group_link: None,
+            android_root: None,
         }
     }
 
@@ -364,26 +407,35 @@ mod tests {
     }
 
     #[test]
-    fn vendor_tokens_drop_tld_and_short_fragments() {
-        assert_eq!(
-            vendor_tokens("com.burbn.instagram"),
-            vec!["burbn", "instagram"]
-        );
-        assert_eq!(
-            vendor_tokens("ph.telegra.Telegraph"),
-            vec!["telegra", "telegraph"]
-        );
-    }
+    fn an_id_matches_across_case_and_a_team_prefix() {
+        assert_eq!(normal_id("5Q4J53EFRC.com.sbb.ch"), "com.sbb.ch");
+        assert_eq!(normal_id("net.whatsapp.WhatsApp"), "net.whatsapp.whatsapp");
+        // Not a team id: lower case, or nothing after it but one name.
+        assert_eq!(normal_id("abcdefghij.com.x"), "abcdefghij.com.x");
+        assert_eq!(normal_id("5Q4J53EFRC.app"), "5q4j53efrc.app");
 
-    #[test]
-    fn heuristic_matches_vendor_group_but_not_cross_brand() {
-        let tokens = vendor_tokens("com.burbn.instagram");
-        // Same-vendor groups are caught.
-        assert!(group_matches_tokens("group.com.burbn.instagram", &tokens));
-        assert!(group_matches_tokens("group.com.burbn.family", &tokens));
-        // The cross-brand Meta group carries no burbn/instagram token — missed,
-        // exactly the limitation Mach-O entitlements resolve.
-        assert!(!group_matches_tokens("group.com.facebook.family", &tokens));
+        let catalog = AppCatalog {
+            platform: Platform::IosFfs,
+            containers: vec![
+                container("5Q4J53EFRC.com.sbb.ch", ContainerKind::AppData),
+                container("net.whatsapp.WhatsApp", ContainerKind::AppData),
+            ],
+            references: McmReferences::empty(),
+        };
+        assert_eq!(
+            catalog.matching_ids("com.sbb.ch"),
+            ["5Q4J53EFRC.com.sbb.ch", "com.sbb.ch"]
+        );
+        assert_eq!(
+            catalog.matching_ids("net.whatsapp.whatsapp"),
+            ["net.whatsapp.WhatsApp", "net.whatsapp.whatsapp"]
+        );
+        assert_eq!(catalog.matching_ids("com.absent"), ["com.absent"]);
+        assert_eq!(catalog.containers_for("com.sbb.ch", false).len(), 1);
+        // A widget named after the plain id belongs to the team-prefixed app.
+        let widget = container("com.sbb.ch.Widget", ContainerKind::Extension);
+        assert!(is_app_or_extension(&widget, "5Q4J53EFRC.com.sbb.ch"));
+        assert!(is_app_or_extension(&widget, "com.sbb.ch"));
     }
 
     #[test]
