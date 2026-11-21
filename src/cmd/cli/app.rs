@@ -71,7 +71,7 @@ pub(crate) struct AppSourceArgs {
     #[arg(long = "backup-password", value_name = "PASSWORD")]
     pub(crate) backup_password: Option<String>,
 
-    /// Password of an encrypted 7z (or MFSCAN_ARCHIVE_PASSWORD).
+    /// Password of an encrypted 7z or zip (or MFSCAN_ARCHIVE_PASSWORD).
     #[arg(long = "archive-password", value_name = "PASS")]
     pub(crate) archive_password: Option<String>,
 }

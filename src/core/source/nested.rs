@@ -16,8 +16,9 @@ use std::fmt;
 
 use anyhow::Result;
 
-use crate::core::models::{Entry, Location, Method};
+use crate::core::models::{Encryption, Entry, Location, Method};
 use crate::core::source::zip;
+use crate::core::source::zip_crypto::ZipPassword;
 
 /// Cumulative cap on bytes held in the nested-archive arena.
 ///
@@ -96,13 +97,15 @@ pub(crate) fn expand(
         // `parse_entries` only ever yields `Zip` locations.
         let Location::Zip {
             method,
+            encryption,
             data_offset,
             data_len,
         } = &ze.location
         else {
             continue;
         };
-        let (method, data_offset, data_len) = (*method, *data_offset, *data_len);
+        let (method, encryption, data_offset, data_len) =
+            (*method, *encryption, *data_offset, *data_len);
         let name = format!("{prefix}{}", ze.name);
 
         // An inner `.zip` is a candidate for expansion when the depth budget allows;
@@ -113,6 +116,7 @@ pub(crate) fn expand(
             pending.push(Pending {
                 name,
                 method,
+                encryption,
                 data_offset,
                 data_len,
                 uncompressed_size: ze.uncompressed_size,
@@ -125,7 +129,7 @@ pub(crate) fn expand(
             ze.uncompressed_size,
             ze.mtime,
             blob_idx,
-            method,
+            (method, encryption),
             data_offset,
             data_len,
         ));
@@ -139,7 +143,11 @@ pub(crate) fn expand(
         // entry in the parent blob, and no budget was ever charged for it.
         let content = match zip::read_range(
             &blobs[blob_idx],
-            p.method,
+            zip::Coding {
+                method: p.method,
+                encryption: p.encryption,
+                password: ZipPassword::Nested,
+            },
             p.data_offset,
             p.data_len,
             p.uncompressed_size,
@@ -152,7 +160,7 @@ pub(crate) fn expand(
                     p.uncompressed_size,
                     p.mtime,
                     blob_idx,
-                    p.method,
+                    (p.method, p.encryption),
                     p.data_offset,
                     p.data_len,
                 ));
@@ -179,7 +187,7 @@ pub(crate) fn expand(
                 p.uncompressed_size,
                 p.mtime,
                 blob_idx,
-                p.method,
+                (p.method, p.encryption),
                 p.data_offset,
                 p.data_len,
             )),
@@ -195,6 +203,7 @@ pub(crate) fn expand(
 struct Pending {
     name: String,
     method: Method,
+    encryption: Encryption,
     data_offset: u64,
     data_len: u64,
     uncompressed_size: u64,
@@ -208,7 +217,7 @@ fn nested_entry(
     uncompressed_size: u64,
     mtime: Option<u64>,
     archive: usize,
-    method: Method,
+    (method, encryption): (Method, Encryption),
     data_offset: u64,
     data_len: u64,
 ) -> Entry {
@@ -219,6 +228,7 @@ fn nested_entry(
         location: Location::Nested {
             archive,
             method,
+            encryption,
             data_offset,
             data_len,
         },

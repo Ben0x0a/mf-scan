@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::core::models::{Entry, Location};
+use crate::core::source::zip_crypto::ZipPassword;
 use crate::core::source::{Content, Source};
 use crate::core::source::{nested, zip};
 
@@ -137,6 +138,7 @@ impl Source for FolderSource {
             Location::Nested {
                 archive,
                 method,
+                encryption,
                 data_offset,
                 data_len,
             } => {
@@ -148,7 +150,11 @@ impl Source for FolderSource {
                 })?;
                 zip::read_range(
                     blob,
-                    *method,
+                    zip::Coding {
+                        method: *method,
+                        encryption: *encryption,
+                        password: ZipPassword::Nested,
+                    },
                     *data_offset,
                     *data_len,
                     entry.uncompressed_size,

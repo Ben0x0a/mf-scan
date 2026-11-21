@@ -9,7 +9,7 @@ mod common;
 
 use common::{FileSpec, build_zip};
 use mf_scan::core::models::{Entry, Location, Method};
-use mf_scan::core::source::zip::parse_entries;
+use mf_scan::core::source::zip::{content, parse_entries};
 
 /// The bytes the parser points at must be exactly the file's stored data.
 fn entry_bytes<'a>(archive: &'a [u8], e: &Entry) -> &'a [u8] {
@@ -64,13 +64,21 @@ fn resolves_data_offset_and_method() {
     assert_eq!(entry_bytes(&zip, &entries[1]), b"\x01\x02\x03");
 }
 
+/// An entry of a method that is not read is listed, never dropped, and reading it
+/// fails, naming the method: the engine then counts it as not searched.
 #[test]
-fn skips_unsupported_methods() {
+fn keeps_unsupported_methods_and_reading_one_fails() {
     let files = [
         FileSpec::stored("keep.txt", b"keep me"),
-        // Method 99 (e.g. AES/other) is neither STORED nor DEFLATE -> skipped.
         FileSpec {
-            name: "drop.bin",
+            name: "bzip2.bin",
+            data: b"\x00\x00",
+            method: 12,
+            uncompressed_size: 2,
+        },
+        // Method 99 is WinZip AES; without its AES extra field it cannot be opened.
+        FileSpec {
+            name: "aes.bin",
             data: b"\x00\x00",
             method: 99,
             uncompressed_size: 2,
@@ -80,8 +88,17 @@ fn skips_unsupported_methods() {
 
     let entries = parse_entries(&zip).unwrap();
 
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "keep.txt");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["keep.txt", "bzip2.bin", "aes.bin"]);
+    assert_eq!(method(&entries[1]), Method::Other(12));
+    assert_eq!(method(&entries[2]), Method::Other(99));
+    assert!(entries[2].is_encrypted(), "an AES entry, unopenable");
+    assert_eq!(content(&zip, &entries[0]).unwrap().as_ref(), b"keep me");
+    let Err(e) = content(&zip, &entries[1]) else {
+        panic!("a bzip2 entry read");
+    };
+    assert!(e.to_string().contains("bzip2"), "{e}");
+    assert!(content(&zip, &entries[2]).is_err());
 }
 
 #[test]

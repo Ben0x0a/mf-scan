@@ -36,6 +36,7 @@ pub mod sevenz;
 pub(crate) mod spool;
 pub mod tar;
 pub mod zip;
+mod zip_crypto;
 
 /// What kind of container a file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -101,3 +101,25 @@ made up.
 | `note.aes.7z` | `7zz a -ms=on -pfixture-password -mhe=off note.aes.7z evidence` (data encrypted) |
 | `note.aes-header.7z` | `7zz a -ms=on -pfixture-password -mhe=on note.aes-header.7z evidence` (list of files too) |
 | `note.deflate.7z` | `7zz a -m0=Deflate note.deflate.7z evidence` (a method this build does not decode) |
+
+## `encrypted_zip/`
+
+ZIP archives of one synthetic tree, for `tests/encrypted_zip.rs` and the ZIP reader:
+`evidence/note.txt` ("needle in a zip"), `evidence/filler.txt` (2000 lines `line N of
+filler text`, 48,890 bytes) and, for `mixed.zip` only, `plain.txt` ("plain needle
+beside encrypted files"). Every time set with `TZ=UTC touch -h -t 202311142213.20`.
+The password, `fixture-password`, is made up. Made by 7-Zip 26.06 (`7zz`) and by
+Info-ZIP Zip 3.0 (macOS `/usr/bin/zip`), from the tree's parent; each was checked with
+Python's `zipfile` for the flags, method and AES field below.
+
+| file | command | what it holds |
+|---|---|---|
+| `note.aes256.zip` | `7zz a -tzip -mem=AES256 -p… note.aes256.zip evidence` | AE-2, AES-256; `note.txt` Stored, `filler.txt` Deflate |
+| `note.aes192.zip` | `… -mem=AES192 …` | AE-2, AES-192 |
+| `note.aes128.zip` | `… -mem=AES128 …` | AE-2, AES-128 |
+| `note.aes256-stored.zip` | `… -mx0 -mem=AES256 …` | AE-2, AES-256, both Stored |
+| `note.zipcrypto.zip` | `7zz a -tzip -mem=ZipCrypto -p… note.zipcrypto.zip evidence` | ZipCrypto, flags `0x0001` (check byte from the CRC) |
+| `note.infozip.zip` | `zip -q -r -e -P … note.infozip.zip evidence` | ZipCrypto, flags `0x0009` (data descriptor: check byte from the DOS time) |
+| `mixed.zip` | `7zz a -tzip mixed.zip plain.txt`, then `7zz a -tzip -mem=AES256 -p… mixed.zip evidence` | one plain file beside AES ones |
+| `note.bzip2.zip` | `7zz a -tzip -mm=BZip2 note.bzip2.zip evidence` | `filler.txt` method 12; `note.txt` Stored by 7-Zip |
+| `note.lzma.zip` | `7zz a -tzip -mm=LZMA note.lzma.zip evidence` | `filler.txt` method 14; `note.txt` Stored |

@@ -42,6 +42,8 @@ src/
                     sniff_container: the one decision on what kind of file an operand is
       zip.rs        ZIP central-directory decoders (shared) + ZipSource (mmap,
                     zero-copy STORED; per-entry CRC-32 for export integrity)
+      zip_crypto.rs encrypted ZIP entries: ZipCrypto and WinZip AES (decode is in zip.rs,
+                    shared by the mapped, ranged and nested readers)
       ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
                     (no whole-file mmap; lazy data-offset resolution; header-first
                     prefix reads). Reuses zip.rs's central-directory decoders.

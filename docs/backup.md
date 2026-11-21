@@ -57,7 +57,7 @@ apps/com.app/db/data.db        ->  data/data/com.app/databases/data.db
 | `--dry-run` | off | Report the plan and write nothing |
 | `--continue-on-error` | off | Keep what can be read of a damaged backup, recording the rest |
 | `--backup-password PW` | — | Else `MFSCAN_BACKUP_PASSWORD`, else the acquisition defaults |
-| `--archive-password PASS` | — | An encrypted 7z holding the backup; else `MFSCAN_ARCHIVE_PASSWORD` |
+| `--archive-password PASS` | — | An encrypted 7z or ZIP holding the backup; else `MFSCAN_ARCHIVE_PASSWORD` |
 | `--max-size SIZE` | no cap | Refuse the rebuild if the files would exceed this |
 | `--verify` | off | SHA-256 the source file before and after reading |
 

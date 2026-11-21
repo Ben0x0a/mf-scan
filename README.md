@@ -24,8 +24,9 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 
 - **~40–100× faster than `zipgrep`** on STORED archives (memory-mapped, no
   per-file process spawn, SIMD search).
-- **Archives *and* folders** — point at a `.zip`, a `.tar` (plain, or compressed
-  with gzip, bzip2, xz or zstd), a `.7z` (AES-encrypted too), or a directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
+- **Archives *and* folders** — point at a `.zip` (AES- or ZipCrypto-encrypted too), a
+  `.tar` (plain, or compressed with gzip, bzip2, xz or zstd), a `.7z` (AES-encrypted
+  too), or a directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
   folder and searches the files within them. (A plain `.tar` is memory-mapped and
   reports true archive offsets; a compressed tar or a 7z is decoded once, in memory up
   to 64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
@@ -201,6 +202,19 @@ zstd/brotli/lz4 methods of some 7-Zip forks) is an error, never a smaller archiv
 A 7z holding an iOS backup is opened as that backup. Its offsets are within each file
 only: no byte of the `.7z` holds them.
 
+A **ZIP** lists every file its central directory names. Encrypted files (WinZip AES
+128/192/256, or ZipCrypto) are decrypted with `--archive-password` or
+`MFSCAN_ARCHIVE_PASSWORD`; the password is checked on open, on the smallest encrypted
+file decoded whole, and a wrong one stops the run. Each encrypted file is then
+verified as it is read (the AES authentication code, or the CRC-32 for ZipCrypto,
+whose one check byte lets a wrong password through 1 time in 256). A match in an
+encrypted file is flagged `decrypted`, and its archive offset is the file's data start.
+Files that cannot be read (encrypted with no password, PKWARE strong encryption, or a
+compression method other than Stored and Deflate, such as bzip2 or LZMA) are still
+listed: stderr says how many and why as the archive is opened, the end-of-run count
+includes them, and the run exits 2. Encrypted files inside a nested archive are not
+decrypted.
+
 A **directory** operand needs one of these two flags to say how to read it (there is no
 silent default — a directory with neither is rejected; the two are mutually exclusive):
 
@@ -266,7 +280,7 @@ With more than one source, each result is tagged with its origin (see
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
 | `--backup-password PASSWORD` | Password to unlock an **encrypted iOS or Android backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
-| `--archive-password PASS` | Password of an **encrypted 7z** (or set `MFSCAN_ARCHIVE_PASSWORD`), separate from the backup's: a 7z can hold an encrypted backup. |
+| `--archive-password PASS` | Password of an **encrypted 7z or ZIP** (or set `MFSCAN_ARCHIVE_PASSWORD`), separate from the backup's: an archive can hold an encrypted backup. |
 
 **Encoded matches.** Each match is one byte span in one encoding, so searching
 several encodings never duplicates a match: a match that is not plain UTF-8 is

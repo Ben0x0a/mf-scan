@@ -35,8 +35,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::core::models::{Entry, Location, Method};
-use crate::core::source::zip::{self, SIG_LFH};
+use crate::core::models::{Encryption, Entry, Location, Method};
+use crate::core::source::zip::{self, Coding, SIG_LFH};
+use crate::core::source::zip_crypto::ZipPassword;
 use crate::core::source::{Content, IntegrityCheck, Source};
 
 /// Bytes read from the tail to locate the EOCD + ZIP64 records. The EOCD may be
@@ -52,6 +53,8 @@ const LFH_FIXED: u64 = 30;
 /// A [`Source`] over a ZIP archive backed by positioned reads.
 pub struct RangedZipSource {
     file: File,
+    /// The password for encrypted entries, when one was given.
+    password: Option<String>,
     /// Public entries. Each [`Location::RangedZip`] carries everything a read
     /// needs (method, LFH offset, compressed length), so [`Source::content`] reads
     /// straight from the entry — no per-call lookup, no O(N) scan over a parallel
@@ -66,6 +69,12 @@ impl RangedZipSource {
     /// Open `path` and parse its central directory with two positioned reads
     /// (the tail, then the central-directory range) — without mapping the file.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_password(path, None)
+    }
+
+    /// [`RangedZipSource::open`], with the password of its encrypted entries,
+    /// checked on the smallest one as for a mapped archive.
+    pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("cannot open archive {}", path.display()))?;
         let size = file
@@ -95,16 +104,31 @@ impl RangedZipSource {
                 mtime: ce.mtime,
                 location: Location::RangedZip {
                     method: ce.method,
+                    encryption: ce.encryption,
                     header_offset: ce.local_offset,
                     data_len: ce.comp_size,
                 },
             });
         }
-        Ok(Self {
+        let source = Self {
             file,
+            password: password.map(str::to_string),
             entries,
             crc_by_name,
-        })
+        };
+        zip::check_password(&source, password.is_some())?;
+        Ok(source)
+    }
+
+    fn coding(&self, method: Method, encryption: Encryption) -> Coding<'_> {
+        Coding {
+            method,
+            encryption,
+            password: match &self.password {
+                Some(password) => ZipPassword::Given(password),
+                None => ZipPassword::Missing,
+            },
+        }
     }
 
     /// Resolve an entry's real data start by reading its Local File Header.
@@ -132,6 +156,7 @@ fn ranged_loc(entry: &Entry) -> Result<(Method, u64, u64)> {
             method,
             header_offset,
             data_len,
+            ..
         } => Ok((method, header_offset, data_len)),
         _ => anyhow::bail!(
             "RangedZipSource called on a non-ranged entry: {}",
@@ -147,16 +172,19 @@ impl Source for RangedZipSource {
 
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
         let (method, header_offset, data_len) = ranged_loc(entry)?;
+        let encryption = match entry.location {
+            Location::RangedZip { encryption, .. } => encryption,
+            _ => Encryption::None,
+        };
         let start = self.data_start(header_offset)?;
         let raw = read_range_chunked(&self.file, start, data_len)?;
-        match method {
-            Method::Stored => Ok(Content::Owned(raw)),
-            Method::Deflate => {
-                let inflated = zip::inflate(&raw, entry.uncompressed_size)
-                    .with_context(|| format!("failed to inflate {}", entry.name))?;
-                Ok(Content::Owned(inflated))
-            }
-        }
+        let content = zip::decode(
+            &raw,
+            self.coding(method, encryption),
+            entry.uncompressed_size,
+            &entry.name,
+        )?;
+        Ok(Content::Owned(content.into_owned()))
     }
 
     fn byte_size(&self) -> u64 {
@@ -183,6 +211,13 @@ impl Source for RangedZipSource {
     /// its (compressed) range and inflates just the prefix.
     fn content_prefix(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
         let (method, header_offset, data_len) = ranged_loc(entry)?;
+        // Encrypted, or a method not read: no cheap partial read, so the whole
+        // entry is decoded (or fails, saying why) and its start kept.
+        if entry.is_encrypted() || matches!(method, Method::Other(_)) {
+            let mut whole = self.content(entry)?.into_owned();
+            whole.truncate(max);
+            return Ok(Content::Owned(whole));
+        }
         let start = self.data_start(header_offset)?;
         match method {
             Method::Stored => {
@@ -198,13 +233,15 @@ impl Source for RangedZipSource {
                     .with_context(|| format!("failed to inflate prefix of {}", entry.name))?;
                 Ok(Content::Owned(out))
             }
+            // Decoded whole above.
+            Method::Other(_) => unreachable!("an unread method is decoded whole above"),
         }
     }
 
     /// Only a STORED entry: a DEFLATE stream must be inflated from its start to
     /// reach its end.
     fn cheap_suffix(&self, entry: &Entry) -> bool {
-        matches!(ranged_loc(entry), Ok((Method::Stored, _, _)))
+        !entry.is_encrypted() && matches!(ranged_loc(entry), Ok((Method::Stored, _, _)))
     }
 
     /// Read only the last `max` uncompressed bytes. A STORED entry is one small
@@ -214,6 +251,12 @@ impl Source for RangedZipSource {
     /// read (`zip::inflate`) would refuse it.
     fn content_suffix(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
         let (method, header_offset, data_len) = ranged_loc(entry)?;
+        // As for the prefix: decoded whole, its end kept.
+        if entry.is_encrypted() || matches!(method, Method::Other(_)) {
+            let whole = self.content(entry)?.into_owned();
+            let from = whole.len().saturating_sub(max);
+            return Ok(Content::Owned(whole[from..].to_vec()));
+        }
         let start = self.data_start(header_offset)?;
         match method {
             Method::Stored => {
@@ -256,6 +299,8 @@ impl Source for RangedZipSource {
                 tail.drain(..tail.len().saturating_sub(max));
                 Ok(Content::Owned(tail))
             }
+            // Decoded whole above.
+            Method::Other(_) => unreachable!("an unread method is decoded whole above"),
         }
     }
 

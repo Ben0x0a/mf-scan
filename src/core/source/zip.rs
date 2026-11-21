@@ -1,12 +1,20 @@
 //! ZIP archive source: central-directory parser + the [`ZipSource`] container.
 //!
 //! Defines: `parse_entries`, which reads a ZIP archive's Central Directory and
-//! resolves every searchable file's byte range and compression method; `content`,
-//! which borrows a STORED entry's bytes from the archive or inflates a DEFLATE one;
-//! and [`ZipSource`], the [`crate::core::source::Source`] over a memory-mapped archive.
-//! Used by: `source` (the open helpers), `engine` (search over a `Source`) and
+//! resolves every file's byte range, compression method and encryption; `content`,
+//! which borrows a STORED entry's bytes from the archive or inflates a DEFLATE one,
+//! decrypting it first when it is encrypted; [`ZipSource`], the
+//! [`crate::core::source::Source`] over a memory-mapped archive; and
+//! [`not_searched_notes`], what an archive holds that cannot be searched.
+//! Used by: `source` (the open helpers), `ranged` and `folder`/`nested` (the shared
+//! directory walk and `decode`), `engine` (search over a `Source`) and
 //! `report::export` (re-reads matched files' bytes).
-//! Uses: `crate::core::models::{Entry, Location, Method}`, `flate2` (inflate), `anyhow`.
+//! Uses: `crate::core::models::{Encryption, Entry, Location, Method}`, `zip_crypto`
+//! (ZipCrypto and WinZip AES), `flate2` (inflate), `anyhow`.
+//!
+//! Every entry the Central Directory lists is kept. One whose method is not read
+//! (bzip2, LZMA, …) or whose encryption cannot be opened fails when it is read, so
+//! the engine counts it as not searched and the run says so; it is never left out.
 //! All integer decoding is done by hand so the parsing flow stays explicit.
 //!
 //! Why CD-first instead of a blind linear scan: the Central Directory is the
@@ -20,7 +28,8 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::read::DeflateDecoder;
 use rayon::prelude::*;
 
-use crate::core::models::{Entry, Location, Method};
+use crate::core::models::{Encryption, Entry, Location, Method};
+use crate::core::source::zip_crypto::{self, ZipPassword};
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::core::util::unix_from_civil;
 
@@ -37,6 +46,11 @@ const METHOD_STORED: u16 = 0; // compression method 0 = no compression
 const METHOD_DEFLATE: u16 = 8; // compression method 8 = DEFLATE
 const ZIP64_EXTRA_ID: u16 = 0x0001; // header id of the ZIP64 extended-info field
 const TIMESTAMP_EXTRA_ID: u16 = 0x5455; // Info-ZIP extended timestamp (exact UTC seconds)
+const METHOD_AES: u16 = 99; // WinZip AES: the real method is in the AES extra field
+const AES_EXTRA_ID: u16 = 0x9901; // WinZip AES extra field (AE-1 / AE-2)
+const FLAG_ENCRYPTED: u16 = 1 << 0; // general-purpose flag: the data is encrypted
+const FLAG_DESCRIPTOR: u16 = 1 << 3; // sizes and CRC follow the data (data descriptor)
+const FLAG_STRONG: u16 = 1 << 6; // PKWARE strong encryption
 
 /// One decoded Central Directory record, *before* its on-disk data offset is
 /// resolved from the Local File Header.
@@ -49,6 +63,7 @@ const TIMESTAMP_EXTRA_ID: u16 = 0x5455; // Info-ZIP extended timestamp (exact UT
 pub(crate) struct CdEntry {
     pub(crate) name: String,
     pub(crate) method: Method,
+    pub(crate) encryption: Encryption,
     /// Compressed (on-disk) data length.
     pub(crate) comp_size: u64,
     /// Uncompressed (logical) data length.
@@ -60,7 +75,7 @@ pub(crate) struct CdEntry {
     pub(crate) local_offset: u64,
 }
 
-/// Parse the archive and return every searchable (STORED or DEFLATE) entry.
+/// Parse the archive and return every entry its Central Directory lists.
 pub fn parse_entries(data: &[u8]) -> Result<Vec<Entry>> {
     Ok(parse_entries_with_crc(data)?
         .into_iter()
@@ -105,6 +120,7 @@ pub fn parse_entries_with_crc(data: &[u8]) -> Result<Vec<(Entry, u32)>> {
                     mtime: ce.mtime,
                     location: Location::Zip {
                         method: ce.method,
+                        encryption: ce.encryption,
                         data_offset,
                         data_len: ce.comp_size,
                     },
@@ -158,8 +174,7 @@ pub(crate) fn find_cd_location(buf: &[u8], base: u64) -> Result<CdLocation> {
     })
 }
 
-/// Walk `total_entries` Central Directory File Headers from the start of `cd`,
-/// keeping the searchable (STORED / DEFLATE) ones.
+/// Walk `total_entries` Central Directory File Headers from the start of `cd`.
 ///
 /// `cd` is the central-directory byte range only (its first byte is the first
 /// `CDFH` signature), so positions here are relative to it; the `local_offset`
@@ -169,9 +184,7 @@ pub(crate) fn parse_cd_headers(cd: &[u8], total_entries: u64) -> Result<Vec<CdEn
     let mut pos = 0usize;
     for _ in 0..total_entries {
         let (record, next) = decode_cd_header(cd, pos)?;
-        if let Some(ce) = record {
-            out.push(ce);
-        }
+        out.push(record);
         pos = next;
     }
     Ok(out)
@@ -219,11 +232,10 @@ fn read_zip64_eocd(buf: &[u8], base: u64, eocd: usize) -> Result<Zip64Eocd> {
 
 /// Decode one Central Directory File Header at `pos` within the CD buffer.
 ///
-/// Returns the decoded record (or `None` for a non-searchable method) plus the
-/// offset of the next header, so the caller can keep walking regardless of
-/// whether this entry was kept. Does NOT resolve the data offset — that needs the
-/// Local File Header, which the two sources reach differently.
-fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
+/// Returns the decoded record plus the offset of the next header. Does NOT resolve
+/// the data offset — that needs the Local File Header, which the two sources reach
+/// differently.
+fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(CdEntry, usize)> {
     // A wrong signature here means we have lost sync with the directory; every
     // subsequent field would be misread, so stop rather than emit junk.
     ensure!(
@@ -231,6 +243,7 @@ fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
         "bad central-directory header signature at offset {pos}"
     );
 
+    let flags = read_u16(cd, pos + 8)?;
     let method_code = read_u16(cd, pos + 10)?;
     // Last-modified DOS time/date (2 bytes each), decoded for `diff`'s mtime compare.
     let dos_time = read_u16(cd, pos + 12)?;
@@ -277,19 +290,41 @@ fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
         }
     }
 
-    // Only STORED and DEFLATE are searchable; any other method is skipped.
+    // WinZip AES names method 99 and keeps the real one in its extra field. An AES
+    // entry without that field cannot be opened, but is still listed.
+    let (method_code, encryption) = if method_code == METHOD_AES {
+        match read_aes_extra(cd, extra_start, extra_len) {
+            Some((strength, method)) => (method, Encryption::Aes { strength }),
+            None => (method_code, Encryption::Unsupported),
+        }
+    } else if flags & FLAG_ENCRYPTED == 0 {
+        (method_code, Encryption::None)
+    } else if flags & FLAG_STRONG != 0 {
+        (method_code, Encryption::Unsupported)
+    } else {
+        // APPNOTE 6.1.6: the header's check byte is the CRC's high byte, or, when a
+        // data descriptor follows (the CRC was unknown while writing), the high byte
+        // of the DOS time.
+        let check = if flags & FLAG_DESCRIPTOR != 0 {
+            (dos_time >> 8) as u8
+        } else {
+            (crc32 >> 24) as u8
+        };
+        (method_code, Encryption::ZipCrypto { check, crc32 })
+    };
     let method = match method_code {
         METHOD_STORED => Method::Stored,
         METHOD_DEFLATE => Method::Deflate,
-        _ => return Ok((None, next)),
+        other => Method::Other(other),
     };
 
     let name = String::from_utf8_lossy(slice(cd, name_start, name_len)?).into_owned();
 
     Ok((
-        Some(CdEntry {
+        CdEntry {
             name,
             method,
+            encryption,
             comp_size,
             uncomp_size,
             // The extended timestamp, when present, is exact and in UTC; the DOS field
@@ -298,7 +333,7 @@ fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
                 .or_else(|| dos_to_unix(dos_date, dos_time)),
             crc32,
             local_offset,
-        }),
+        },
         next,
     ))
 }
@@ -309,19 +344,37 @@ fn decode_cd_header(cd: &[u8], pos: usize) -> Result<(Option<CdEntry>, usize)> {
 /// field's body is a flags byte (bit 0: a modification time follows) and a signed
 /// 32-bit time. A malformed or negative value yields `None`, and the DOS field is used.
 fn read_timestamp_extra(data: &[u8], extra_start: usize, extra_len: usize) -> Option<u64> {
+    let body = find_extra(data, extra_start, extra_len, TIMESTAMP_EXTRA_ID)?;
+    let (&flags, rest) = body.split_first()?;
+    if flags & 1 == 0 {
+        return None;
+    }
+    let bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    u64::try_from(i32::from_le_bytes(bytes)).ok()
+}
+
+/// The AES strength (1, 2, 3) and real compression method in an entry's WinZip AES
+/// extra field: vendor version (AE-1 or AE-2), vendor id `AE`, strength, method.
+fn read_aes_extra(data: &[u8], extra_start: usize, extra_len: usize) -> Option<(u8, u16)> {
+    let body = find_extra(data, extra_start, extra_len, AES_EXTRA_ID)?;
+    let [_, _, b'A', b'E', strength, m0, m1, ..] = *body else {
+        return None;
+    };
+    Some((strength, u16::from_le_bytes([m0, m1])))
+}
+
+/// The body of the extra-area block `id`, if the entry has one.
+///
+/// HOW: the extra area is a sequence of `(id: u16, size: u16, body)` blocks. A block
+/// running past the area ends the walk.
+fn find_extra(data: &[u8], extra_start: usize, extra_len: usize, id: u16) -> Option<&[u8]> {
     let extra = data.get(extra_start..extra_start.checked_add(extra_len)?)?;
     let mut pos = 0;
     while let Some(block) = extra.get(pos..pos + 4) {
-        let id = u16::from_le_bytes([block[0], block[1]]);
         let size = u16::from_le_bytes([block[2], block[3]]) as usize;
         let body = extra.get(pos + 4..pos + 4 + size)?;
-        if id == TIMESTAMP_EXTRA_ID {
-            let (&flags, rest) = body.split_first()?;
-            if flags & 1 == 0 {
-                return None;
-            }
-            let bytes: [u8; 4] = rest.get(..4)?.try_into().ok()?;
-            return u64::try_from(i32::from_le_bytes(bytes)).ok();
+        if u16::from_le_bytes([block[0], block[1]]) == id {
+            return Some(body);
         }
         pos += 4 + size;
     }
@@ -543,8 +596,18 @@ fn dos_to_unix(date: u16, time: u16) -> Option<u64> {
 /// decompressed into an owned buffer, so reported offsets are positions within the
 /// *decompressed* stream. A non-ZIP entry is a caller bug and errors.
 pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Content<'a>> {
+    content_with(archive, entry, ZipPassword::Missing)
+}
+
+/// [`content`], with what is known of the password for an encrypted entry.
+pub(crate) fn content_with<'a>(
+    archive: &'a [u8],
+    entry: &Entry,
+    password: ZipPassword,
+) -> Result<Content<'a>> {
     let Location::Zip {
         method,
+        encryption,
         data_offset,
         data_len,
     } = &entry.location
@@ -553,12 +616,25 @@ pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Content<'a>> {
     };
     read_range(
         archive,
-        *method,
+        Coding {
+            method: *method,
+            encryption: *encryption,
+            password,
+        },
         *data_offset,
         *data_len,
         entry.uncompressed_size,
         &entry.name,
     )
+}
+
+/// How an entry's data is coded: its compression, its encryption, and what is known
+/// of the password.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Coding<'p> {
+    pub(crate) method: Method,
+    pub(crate) encryption: Encryption,
+    pub(crate) password: ZipPassword<'p>,
 }
 
 /// Read a ZIP data range from `archive` by explicit fields: borrow the slice for
@@ -568,9 +644,9 @@ pub fn content<'a>(archive: &'a [u8], entry: &Entry) -> Result<Content<'a>> {
 /// in-memory *nested* archive (where the offsets are into a folder source's blob, not
 /// a top-level `Entry`'s mmap). `uncompressed_size` is the inflate capacity hint and
 /// `name` only labels errors.
-pub fn read_range<'a>(
+pub(crate) fn read_range<'a>(
     archive: &'a [u8],
-    method: Method,
+    coding: Coding,
     data_offset: u64,
     data_len: u64,
     uncompressed_size: u64,
@@ -585,15 +661,165 @@ pub fn read_range<'a>(
         .checked_add(data_len as usize)
         .and_then(|end| archive.get(start..end))
         .with_context(|| format!("data range of {name} is out of bounds"))?;
+    decode(raw, coding, uncompressed_size, name)
+}
 
-    match method {
-        Method::Stored => Ok(Content::Borrowed(raw)),
-        Method::Deflate => {
-            let inflated = inflate(raw, uncompressed_size)
-                .with_context(|| format!("failed to inflate {name}"))?;
-            Ok(Content::Owned(inflated))
+/// An entry's content from its raw data as stored: decrypted, then decompressed.
+///
+/// Shared by the mapped, ranged and nested ZIP readers, so an entry is decoded the
+/// same way whichever read it. Unencrypted STORED data is borrowed, not copied. A
+/// ZipCrypto entry's CRC-32 is checked here: its 12-byte header carries one check
+/// byte, so a wrong password passes it 1 time in 256, and its output would be
+/// searched as garbage; the CRC catches that (WinZip AES has its own HMAC).
+pub(crate) fn decode<'a>(
+    raw: &'a [u8],
+    coding: Coding,
+    uncompressed_size: u64,
+    name: &str,
+) -> Result<Content<'a>> {
+    let Coding {
+        method,
+        encryption,
+        password,
+    } = coding;
+    // Before decrypting: a method that cannot be read fails the same way whether or
+    // not the entry is encrypted, and costs no key derivation.
+    if let Method::Other(code) = method {
+        bail!(
+            "{name} uses compression method {code} ({}), which mf-scan does not read",
+            method_name(code)
+        );
+    }
+    let content = if encryption == Encryption::None {
+        match method {
+            Method::Stored => Content::Borrowed(raw),
+            _ => Content::Owned(
+                inflate(raw, uncompressed_size)
+                    .with_context(|| format!("failed to inflate {name}"))?,
+            ),
+        }
+    } else {
+        let plain = zip_crypto::decrypt(raw, encryption, password)
+            .with_context(|| format!("cannot decrypt {name}"))?;
+        Content::Owned(match method {
+            Method::Stored => plain,
+            _ => inflate(&plain, uncompressed_size).with_context(|| {
+                format!(
+                    "failed to inflate {name} after decryption (a wrong password, or damaged data)"
+                )
+            })?,
+        })
+    };
+    if let Encryption::ZipCrypto { crc32, .. } = encryption {
+        let actual = crc32fast::hash(&content);
+        ensure!(
+            actual == crc32,
+            "{name}: the CRC-32 after decryption is {actual:08x}, not the recorded \
+             {crc32:08x} (a wrong password, or damaged data)"
+        );
+    }
+    Ok(content)
+}
+
+/// A ZIP compression method's name (APPNOTE 4.4.5), for messages.
+fn method_name(code: u16) -> &'static str {
+    match code {
+        1 => "shrunk",
+        2..=5 => "reduced",
+        6 => "imploded",
+        9 => "Deflate64",
+        10 => "PKWARE DCL imploded",
+        12 => "bzip2",
+        14 => "LZMA",
+        18 => "IBM TERSE",
+        19 => "IBM LZ77",
+        93 => "Zstandard",
+        94 => "MP3",
+        95 => "xz",
+        96 => "JPEG",
+        97 => "WavPack",
+        98 => "PPMd",
+        99 => "AES without its extra field",
+        _ => "unknown",
+    }
+}
+
+/// What in `entries` cannot be searched as the archive is opened, one line each for
+/// stderr: encrypted entries (and whether a password was given), encryption not read,
+/// compression methods not read. Empty when everything can be read.
+///
+/// WHY at open, not only in the end-of-run count: the count says how many files
+/// could not be read, these lines say why, and what would open them.
+pub fn not_searched_notes(entries: &[Entry], password_given: bool) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut aes = BTreeMap::new();
+    let mut zipcrypto = 0usize;
+    let mut unsupported = 0usize;
+    let mut methods: BTreeMap<u16, usize> = BTreeMap::new();
+    for entry in entries {
+        let (Location::Zip {
+            method, encryption, ..
+        }
+        | Location::RangedZip {
+            method, encryption, ..
+        }
+        | Location::Nested {
+            method, encryption, ..
+        }) = &entry.location
+        else {
+            continue;
+        };
+        match encryption {
+            Encryption::None => {}
+            Encryption::ZipCrypto { .. } => zipcrypto += 1,
+            Encryption::Aes { strength } => *aes.entry(*strength).or_insert(0usize) += 1,
+            Encryption::Unsupported => unsupported += 1,
+        }
+        if let Method::Other(code) = method {
+            *methods.entry(*code).or_insert(0) += 1;
         }
     }
+    let mut notes = Vec::new();
+    let mut schemes: Vec<String> = aes
+        .iter()
+        .map(|(strength, n)| format!("{n} AES-{}", 64 + 64 * u32::from(*strength)))
+        .collect();
+    if zipcrypto > 0 {
+        schemes.push(format!("{zipcrypto} ZipCrypto"));
+    }
+    if !schemes.is_empty() {
+        let total = zipcrypto + aes.values().sum::<usize>();
+        notes.push(if password_given {
+            format!(
+                "{total} encrypted file(s) ({}), decrypted with the supplied password",
+                schemes.join(", ")
+            )
+        } else {
+            format!(
+                "⚠ {total} encrypted file(s) ({}) NOT searched: pass the password with \
+                 --archive-password (or MFSCAN_ARCHIVE_PASSWORD)",
+                schemes.join(", ")
+            )
+        });
+    }
+    if unsupported > 0 {
+        notes.push(format!(
+            "⚠ {unsupported} file(s) NOT searched: an encryption mf-scan does not read \
+             (PKWARE strong encryption, or a malformed AES field)"
+        ));
+    }
+    if !methods.is_empty() {
+        let list: Vec<String> = methods
+            .iter()
+            .map(|(code, n)| format!("{n} {} ({code})", method_name(*code)))
+            .collect();
+        notes.push(format!(
+            "⚠ {} file(s) NOT searched: a compression method mf-scan does not read: {}",
+            methods.values().sum::<usize>(),
+            list.join(", ")
+        ));
+    }
+    notes
 }
 
 /// Cap on the inflate pre-allocation hint. `expected_size` comes from the
@@ -628,6 +854,8 @@ pub(crate) fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> 
 /// borrowed `data` is the read-only mmap held by the caller for the source's life.
 pub struct ZipSource<'d> {
     data: &'d [u8],
+    /// The password for encrypted entries, when one was given.
+    password: Option<String>,
     entries: Vec<Entry>,
     /// Central-Directory CRC-32 per entry, parallel to `entries`. Kept so
     /// [`Source::integrity_check`] can attest an entry's bytes against the value
@@ -638,14 +866,77 @@ pub struct ZipSource<'d> {
 impl<'d> ZipSource<'d> {
     /// Parse `data`'s central directory and build the source.
     pub fn open(data: &'d [u8]) -> Result<Self> {
+        Self::open_with_password(data, None)
+    }
+
+    /// [`ZipSource::open`], with the password of its encrypted entries. A password
+    /// that does not open the smallest encrypted entry is an error here, before any
+    /// search (see `check_password`).
+    pub fn open_with_password(data: &'d [u8], password: Option<&str>) -> Result<Self> {
         let (entries, crcs): (Vec<Entry>, Vec<u32>) =
             parse_entries_with_crc(data)?.into_iter().unzip();
-        Ok(Self {
+        let source = Self {
             data,
+            password: password.map(str::to_string),
             entries,
             crcs,
-        })
+        };
+        check_password(&source, password.is_some())?;
+        Ok(source)
     }
+
+    fn password(&self) -> ZipPassword<'_> {
+        match &self.password {
+            Some(password) => ZipPassword::Given(password),
+            None => ZipPassword::Missing,
+        }
+    }
+}
+
+/// With a password given, decode the smallest entry it should open, whole.
+///
+/// WHY: a wrong password must stop the run with that reason, not turn every
+/// encrypted file into an "unreadable" count the examiner has to explain. The whole
+/// entry is decoded because only the CRC (ZipCrypto) or the HMAC (AES) tells a wrong
+/// password for sure; the smallest keeps that cheap. An archive whose files have
+/// different passwords opens with the smallest one's: the others are then counted as
+/// not searched, each failing its own check.
+pub(crate) fn check_password(source: &dyn Source, password_given: bool) -> Result<()> {
+    if !password_given {
+        return Ok(());
+    }
+    let smallest = source
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.is_encrypted()
+                && !matches!(
+                    &e.location,
+                    Location::Zip {
+                        encryption: Encryption::Unsupported,
+                        ..
+                    } | Location::Zip {
+                        method: Method::Other(_),
+                        ..
+                    } | Location::RangedZip {
+                        encryption: Encryption::Unsupported,
+                        ..
+                    } | Location::RangedZip {
+                        method: Method::Other(_),
+                        ..
+                    }
+                )
+        })
+        .min_by_key(|e| e.uncompressed_size);
+    if let Some(entry) = smallest {
+        source.content(entry).with_context(|| {
+            format!(
+                "the password given does not open {} (the smallest encrypted file, checked first)",
+                entry.name
+            )
+        })?;
+    }
+    Ok(())
 }
 
 impl Source for ZipSource<'_> {
@@ -654,7 +945,7 @@ impl Source for ZipSource<'_> {
     }
 
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
-        content(self.data, entry)
+        content_with(self.data, entry, self.password())
     }
 
     fn byte_size(&self) -> u64 {

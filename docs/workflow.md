@@ -237,4 +237,9 @@ See [diff.md](diff.md) for the comparison rules and report schema.
 - DEFLATE entries are decompressed automatically; their `file_offset` is the
   position in the decompressed stream and `archive_offset` is the compressed
   blob's start (flagged `compressed`).
-- Directory entries and unsupported compression methods are skipped.
+- Directory entries are skipped. A file whose compression method is not read (bzip2,
+  LZMA, …) or whose encryption cannot be opened is listed but not searched: stderr
+  says why as the archive opens, it is counted as not searched, and the run exits 2.
+- Encrypted ZIP files (WinZip AES, ZipCrypto) are decrypted with `--archive-password`;
+  a match in one is flagged `decrypted`, and its `archive_offset` is the file's data
+  start.

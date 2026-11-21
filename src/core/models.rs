@@ -183,14 +183,39 @@ impl Encoding {
     }
 }
 
-/// Compression method of a searchable entry.
+/// Compression method of a ZIP entry.
 ///
-/// Only the two methods that appear in mobile-forensic archives are modelled;
-/// any other method is dropped by the parser rather than represented here.
+/// Stored and Deflate are the two methods mobile-forensic archives use, and the two
+/// read. Any other is kept as [`Method::Other`], so the entry is listed and reported
+/// as not searched rather than left out of the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Stored,
     Deflate,
+    /// A method this tool does not decode, by its ZIP number (12 bzip2, 14 LZMA, …).
+    Other(u16),
+}
+
+/// How a ZIP entry's data is encrypted (APPNOTE 6.1, and WinZip's AE-1/AE-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    None,
+    /// Traditional PKWARE encryption. `check` is the byte the 12-byte encryption
+    /// header must decrypt to last; `crc32` is the CRC of the plain data, verified
+    /// after decoding, since one check byte lets a wrong password through 1 time in
+    /// 256.
+    ZipCrypto {
+        check: u8,
+        crc32: u32,
+    },
+    /// WinZip AES (method 99). `strength` 1, 2 or 3 is AES-128, -192 or -256; the
+    /// data carries a password check value and an HMAC-SHA1 over the ciphertext.
+    Aes {
+        strength: u8,
+    },
+    /// An encryption this tool does not read (PKWARE strong encryption, or an AES
+    /// entry without a valid AES extra field).
+    Unsupported,
 }
 
 /// Where a located file's bytes physically live — the one thing that differs
@@ -207,6 +232,7 @@ pub enum Location {
     /// stream for DEFLATE).
     Zip {
         method: Method,
+        encryption: Encryption,
         data_offset: u64,
         data_len: u64,
     },
@@ -219,6 +245,7 @@ pub enum Location {
     /// (like a loose/nested entry) — the in-file offset is still exact.
     RangedZip {
         method: Method,
+        encryption: Encryption,
         header_offset: u64,
         data_len: u64,
     },
@@ -232,6 +259,7 @@ pub enum Location {
     Nested {
         archive: usize,
         method: Method,
+        encryption: Encryption,
         data_offset: u64,
         data_len: u64,
     },
@@ -287,6 +315,16 @@ impl Entry {
             | Location::Nested { .. }
             | Location::Tar { .. }
             | Location::SevenZ { .. } => None,
+        }
+    }
+
+    /// True when a ZIP entry's data is encrypted (in whichever ZIP location).
+    pub fn is_encrypted(&self) -> bool {
+        match &self.location {
+            Location::Zip { encryption, .. }
+            | Location::RangedZip { encryption, .. }
+            | Location::Nested { encryption, .. } => *encryption != Encryption::None,
+            Location::Loose { .. } | Location::Tar { .. } | Location::SevenZ { .. } => false,
         }
     }
 
@@ -445,6 +483,9 @@ impl MatchRecord {
         // let `compressed` flag the caveat. No resolved start (loose/nested, or an
         // unresolvable ranged header): no archive byte, `file_start` 0.
         let compressed = entry.is_compressed();
+        // An encrypted entry's match is in the decrypted bytes: like DEFLATE, no
+        // archive byte holds it, so the offset is the data's start.
+        let decrypted = entry.is_encrypted();
         let (file_start, archive_offset) = match (&entry.location, archive_data_start) {
             // A top-level ZIP entry (mmap or ranged) or a plain `.tar` entry with its
             // data start resolved — the offset is the exact archive byte.
@@ -452,7 +493,7 @@ impl MatchRecord {
                 Location::Zip { .. } | Location::RangedZip { .. } | Location::Tar { .. },
                 Some(start),
             ) => {
-                let offset = if compressed {
+                let offset = if compressed || decrypted {
                     start
                 } else {
                     start + hit.offset
@@ -472,7 +513,7 @@ impl MatchRecord {
             line_number: None,
             archive_offset,
             compressed,
-            decrypted: false,
+            decrypted,
             line: hit.line,
             match_in_line: hit.match_in_line,
             inspection: None,
@@ -504,6 +545,7 @@ mod tests {
             mtime: None,
             location: Location::Zip {
                 method,
+                encryption: Encryption::None,
                 data_offset,
                 data_len,
             },
@@ -540,6 +582,7 @@ mod tests {
             mtime: None,
             location: Location::RangedZip {
                 method: Method::Stored,
+                encryption: Encryption::None,
                 header_offset: 40,
                 data_len: 50,
             },

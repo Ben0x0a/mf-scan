@@ -369,12 +369,18 @@ pub(crate) fn with_operand_source<R>(
         // page-by-page over the network. The ranged source has no single backing
         // buffer, so `--verify` (which needs the raw bytes) is passed `None`.
         Operand::Archive(path) if io_mode.use_ranged(path) => {
-            let source = RangedZipSource::open(path)?;
+            let password = backup.archive_password.as_deref();
+            let source = RangedZipSource::open_with_password(path, password)
+                .with_context(|| format!("cannot open {}", path.display()))?;
+            print_zip_notes(path, source.entries(), password.is_some());
             with_maybe_backup(&source, backup, record, |s| f(s, None))
         }
         Operand::Archive(path) => {
             let mmap = open_archive(path)?;
-            let source = ZipSource::open(&mmap)?;
+            let password = backup.archive_password.as_deref();
+            let source = ZipSource::open_with_password(&mmap, password)
+                .with_context(|| format!("cannot open {}", path.display()))?;
+            print_zip_notes(path, source.entries(), password.is_some());
             with_maybe_backup(&source, backup, record, |s| f(s, Some(&mmap)))
         }
         // Tar keeps its on-disk mapping alive alongside any inflated stream, so
@@ -441,6 +447,14 @@ pub(crate) fn with_operand_source<R>(
             let source = FolderSource::open(path, archive_depth)?;
             with_maybe_backup(&source, backup, record, |s| f(s, None))
         }
+    }
+}
+
+/// Print, once per archive, what in it cannot be searched or was decrypted (see
+/// `zip::not_searched_notes`). The end-of-run count adds the files that then failed.
+fn print_zip_notes(path: &Path, entries: &[mf_scan::core::models::Entry], password: bool) {
+    for note in mf_scan::core::source::zip::not_searched_notes(entries, password) {
+        eprintln!("zip: {}: {note}", path.display());
     }
 }
 
