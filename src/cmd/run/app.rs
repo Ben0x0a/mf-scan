@@ -195,7 +195,10 @@ fn open_app_source<R>(
         .next()
         .ok_or_else(|| anyhow!("no source to read"))?;
 
-    let backup_opts = BackupOptions::resolve(src.backup_password.as_deref());
+    let backup_opts = BackupOptions::resolve(
+        src.backup_password.as_deref(),
+        src.archive_password.as_deref(),
+    );
     let prov = BackupProvenance::new();
     let path_str = resolved.path.display().to_string();
     let operand = resolved.operand(src.archive_depth);

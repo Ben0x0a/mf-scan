@@ -4,10 +4,12 @@
 //! [`Lz4`], [`Lzfse`], [`Aea`].
 //! Used by: `identify` (re-export) → `inspect::mod` registry.
 //! Uses: `identify::has_at`, the `classify_inspector!` macro, and
-//! `core::source::compressed::Compression` (the one table of compression magics).
+//! `core::source::compressed::Compression` (the one table of compression magics),
+//! `core::source::sevenz::is_seven_z` (the 7z signature the 7z reader uses).
 
 use super::has_at;
 use crate::core::source::compressed::Compression;
+use crate::core::source::sevenz::is_seven_z;
 
 // ZIP (also APK, JAR, IPA, DOCX, …): a local file header, or the end record of an
 // empty archive.
@@ -33,12 +35,9 @@ classify_inspector!(Xz, "xz", "archive", [], |c: &[u8]| Compression::of(c)
 classify_inspector!(Zstd, "zstd", "archive", [], |c: &[u8]| Compression::of(c)
     == Some(Compression::Zstd));
 
-// 7-Zip: the 6-byte signature header. Not found in the test file systems.
-classify_inspector!(SevenZip, "7z", "archive", [], |c: &[u8]| has_at(
-    c,
-    0,
-    &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C]
-));
+// 7-Zip: the 6-byte signature header, as the 7z reader recognises it. Not found in
+// the test file systems.
+classify_inspector!(SevenZip, "7z", "archive", [], is_seven_z);
 
 // tar (POSIX ustar, and GNU tar's "ustar  "): the magic in the first header block.
 classify_inspector!(Tar, "tar", "archive", [], |c: &[u8]| has_at(

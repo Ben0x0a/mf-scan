@@ -25,11 +25,10 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 - **~40–100× faster than `zipgrep`** on STORED archives (memory-mapped, no
   per-file process spawn, SIMD search).
 - **Archives *and* folders** — point at a `.zip`, a `.tar` (plain, or compressed
-  with gzip, bzip2, xz or zstd), or a
-  directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
+  with gzip, bzip2, xz or zstd), a `.7z` (AES-encrypted too), or a directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
   folder and searches the files within them. (A plain `.tar` is memory-mapped and
-  reports true archive offsets; a compressed tar is decompressed once, in memory up to
-  64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
+  reports true archive offsets; a compressed tar or a 7z is decoded once, in memory up
+  to 64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
   evidence while the tool runs.)
 - **Tells you *where*, always** — every match reports the file path plus byte
   offsets (see [Offsets](#offsets)).
@@ -188,10 +187,19 @@ on success. All exit `2` on error.
 
 A **file** operand is identified by its content, then its name: a ZIP, a tar (plain, or
 gzip, bzip2, xz or zstd compressed: a compressed file is a tar when what it decodes to
-starts like one), or an Android backup is opened as one, and anything else is searched
-as one file. Every member or frame of a compressed stream is read and its checks
-verified; a damaged stream is an error, never a shorter archive. A damaged
-file named `.zip` or `.tar` fails rather than being searched as an opaque blob.
+starts like one), a 7z, or an Android backup is opened as one, and anything else is
+searched as one file. Every member or frame of a compressed stream is read and its
+checks verified; a damaged stream is an error, never a shorter archive. A damaged
+file named `.zip`, `.tar` or `.7z` fails rather than being searched as an opaque blob.
+
+A **7z** is decoded whole on open (LZMA, LZMA2, PPMd, BZip2, the BCJ filters), every
+member's CRC-32 verified. An encrypted one (AES-256, its list of files encrypted or
+not) needs `--archive-password` or `MFSCAN_ARCHIVE_PASSWORD`; it is used only if the
+archive is encrypted, and stderr says when it was. A missing or wrong password, a
+failed check, or a method this build does not decode (Deflate, Deflate64, and the
+zstd/brotli/lz4 methods of some 7-Zip forks) is an error, never a smaller archive.
+A 7z holding an iOS backup is opened as that backup. Its offsets are within each file
+only: no byte of the `.7z` holds them.
 
 A **directory** operand needs one of these two flags to say how to read it (there is no
 silent default — a directory with neither is rejected; the two are mutually exclusive):
@@ -202,7 +210,7 @@ silent default — a directory with neither is rejected; the two are mutually ex
   level, `N` = `N` levels of nesting).
 - `-r`, `--recursive` — walk the directory tree and treat **every archive** found
   (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`,
-  `.tar.zst`/`.tzst`, `.tar.md5`, `.ab`) as its own source, tagged by its path. Loose
+  `.tar.zst`/`.tzst`, `.tar.md5`, `.7z`, `.ab`) as its own source, tagged by its path. Loose
   files are not searched; how many were skipped is reported on stderr and in the scan
   report.
 
@@ -230,7 +238,7 @@ With more than one source, each result is tagged with its origin (see
 | `-E`, `--extended-regexp` | Accepted for grep muscle memory; no-op (the engine is already ERE-like). |
 | `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
 | `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
-| `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.ufdr`, tars plain or compressed, `.ab`), each its own source. Skipped loose files are counted and reported. |
+| `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.ufdr`, tars plain or compressed, `.7z`, `.ab`), each its own source. Skipped loose files are counted and reported. |
 | `--path GLOB` | Only handle files whose whole internal path matches the wildcard: `*` any run of characters, `/` included; `?` one byte; case-sensitive. Repeatable. |
 | `--app ID` | Only this app's data: its data container, extensions and widgets, bundle and App Groups (as `app paths` lists them), on an iOS file system, an iOS backup or Android. App Groups come from the entitlements of the app and its extensions where the iOS file system records them, else by name (a guess, named in the output). On Android: every user (`/data/user/<n>`) and every mount alias a capture holds (`/data_mirror`, `/mnt/…`), also below an extraction folder (`Dump/`). What each id resolved to is printed; an id with no data is reported and adds nothing. Apple apps also keep data outside their containers (Messages in `Library/SMS`): use `--path` for it. Repeatable; combines with `--path`. |
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |
@@ -258,6 +266,7 @@ With more than one source, each result is tagged with its origin (see
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
 | `--backup-password PASSWORD` | Password to unlock an **encrypted iOS or Android backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
+| `--archive-password PASS` | Password of an **encrypted 7z** (or set `MFSCAN_ARCHIVE_PASSWORD`), separate from the backup's: a 7z can hold an encrypted backup. |
 
 **Encoded matches.** Each match is one byte span in one encoding, so searching
 several encodings never duplicates a match: a match that is not plain UTF-8 is

@@ -132,6 +132,10 @@ pub(crate) struct DecryptArgs {
     /// Password for an encrypted backup (or set MFSCAN_BACKUP_PASSWORD).
     #[arg(long = "backup-password", value_name = "PASSWORD")]
     pub(crate) backup_password: Option<String>,
+
+    /// Password of an encrypted 7z (or MFSCAN_ARCHIVE_PASSWORD).
+    #[arg(long = "archive-password", value_name = "PASS")]
+    pub(crate) archive_password: Option<String>,
 }
 
 /// Manifest/export sink shared by `grep` and `diff`: persist the selected files.

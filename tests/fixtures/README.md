@@ -82,3 +82,22 @@ decodes half a tar. The zstd file also starts with a skippable frame (magic
 
 Each was checked to decode back to `note.tar` with the same tool (`gzip -dc`,
 `bzip2 -dc`, `xz -dc`, `zstd -dcq`).
+
+## `sevenz/`
+
+7z archives of one synthetic tree, for `core::source::sevenz` and `tests/sevenz.rs`,
+made by 7-Zip 26.06 (`7zz`). The tree, under `evidence/`: `note.txt` ("needle in a
+7z"), `filler.txt` (2000 lines `line N of filler text`, 48,890 bytes, so the solid
+block holds two members with data), an empty `empty.txt` and an empty directory
+`empty-dir`. Every time set with `TZ=UTC touch -h -t 202311142213.20` (Unix
+1700000000). Each archive is solid, one block. The password, `fixture-password`, is
+made up.
+
+| file | command (from the tree's parent) |
+|---|---|
+| `note.7z` | `7zz a -ms=on -m0=LZMA2 note.7z evidence` |
+| `note.ppmd.7z` | `7zz a -ms=on -m0=PPMd note.ppmd.7z evidence` |
+| `note.bzip2.7z` | `7zz a -ms=on -m0=BZip2 note.bzip2.7z evidence` |
+| `note.aes.7z` | `7zz a -ms=on -pfixture-password -mhe=off note.aes.7z evidence` (data encrypted) |
+| `note.aes-header.7z` | `7zz a -ms=on -pfixture-password -mhe=on note.aes-header.7z evidence` (list of files too) |
+| `note.deflate.7z` | `7zz a -m0=Deflate note.deflate.7z evidence` (a method this build does not decode) |

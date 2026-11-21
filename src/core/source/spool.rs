@@ -1,8 +1,8 @@
 //! The spool: where a container decoded before it can be read at random is kept.
 //!
 //! Defines: `Spool` (collect decoded bytes).
-//! Used by: `compressed` (a compressed stream), `platform::android::backup` (the
-//! decoded `.ab` payload).
+//! Used by: `compressed` (a compressed stream), `sevenz` (a 7z's decoded blocks),
+//! `platform::android::backup` (the decoded `.ab` payload).
 //! Uses: `tempfile` (the spill file), `memmap2`, `Content`.
 //!
 //! HOW: bytes stay in memory up to `SPOOL_LIMIT`; past it, everything so far and all
@@ -29,6 +29,8 @@ pub(crate) const SPOOL_LIMIT: usize = 64 * 1024 * 1024;
 pub(crate) struct Spool {
     memory: Vec<u8>,
     file: Option<File>,
+    /// Bytes written so far, in memory or in the file.
+    len: u64,
     /// What is being decoded, for error messages ("the Android backup").
     what: &'static str,
 }
@@ -38,12 +40,14 @@ impl Spool {
         Self {
             memory: Vec::new(),
             file: None,
+            len: 0,
             what,
         }
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<()> {
         let what = self.what;
+        self.len += bytes.len() as u64;
         if self.file.is_none() && self.memory.len() + bytes.len() > SPOOL_LIMIT {
             let mut file = tempfile::tempfile()
                 .with_context(|| format!("cannot create a temporary file to decode {what}"))?;
@@ -61,6 +65,11 @@ impl Spool {
                 Ok(())
             }
         }
+    }
+
+    /// How many bytes have been written so far: where the next write starts.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
     }
 
     /// Whether the bytes went to a temporary file.
@@ -95,6 +104,7 @@ mod tests {
         assert!(!spool.spilled());
         spool.write(&chunk).unwrap();
         assert!(spool.spilled());
+        assert_eq!(spool.len(), chunk.len() as u64 * 2);
         let content = spool.finish().unwrap();
         assert_eq!(content.len(), chunk.len() * 2);
         assert!(content.iter().all(|&b| b == 0xAB));

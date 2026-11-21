@@ -4,8 +4,8 @@
 //! and read any file's logical bytes ([`Source::content`]) — plus [`Content`]
 //! (the borrowed/owned/mapped byte carrier) and the concrete containers. A
 //! `Source` is whatever yields located files with bytes: a ZIP archive
-//! ([`zip::ZipSource`]), a tar archive ([`tar::TarSource`], plain or `.tar.gz`), a
-//! directory of loose files or one such file ([`folder::FolderSource`]), or bytes held
+//! ([`zip::ZipSource`]), a tar archive ([`tar::TarSource`], plain or compressed), a
+//! 7z archive ([`sevenz::SevenZSource`]), a directory of loose files or one such file ([`folder::FolderSource`]), or bytes held
 //! in memory ([`bytes::BytesSource`], standard input). [`sniff_container`] is the single
 //! decision on which of these a file is.
 //! Used by: `engine` (search), `report::export` and `diff`. Built by the
@@ -32,6 +32,7 @@ pub(crate) mod compressed;
 pub mod folder;
 mod nested;
 pub mod ranged;
+pub mod sevenz;
 pub(crate) mod spool;
 pub mod tar;
 pub mod zip;
@@ -41,6 +42,7 @@ pub mod zip;
 pub enum Container {
     Zip,
     Tar,
+    SevenZ,
     AndroidBackup,
     /// Not a container: an ordinary file, to be searched as itself.
     Other,
@@ -88,12 +90,18 @@ fn is_zip_name(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
 }
 
+/// Whether `path` is named like a 7z archive.
+pub fn is_seven_z_name(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("7z"))
+}
+
 /// Decide what kind of container the file at `path` is.
 ///
 /// HOW: from its content first (the `.ab` magic, a ZIP header or end-of-central-directory
-/// record, the `ustar` tar magic), because forensic file names are often wrong or
+/// record, the 7z signature, the `ustar` tar magic, a compressed tar), because forensic file names are often wrong or
 /// absent. The name is the fallback, and it decides in one case the content cannot: a
-/// damaged `.zip` or `.tar` must fail loudly as an archive rather than be quietly
+/// damaged `.zip`, `.tar` or `.7z` must fail loudly as an archive rather than be quietly
 /// searched as one opaque file.
 pub fn sniff_container(path: &Path) -> Result<Container> {
     /// Where the `ustar` magic sits in a tar header.
@@ -114,6 +122,9 @@ pub fn sniff_container(path: &Path) -> Result<Container> {
     if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
         return Ok(Container::Zip);
     }
+    if sevenz::is_seven_z(&head) {
+        return Ok(Container::SevenZ);
+    }
     if head.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
         return Ok(Container::Tar);
     }
@@ -132,6 +143,9 @@ pub fn sniff_container(path: &Path) -> Result<Container> {
     }
     if is_zip_name(path) {
         return Ok(Container::Zip);
+    }
+    if is_seven_z_name(path) {
+        return Ok(Container::SevenZ);
     }
 
     // A ZIP can start with anything (a self-extractor's stub), so look for its tail.

@@ -120,7 +120,10 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
         bail!("--export/--manifest require a single source");
     }
 
-    let backup_opts = BackupOptions::resolve(args.decrypt.backup_password.as_deref());
+    let backup_opts = BackupOptions::resolve(
+        args.decrypt.backup_password.as_deref(),
+        args.decrypt.archive_password.as_deref(),
+    );
     // Only an export uses keys: a listing reads no file content.
     let decrypt_ctx = if wants_export {
         let paths: Vec<&std::path::Path> = sources.iter().map(|s| s.path.as_path()).collect();

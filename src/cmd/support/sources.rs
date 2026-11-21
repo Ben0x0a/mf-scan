@@ -21,6 +21,7 @@ use memmap2::Mmap;
 use mf_scan::core::source::bytes::BytesSource;
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::ranged::RangedZipSource;
+use mf_scan::core::source::sevenz::{SevenZSource, Unlock};
 use mf_scan::core::source::tar::TarSource;
 use mf_scan::core::source::zip::ZipSource;
 use mf_scan::core::source::{Container, Source, is_tar_name, sniff_container};
@@ -55,12 +56,16 @@ impl IoMode {
     }
 }
 
-/// The backup password resolved from the CLI flag or the `MFSCAN_BACKUP_PASSWORD`
-/// environment variable, threaded through the open path so an encrypted backup
-/// can be unlocked. `None` ⇒ try the acquisition defaults.
+/// The passwords resolved from the CLI flags or their environment variables,
+/// threaded through the open path: the backup's (`MFSCAN_BACKUP_PASSWORD`; `None` ⇒
+/// try the acquisition defaults) and an encrypted 7z's (`MFSCAN_ARCHIVE_PASSWORD`).
+///
+/// WHY two: a 7z can hold an encrypted iOS backup, and the two passwords are set by
+/// different people (the examiner packing the case, the phone's owner).
 #[derive(Clone, Default)]
 pub(crate) struct BackupOptions {
     pub(crate) password: Option<String>,
+    pub(crate) archive_password: Option<String>,
 }
 
 impl BackupOptions {
@@ -68,13 +73,15 @@ impl BackupOptions {
     /// the flag is absent. WHY env fallback: keeping the password out of the
     /// shell command line avoids it landing in shell history or `ps` output —
     /// forensic hygiene.
-    pub(crate) fn resolve(flag: Option<&str>) -> Self {
-        let password = flag.map(str::to_string).or_else(|| {
-            std::env::var("MFSCAN_BACKUP_PASSWORD")
-                .ok()
-                .filter(|s| !s.is_empty())
-        });
-        Self { password }
+    pub(crate) fn resolve(flag: Option<&str>, archive_flag: Option<&str>) -> Self {
+        let from = |flag: Option<&str>, var: &str| {
+            flag.map(str::to_string)
+                .or_else(|| std::env::var(var).ok().filter(|s| !s.is_empty()))
+        };
+        Self {
+            password: from(flag, "MFSCAN_BACKUP_PASSWORD"),
+            archive_password: from(archive_flag, "MFSCAN_ARCHIVE_PASSWORD"),
+        }
     }
 }
 
@@ -88,8 +95,10 @@ const STDIN_LABEL: &str = "(standard input)";
 pub(crate) enum ResolvedKind {
     /// A ZIP archive — opened as a `ZipSource` over its mmap.
     Archive,
-    /// A tar archive (plain or `.tar.gz`/`.tgz`) — opened as a `TarSource`.
+    /// A tar archive (plain or compressed) — opened as a `TarSource`.
     Tar,
+    /// A 7z archive — decoded and opened as a `SevenZSource`.
+    SevenZ,
     /// An Android `adb backup` — decoded and opened as an `AndroidBackupSource`.
     AndroidBackup,
     /// An ordinary file — one loose file, searched as itself.
@@ -105,6 +114,7 @@ pub(crate) fn resolve_file(path: &Path) -> Result<ResolvedSource> {
     let kind = match sniff_container(path)? {
         Container::Zip => ResolvedKind::Archive,
         Container::Tar => ResolvedKind::Tar,
+        Container::SevenZ => ResolvedKind::SevenZ,
         Container::AndroidBackup => ResolvedKind::AndroidBackup,
         Container::Other => ResolvedKind::LooseFile,
     };
@@ -130,6 +140,7 @@ impl ResolvedSource {
         match self.kind {
             ResolvedKind::Archive => Operand::Archive(&self.path),
             ResolvedKind::Tar => Operand::Tar(&self.path),
+            ResolvedKind::SevenZ => Operand::SevenZ(&self.path),
             ResolvedKind::AndroidBackup => Operand::AndroidBackup(&self.path),
             ResolvedKind::LooseFile => Operand::LooseFile(&self.path),
             ResolvedKind::Stdin => Operand::Stdin,
@@ -314,8 +325,10 @@ pub(crate) fn resolve_sources(
 pub(crate) enum Operand<'a> {
     /// A single ZIP archive file — opened as a `ZipSource` over its mmap.
     Archive(&'a Path),
-    /// A single tar archive (plain or gzip-compressed) — opened as a `TarSource`.
+    /// A single tar archive (plain or compressed) — opened as a `TarSource`.
     Tar(&'a Path),
+    /// A single 7z archive, decoded and opened as a `SevenZSource`.
+    SevenZ(&'a Path),
     /// An Android `adb backup` file.
     AndroidBackup(&'a Path),
     /// One ordinary file, searched as itself.
@@ -370,6 +383,23 @@ pub(crate) fn with_operand_source<R>(
         // a different level, and so a weaker attestation).
         Operand::Tar(path) => {
             let source = TarSource::open(path)?;
+            with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
+        }
+        // Like tar: `--verify` attests the `.7z` as stored. The decoded files may be an
+        // iOS backup, which is then opened as one.
+        Operand::SevenZ(path) => {
+            let source = SevenZSource::open(path, backup.archive_password.as_deref())?;
+            let what = match source.unlock() {
+                Unlock::NotEncrypted => None,
+                Unlock::Data => Some("encrypted"),
+                Unlock::HeaderAndData => Some("encrypted, its list of files too"),
+            };
+            if let Some(what) = what {
+                eprintln!(
+                    "7z: {} is {what}; decrypted with the supplied password",
+                    path.display()
+                );
+            }
             with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
         }
         Operand::AndroidBackup(path) => {
@@ -503,7 +533,7 @@ fn with_maybe_backup<R>(
 
 /// Extensions `-r` harvests as archives, besides tars. A Cellebrite `.ufdr` report is
 /// a zip; `.ab` is an Android backup.
-const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "ufdr", "ab"];
+const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "ufdr", "ab", "7z"];
 
 /// Whether a file's name marks it as an archive for `-r` to harvest.
 fn is_archive_name(path: &Path) -> bool {
@@ -516,7 +546,7 @@ fn is_archive_name(path: &Path) -> bool {
 /// Recursively collect the archives `-r` should scan under `dir` into `out`, counting
 /// every other file in `loose`.
 ///
-/// Both ZIP and tar (`.tar`, `.tar.gz`, `.tgz`) are harvested. WHY tar belongs
+/// ZIP, tar (plain or compressed), 7z and `.ab` are harvested. WHY tar belongs
 /// here: it is a first-class acquisition container everywhere else in the tool, so
 /// collecting only `*.zip` made `-r` silently skip every tar acquisition in a case
 /// folder — a scope loss the operator had no way to notice.
@@ -559,6 +589,7 @@ mod tests {
             "sub/d.tgz",
             "e.ZIP",
             "f.ab",
+            "g.7z",
             "notes.txt",
             "image.jpg",
         ] {
@@ -577,7 +608,9 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.ZIP", "f.ab"],
+            vec![
+                "a.zip", "b.tar", "c.tar.gz", "d.tgz", "e.ZIP", "f.ab", "g.7z"
+            ],
             "every archive form must be harvested, and nothing else"
         );
     }

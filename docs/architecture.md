@@ -48,6 +48,8 @@ src/
       tar.rs        TarSource: plain or compressed tar; also the payload of an Android backup
       compressed.rs the one table of compression magics (gzip, bzip2, xz, zstd) and
                     their decoders, every member and check read
+      sevenz.rs     SevenZSource: a 7z (sevenz-rust2), plain or AES, every block decoded
+                    once into the spool; each member a range of that stream
       spool.rs      decoded streams: in memory up to 64 MiB, then an unnamed temp file
       folder.rs     FolderSource: a directory of loose files (+ nested-archive arena), or
                     one loose file

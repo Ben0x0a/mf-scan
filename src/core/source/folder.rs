@@ -155,7 +155,10 @@ impl Source for FolderSource {
                     &entry.name,
                 )
             }
-            Location::Zip { .. } | Location::RangedZip { .. } | Location::Tar { .. } => bail!(
+            Location::Zip { .. }
+            | Location::RangedZip { .. }
+            | Location::Tar { .. }
+            | Location::SevenZ { .. } => bail!(
                 "FolderSource::content called on a top-level archive entry: {}",
                 entry.name
             ),

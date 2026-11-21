@@ -243,6 +243,11 @@ pub enum Location {
     /// absolute archive offset there — see
     /// `TarSource::archive_data_start`.
     Tar { data_offset: u64, data_len: u64 },
+    /// Inside a 7z archive. 7z compresses files together in blocks, so the source
+    /// decodes every block once, whole, and `data_offset`/`data_len` are the byte
+    /// range in that decoded stream; no byte of the `.7z` file corresponds to them,
+    /// so the source reports no absolute archive offset.
+    SevenZ { data_offset: u64, data_len: u64 },
 }
 
 /// One searchable file, from a ZIP archive or a folder.
@@ -280,7 +285,8 @@ impl Entry {
             Location::RangedZip { .. }
             | Location::Loose { .. }
             | Location::Nested { .. }
-            | Location::Tar { .. } => None,
+            | Location::Tar { .. }
+            | Location::SevenZ { .. } => None,
         }
     }
 

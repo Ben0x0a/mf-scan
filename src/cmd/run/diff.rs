@@ -64,7 +64,10 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
     // encrypted backup on either side is decrypted transparently by the shared
     // open path. (Backup provenance is not reported by diff yet; the per-side
     // record sink is local and discarded.)
-    let backup_opts = BackupOptions::resolve(args.decrypt.backup_password.as_deref());
+    let backup_opts = BackupOptions::resolve(
+        args.decrypt.backup_password.as_deref(),
+        args.decrypt.archive_password.as_deref(),
+    );
 
     with_diff_side(
         &args.a,

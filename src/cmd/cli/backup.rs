@@ -44,6 +44,10 @@ pub(crate) struct BackupSourceArgs {
     #[arg(long = "backup-password", value_name = "PASSWORD")]
     pub(crate) backup_password: Option<String>,
 
+    /// Password of an encrypted 7z (or MFSCAN_ARCHIVE_PASSWORD).
+    #[arg(long = "archive-password", value_name = "PASS")]
+    pub(crate) archive_password: Option<String>,
+
     /// With a folder, open nested .zip files this many levels deep.
     #[arg(
         long = "archive-depth",

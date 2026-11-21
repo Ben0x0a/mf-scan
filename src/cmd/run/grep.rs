@@ -148,7 +148,10 @@ pub(crate) fn run_grep(mut cli: GrepArgs) -> Result<u8> {
 
     // The backup password (flag or env), and a sink the open path fills in when a
     // source turns out to be an encrypted backup that gets unlocked.
-    let backup_opts = BackupOptions::resolve(cli.decrypt.backup_password.as_deref());
+    let backup_opts = BackupOptions::resolve(
+        cli.decrypt.backup_password.as_deref(),
+        cli.decrypt.archive_password.as_deref(),
+    );
     let backup_prov = BackupProvenance::new();
 
     // Coverage statistics aggregated across every searched archive, the decryption

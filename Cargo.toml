@@ -48,6 +48,7 @@ ruzstd = "0.9.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9"
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["aes256", "bzip2", "ppmd"] }
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 # The spill file for decoding a large Android backup: unnamed and deleted by the OS,

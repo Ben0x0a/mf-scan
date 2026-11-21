@@ -27,7 +27,7 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     let manifest = export::read_manifest(BufReader::new(manifest_file))?;
 
     let resolved = resolve_file(&args.archive)?;
-    let backup_opts = BackupOptions::resolve(None);
+    let backup_opts = BackupOptions::resolve(None, None);
     let prov = BackupProvenance::new();
     with_operand_source(
         resolved.operand(0),
