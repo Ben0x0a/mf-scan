@@ -91,6 +91,12 @@ pub struct ScanStats {
     /// Not searched, but the scan continued — "what did you not look at" must
     /// stay exact for a forensic run.
     pub unreadable: SkipTally,
+    /// Nested archives `--archive-depth` could not open, or read only in part
+    /// (damaged, or encrypted): what they hold was NOT all searched.
+    pub nested_gaps: usize,
+    /// Archives `--archive-depth` opened: listed, their members searched in their
+    /// place (so their own size is not in `bytes_total`, their members' is).
+    pub expanded: SkipTally,
     /// Profile-matched files no candidate key could decrypt: their ciphertext
     /// was not searched, so they are excluded from the scanned figures.
     pub decrypt_failed: SkipTally,
@@ -143,6 +149,11 @@ impl ScanStats {
         self.files_skipped += 1;
     }
 
+    /// Record an archive opened by `--archive-depth`, its members searched instead.
+    pub fn add_expanded(&mut self, bytes: u64) {
+        self.expanded.add(bytes);
+    }
+
     /// Record a file whose content could not be read (the scan continued).
     pub fn add_unreadable(&mut self, bytes: u64) {
         self.unreadable.add(bytes);
@@ -188,6 +199,8 @@ impl ScanStats {
         self.skipped_media.merge(other.skipped_media);
         self.skipped_type.merge(other.skipped_type);
         self.unreadable.merge(other.unreadable);
+        self.expanded.merge(other.expanded);
+        self.nested_gaps += other.nested_gaps;
         self.decrypt_failed.merge(other.decrypt_failed);
         self.files_with_matches += other.files_with_matches;
         self.total_matches += other.total_matches;

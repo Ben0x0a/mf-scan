@@ -6,6 +6,7 @@
 //! `mf_scan::ops::rebuild` for the plan, `mf_scan::report::export` for the path planning
 //! every export shares, and `mf_scan::report::rebuild_zip` for the archive.
 
+use mf_scan::core::source::expand::Nesting;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -16,7 +17,7 @@ use crate::cmd::cli::{
 use crate::cmd::support::exporting::report_integrity;
 use crate::cmd::support::reporting::{report_verify, sha256_hex};
 use crate::cmd::support::sources::{
-    BackupOptions, BackupProvenance, resolve_sources, with_operand_source,
+    BackupOptions, BackupProvenance, fail_on_nested_gaps, resolve_sources, with_operand_source,
 };
 use mf_scan::core::models::RunInfo;
 use mf_scan::core::source::Source;
@@ -66,14 +67,21 @@ fn open_backup<R>(
     let backup_opts = BackupOptions::resolve(src.backup_password, src.archive_password)?;
     let prov = BackupProvenance::new();
     let path_str = resolved.path.display().to_string();
-    let operand = resolved.operand(src.archive_depth);
+    let operand = resolved.operand();
+    let nesting = Nesting {
+        depth: src.archive_depth,
+        limit: src.nested_limit,
+    };
 
+    let gaps = std::cell::Cell::new(0);
     let out = with_operand_source(
         operand,
         &backup_opts,
         src.io_mode.to_io_mode(),
+        nesting,
         prov.sink(),
         |source, raw| {
+            gaps.set(source.nested_gaps().len());
             // The sink is filled when the source is built, which happens before this
             // closure runs. `None` means the source was not recognised as a backup at
             // all, so fail loudly rather than rebuild nothing.
@@ -99,6 +107,7 @@ fn open_backup<R>(
     )?;
 
     prov.report();
+    fail_on_nested_gaps(gaps.get())?;
     Ok(out)
 }
 
@@ -164,6 +173,8 @@ fn run_rebuild(args: BackupRebuildArgs) -> Result<()> {
             pattern: "backup rebuild".to_string(),
             archives: vec![path.to_string()],
             platform: Some(platform_label(kind).to_string()),
+            archive_depth: args.source.archive_depth,
+            nested_limit: (args.source.archive_depth > 0).then_some(args.source.nested_limit),
             ..RunInfo::default()
         };
         let outcome = rebuild_zip::write(RebuildRequest {

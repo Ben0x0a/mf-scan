@@ -9,6 +9,7 @@
 //! decryption, progress, reporting, exporting, scoping}` modules — each owning one
 //! concern.
 
+use mf_scan::core::source::expand::Nesting;
 use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -66,7 +67,11 @@ pub(crate) const EXIT_ERROR: u8 = 2;
 fn exit_status(stats: &ScanStats, damaged: bool, quiet: bool) -> u8 {
     if quiet && stats.total_matches > 0 {
         EXIT_MATCH
-    } else if stats.unreadable.count > 0 || stats.decrypt_failed.count > 0 || damaged {
+    } else if stats.unreadable.count > 0
+        || stats.decrypt_failed.count > 0
+        || stats.nested_gaps > 0
+        || damaged
+    {
         EXIT_ERROR
     } else if stats.total_matches > 0 {
         EXIT_MATCH
@@ -550,6 +555,8 @@ fn build_run_info(
     // `--app` is recorded here; the containers it resolved to, per source, by
     // `scoped_run` on the export's copy.
     RunInfo {
+        archive_depth: cli.archive_depth,
+        nested_limit: (cli.archive_depth > 0).then_some(cli.nested_limit),
         pattern: cli.regexps.join(" | "),
         patterns: if cli.regexps.len() > 1 {
             cli.regexps.clone()
@@ -633,7 +640,10 @@ fn with_searched_source(
 ) -> Result<()> {
     with_source(
         src,
-        ctx.cli.archive_depth,
+        Nesting {
+            depth: ctx.cli.archive_depth,
+            limit: ctx.cli.nested_limit,
+        },
         ctx.cli.io_mode.to_io_mode(),
         ctx.backup_opts,
         ctx.backup_record,
@@ -679,19 +689,25 @@ fn with_searched_source(
 }
 
 /// Adapt a pre-resolved [`ResolvedSource`] onto the shared [`with_operand_source`]
-/// open/dispatch point via [`ResolvedSource::operand`]; the folder case keeps
-/// `--archive-depth` so nested `.zip` files expand. The raw archive bytes flow
+/// open/dispatch point via [`ResolvedSource::operand`], with `nesting` (the
+/// `--archive-depth` expansion, for every source kind). The raw archive bytes flow
 /// straight through (used by `--verify`).
 fn with_source<R>(
     resolved: &ResolvedSource,
-    archive_depth: u32,
+    nesting: Nesting,
     io_mode: IoMode,
     backup_opts: &BackupOptions,
     backup_record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
-    let operand = resolved.operand(archive_depth);
-    with_operand_source(operand, backup_opts, io_mode, backup_record, f)
+    with_operand_source(
+        resolved.operand(),
+        backup_opts,
+        io_mode,
+        nesting,
+        backup_record,
+        f,
+    )
 }
 
 /// Emit the `--verify` attestation for one source: the before/after archive hash

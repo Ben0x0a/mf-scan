@@ -28,7 +28,7 @@ fn rebuild_fixture(
     password: Option<&str>,
     dir: &std::path::Path,
 ) -> (rebuild::Rebuild, Vec<String>) {
-    let folder = FolderSource::open(&fixture(name), 0).expect("fixture opens");
+    let folder = FolderSource::open(&fixture(name)).expect("fixture opens");
     let profile = profile::detect(&folder).expect("fixture is a backup");
     let source = BackupSource::build(
         &folder,
@@ -139,7 +139,7 @@ fn encrypted_and_unencrypted_rebuilds_are_identical() {
 /// must be reported AND given a root, or its files scatter across the output root.
 #[test]
 fn every_entry_is_attributable_to_a_root() {
-    let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("opens");
+    let folder = FolderSource::open(&fixture("unencrypted")).expect("opens");
     let profile = profile::detect(&folder).expect("is a backup");
     let source = BackupSource::build(&folder, &profile, PasswordInput::None).expect("builds");
     let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);

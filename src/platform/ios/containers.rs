@@ -241,7 +241,7 @@ mod tests {
             .to_file_binary(container.join(CONTAINER_METADATA_NAME))
             .unwrap();
 
-        let source = FolderSource::open(dir.path(), 0).unwrap();
+        let source = FolderSource::open(dir.path()).unwrap();
         let map = AppContainerMap::build(&source);
         map.containers().next().unwrap().1.clone()
     }
@@ -277,7 +277,7 @@ mod tests {
         let container = dir.path().join("Containers/Data/Application/GUID-2");
         std::fs::create_dir_all(&container).unwrap();
         std::fs::write(container.join(CONTAINER_METADATA_NAME), b"not a plist").unwrap();
-        let source = FolderSource::open(dir.path(), 0).unwrap();
+        let source = FolderSource::open(dir.path()).unwrap();
         assert!(AppContainerMap::build(&source).is_empty());
     }
 

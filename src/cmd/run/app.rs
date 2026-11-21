@@ -9,6 +9,7 @@
 //! and the `crate::cmd::support` modules (`sources`, `reporting`, `exporting`,
 //! `scoping` for the note on data outside containers).
 
+use mf_scan::core::source::expand::Nesting;
 use std::io::Write;
 
 use anyhow::{Result, anyhow, bail};
@@ -29,7 +30,7 @@ use crate::cmd::support::exporting::{export_archive_path, export_subject, report
 use crate::cmd::support::reporting::{emit, report_verify, sha256_hex};
 use crate::cmd::support::scoping::report_resolution;
 use crate::cmd::support::sources::{
-    BackupOptions, BackupProvenance, resolve_sources, with_operand_source,
+    BackupOptions, BackupProvenance, fail_on_nested_gaps, resolve_sources, with_operand_source,
 };
 use crate::cmd::support::{Caveat, caveat};
 
@@ -144,7 +145,12 @@ fn run_export(args: AppExportArgs) -> Result<()> {
                 eprintln!("    {} -> {}", r.wanted, r.used);
             }
         }
-        let run = app_run_info(&args.bundle_id, &containers, platform, path);
+        let run = RunInfo {
+            // So `export --from-manifest` reopens nested archives as this run did.
+            archive_depth: args.source.archive_depth,
+            nested_limit: (args.source.archive_depth > 0).then_some(args.source.nested_limit),
+            ..app_run_info(&args.bundle_id, &containers, platform, path)
+        };
 
         // Keys from a dump beside the source (or --keyfile) give each app database
         // a decrypted copy beside its original.
@@ -198,17 +204,27 @@ fn open_app_source<R>(
     let backup_opts = BackupOptions::resolve(src.backup_password, src.archive_password)?;
     let prov = BackupProvenance::new();
     let path_str = resolved.path.display().to_string();
-    let operand = resolved.operand(src.archive_depth);
+    let operand = resolved.operand();
+    let nesting = Nesting {
+        depth: src.archive_depth,
+        limit: src.nested_limit,
+    };
 
+    let gaps = std::cell::Cell::new(0);
     let out = with_operand_source(
         operand,
         &backup_opts,
         src.io_mode.to_io_mode(),
+        nesting,
         prov.sink(),
-        |source, raw| f(source, raw, &path_str),
+        |source, raw| {
+            gaps.set(source.nested_gaps().len());
+            f(source, raw, &path_str)
+        },
     )?;
 
     prov.report();
+    fail_on_nested_gaps(gaps.get())?;
     Ok(out)
 }
 

@@ -26,8 +26,8 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
   per-file process spawn, SIMD search).
 - **Archives *and* folders** — point at a `.zip` (AES- or ZipCrypto-encrypted too), a
   `.tar` (plain, or compressed with gzip, bzip2, xz or zstd), a `.7z` (AES-encrypted
-  too), or a directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
-  folder and searches the files within them. (A plain `.tar` is memory-mapped and
+  too), or a directory; with `--archive-depth` mf-scan also opens the archives and
+  compressed files found inside any of them, and searches the files within. (A plain `.tar` is memory-mapped and
   reports true archive offsets; a compressed tar or a 7z is decoded once, in memory up
   to 64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
   evidence while the tool runs.)
@@ -220,14 +220,45 @@ A **directory** operand needs one of these two flags to say how to read it (ther
 silent default — a directory with neither is rejected; the two are mutually exclusive):
 
 - `--dir-mode` — treat the directory as a **folder of interest**: scan the files
-  inside it. A nested `.zip` is an opaque file at the default `--archive-depth 0`;
-  raise the depth to open nested archives and list the files within them (`1` = one
-  level, `N` = `N` levels of nesting).
+  inside it. Archives inside it are opened with `--archive-depth`, as for any source
+  (see below).
 - `-r`, `--recursive` — walk the directory tree and treat **every archive** found
   (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`,
   `.tar.zst`/`.tzst`, `.tar.md5`, `.7z`, `.ab`) as its own source, tagged by its path. Loose
   files are not searched; how many were skipped is reported on stderr and in the scan
   report.
+
+### Nested archives
+
+With `--archive-depth N`, every entry of the source whose content starts like a ZIP, a
+tar, a 7z, or a gzip/bzip2/xz/zstd stream is opened, and its files are listed right
+after it as `<entry>/<file>` (`case.zip` → `chats/backup.zip/msgstore.db`). A
+compressed stream is a tar when what it decodes to starts like one, else a single file
+named without its suffix (`logs/app.log.gz/app.log`). Files inside are looked at the
+same way, one level less deep each time. Recognition is by content: a renamed archive
+is opened, a file merely named `.zip` is not.
+
+The archive itself stays listed (`find`, `diff` and export see it) and is counted as
+*expanded* in the statistics; its bytes are searched once, through its files. One that
+cannot be opened (damaged, or encrypted: nested archives are not decrypted) is searched
+as one file, stderr says why (`nested: <entry>: not opened (…)`), and the run exits 2:
+its contents were not searched, as for a file that could not be read. A tar cut short
+lists the files before the damage and is searched as one file too, with the same exit
+2. `diff`, `app` and `backup` finish their work, then fail the same way. Encrypted
+files inside an opened ZIP are listed, not searched, and counted as unreadable
+(exit 2).
+Android backups are not opened when nested.
+
+An archive whose bytes are already at hand (a STORED member of a mapped ZIP, a
+folder's file, a tar member, a file inside an archive opened before) is read where it
+is. One that has to be decoded (a 7z, a compressed file) or read into memory (a
+DEFLATE member, a file of an encrypted backup or a network share) goes to memory up to
+64 MiB and beyond that to a temporary file in `TMPDIR`. What that adds is capped for
+the whole source (`--nested-limit`, `16G` by default), and an archive is checked
+against what is left before it is read: reaching the cap stops the run rather than
+leave files unsearched without a trace, or fill the memory or the disk. Files inside a
+nested ZIP are checked against the CRC-32 it records. Offsets inside a nested archive
+are within its file only.
 
 ### `grep`
 
@@ -252,7 +283,8 @@ With more than one source, each result is tagged with its origin (see
 | `-q`, `--quiet` | Print nothing and write no report (unless `--report` names one); the exit status is the answer. Files that could not be searched are still reported. |
 | `-E`, `--extended-regexp` | Accepted for grep muscle memory; no-op (the engine is already ERE-like). |
 | `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
-| `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
+| `--archive-depth N` | Open the archives and compressed files found inside the source (a folder, ZIP, tar, 7z, backup), up to `N` levels deep. Default `0` (they are searched as files). See [Nested archives](#nested-archives). |
+| `--nested-limit SIZE` | With `--archive-depth`: the most opening nested archives may add to memory or temporary files (what they decode to, or what has to be read into memory), together. Reaching it stops the run (exit 2). Default `16G`. |
 | `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.ufdr`, tars plain or compressed, `.7z`, `.ab`), each its own source. Skipped loose files are counted and reported. |
 | `--path GLOB` | Only handle files whose whole internal path matches the wildcard: `*` any run of characters, `/` included; `?` one byte; case-sensitive. Repeatable. |
 | `--app ID` | Only this app's data: its data container, extensions and widgets, bundle and App Groups (as `app paths` lists them), on an iOS file system, an iOS backup or Android. App Groups come from the entitlements of the app and its extensions where the iOS file system records them, else by name (a guess, named in the output). On Android: every user (`/data/user/<n>`) and every mount alias a capture holds (`/data_mirror`, `/mnt/…`), also below an extraction folder (`Dump/`). What each id resolved to is printed; an id with no data is reported and adds nothing. Apple apps also keep data outside their containers (Messages in `Library/SMS`): use `--path` for it. Repeatable; combines with `--path`. |
@@ -353,11 +385,15 @@ is no summary and no scan report. It exits `0` with or without results, as `find
 
 ```
 mf-scan export ARCHIVE --from-manifest FILE --to DIR [--max-size SIZE]
+               [--archive-depth N] [--nested-limit SIZE] [--backup-password] [--archive-password]
 ```
 
 Re-ingests a manifest written by `grep`, `find` or `diff --manifest` and exports
 the listed files into a zip in `DIR`, named after the manifest — **without searching
-again**. Honours `--max-size`.
+again**. Honours `--max-size`. The source is reopened as the manifest's run opened it
+(its `archive_depth` and `nested_limit`), so files inside nested archives are found
+again; `--archive-depth` and `--nested-limit` override that. The password flags ask
+on the terminal, as for `grep`.
 
 > **Vocabulary:** *export* = copy files out; *extract* is reserved for extracting
 > *meaning* (the `--inspect` analysis).

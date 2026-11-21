@@ -11,6 +11,7 @@
 //! backup layer, whose files are not the ZIP's members, so it is re-packed instead, as
 //! are folders, tars and Android backups.
 
+use mf_scan::core::source::expand::Nesting;
 use std::process::ExitCode;
 
 use anyhow::{Result, anyhow, bail};
@@ -60,9 +61,10 @@ pub(crate) fn run_decrypt(args: DecryptCmdArgs) -> Result<ExitCode> {
     let backup_opts = BackupOptions::resolve(args.backup_password, args.archive_password)?;
     let prov = BackupProvenance::new();
     let failed = with_operand_source(
-        resolved.operand(0),
+        resolved.operand(),
         &backup_opts,
         args.io_mode.to_io_mode(),
+        Nesting::default(),
         prov.sink(),
         |source, _raw| {
             // Keys a dump inside the source carries (a Cellebrite report) join the rest.

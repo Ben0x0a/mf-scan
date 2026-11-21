@@ -107,6 +107,13 @@ impl Source for BackupSource<'_> {
         }
     }
 
+    fn content_head(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        match self {
+            BackupSource::Encrypted(s) => s.content_head(entry, max),
+            BackupSource::Plain(s) => s.content_head(entry, max),
+        }
+    }
+
     fn byte_size(&self) -> u64 {
         match self {
             BackupSource::Encrypted(s) => s.byte_size(),

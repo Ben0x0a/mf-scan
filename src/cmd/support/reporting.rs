@@ -79,6 +79,13 @@ pub(crate) fn print_stats_summary(stats: &ScanStats, match_path: bool) {
         "matches: {} in {} file(s)",
         stats.total_matches, stats.files_with_matches
     );
+    if stats.expanded.count > 0 {
+        eprintln!(
+            "  expanded (archives opened, their files searched): {} file(s), {}",
+            stats.expanded.count,
+            human_bytes(stats.expanded.bytes)
+        );
+    }
     if stats.skipped_not_in_app.count > 0 {
         eprintln!(
             "  skipped (not in --app): {} file(s), {}",
@@ -161,6 +168,12 @@ pub(crate) fn print_coverage_gaps(stats: &ScanStats) {
             "  unreadable (read failed, NOT searched): {} file(s), {}",
             stats.unreadable.count,
             human_bytes(stats.unreadable.bytes)
+        );
+    }
+    if stats.nested_gaps > 0 {
+        eprintln!(
+            "  nested archives NOT fully searched (not opened, or damaged; see nested: above): {}",
+            stats.nested_gaps
         );
     }
     if stats.decrypt_failed.count > 0 {

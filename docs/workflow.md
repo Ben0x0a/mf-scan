@@ -195,19 +195,27 @@ exported/
 ## 8. Scan a folder (and the archives inside it)
 
 When the acquisition is an **extracted folder** rather than a `.zip`, scan it with
-`--dir-mode`. By default a `.zip` found inside the folder is an opaque file;
-`--archive-depth` opens nested archives and searches the files within them:
+`--dir-mode`. By default an archive found inside the source (a folder, or a ZIP, tar
+or 7z acquisition) is searched as one file; `--archive-depth` opens the archives and
+compressed files inside it (ZIP, tar, compressed tar, 7z, single gzip/bzip2/xz/zstd
+files), by content, and searches the files within them:
 
 ```
-# Scan the folder's loose files only (nested zips are opaque)
+# Scan the folder's loose files only (nested archives are searched as files)
 mf-scan grep 'token' ./extracted --dir-mode
 
-# Also open nested zips one level deep — matches read like backup.zip/messages.db
+# Also open nested archives one level deep — matches read like backup.zip/messages.db
 mf-scan grep 'token' ./extracted --dir-mode --archive-depth 1
 
-# Two levels: also open a zip found inside a nested zip
-mf-scan grep 'token' ./extracted --dir-mode --archive-depth 2
+# Two levels: also open an archive found inside a nested one
+mf-scan grep 'token' case.zip --archive-depth 2
 ```
+
+An opened archive stays listed and is counted as *expanded*; one that cannot be
+opened (encrypted, damaged) is searched as one file, with a `nested:` line on stderr,
+and the run exits 2 (its contents were not searched).
+What opening them adds to memory or temporary files is capped by `--nested-limit`
+(default `16G`).
 
 A folder source has no single archive byte, so `--verify` is skipped for it and
 `archive_offset` is absent in json/csv (see

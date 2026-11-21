@@ -139,6 +139,15 @@ impl Source for PlainBackupSource<'_> {
         Ok(Content::Owned(blob))
     }
 
+    /// The start of the file, read alone (an unencrypted blob is the file).
+    fn content_head(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        let idx = meta_index(&self.index, &entry.name)?;
+        let head = self
+            .blobs
+            .read_head(self.inner, &self.meta[idx].file_id, max)?;
+        Ok(Content::Owned(head))
+    }
+
     fn byte_size(&self) -> u64 {
         self.entries.iter().map(|e| e.uncompressed_size).sum()
     }

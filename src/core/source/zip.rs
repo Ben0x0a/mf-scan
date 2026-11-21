@@ -847,6 +847,15 @@ pub(crate) fn inflate(compressed: &[u8], expected_size: u64) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+/// The first `max` bytes a raw DEFLATE stream inflates to (fewer when it is shorter).
+pub(crate) fn inflate_head(compressed: &[u8], max: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(max);
+    DeflateDecoder::new(compressed)
+        .take(max as u64)
+        .read_to_end(&mut out)?;
+    Ok(out)
+}
+
 /// A [`Source`] backed by a memory-mapped ZIP archive.
 ///
 /// Parses the central directory once on [`ZipSource::open`] and then serves each
@@ -946,6 +955,40 @@ impl Source for ZipSource<'_> {
 
     fn content(&self, entry: &Entry) -> Result<Content<'_>> {
         content_with(self.data, entry, self.password())
+    }
+
+    /// A plain STORED entry is a slice of the mapped archive.
+    fn reads_in_place(&self, entry: &Entry) -> bool {
+        matches!(
+            entry.location,
+            Location::Zip {
+                method: Method::Stored,
+                encryption: Encryption::None,
+                ..
+            }
+        )
+    }
+
+    /// The start of a plain DEFLATE entry is inflated alone; anything else (STORED
+    /// is borrowed anyway, encrypted data is checked whole) is read whole.
+    fn content_head(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        if let Location::Zip {
+            method: Method::Deflate,
+            encryption: Encryption::None,
+            data_offset,
+            data_len,
+        } = entry.location
+        {
+            let start = usize::try_from(data_offset)?;
+            let raw = start
+                .checked_add(usize::try_from(data_len)?)
+                .and_then(|end| self.data.get(start..end))
+                .with_context(|| format!("data range of {} is out of bounds", entry.name))?;
+            return inflate_head(raw, max)
+                .map(Content::Owned)
+                .with_context(|| format!("failed to inflate the start of {}", entry.name));
+        }
+        self.content(entry)
     }
 
     fn byte_size(&self) -> u64 {

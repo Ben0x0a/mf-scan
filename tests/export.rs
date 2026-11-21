@@ -45,6 +45,8 @@ fn run_info() -> RunInfo {
         app_containers: vec![],
         app_group_links: vec![],
         loose_files_skipped: 0,
+        archive_depth: 0,
+        nested_limit: None,
     }
 }
 

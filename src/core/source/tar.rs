@@ -156,6 +156,11 @@ impl Source for TarSource {
         Ok(Content::Borrowed(&bytes[start..end]))
     }
 
+    /// Every member is a slice of the mapped file or of the decoded stream.
+    fn reads_in_place(&self, _entry: &Entry) -> bool {
+        true
+    }
+
     fn byte_size(&self) -> u64 {
         self.stream().len() as u64
     }
@@ -172,10 +177,10 @@ impl Source for TarSource {
 }
 
 /// What a walk of the block sequence found.
-struct ParsedTar {
-    entries: Vec<Entry>,
-    links: Vec<String>,
-    damage: Option<String>,
+pub(crate) struct ParsedTar {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) links: Vec<String>,
+    pub(crate) damage: Option<String>,
 }
 
 /// Walk the tar block sequence, yielding one [`Entry`] per regular file and
@@ -183,7 +188,7 @@ struct ParsedTar {
 /// block), at EOF, or on the first header that fails its checksum (lost sync /
 /// trailing garbage) — never panics on a malformed archive. Stopping for any reason
 /// but the marker or a clean EOF is recorded as damage.
-fn parse(data: &[u8]) -> ParsedTar {
+pub(crate) fn parse(data: &[u8]) -> ParsedTar {
     let mut entries = Vec::new();
     let mut links = Vec::new();
     let mut damage = None;

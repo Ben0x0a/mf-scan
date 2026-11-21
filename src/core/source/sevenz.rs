@@ -111,7 +111,7 @@ impl SevenZSource {
         };
 
         let reader = ArchiveReader::from_archive(archive, Cursor::new(&raw[..]), password);
-        let (decoded, entries) = decode_all(reader, unlock)
+        let (decoded, entries) = decode_all(reader, unlock, Spool::new("the 7z archive"))
             .with_context(|| format!("cannot decompress the 7z {}", path.display()))?;
         Ok(Self {
             raw,
@@ -157,9 +157,40 @@ impl Source for SevenZSource {
         Ok(Content::Borrowed(&bytes[start..end]))
     }
 
+    /// Every member is a slice of the mapped file or of the decoded stream.
+    fn reads_in_place(&self, _entry: &Entry) -> bool {
+        true
+    }
+
     fn byte_size(&self) -> u64 {
         self.decoded.len() as u64
     }
+}
+
+/// A 7z held in `bytes` (one nested in another container), decoded into `spool`:
+/// the decoded stream and one [`Location::SevenZ`] entry per member.
+///
+/// Nested archives are not decrypted: an encrypted one is an error, which its
+/// caller reports, keeping the 7z as one file.
+pub(crate) fn decode_bytes(bytes: &[u8], spool: Spool) -> Result<(Content<'static>, Vec<Entry>)> {
+    const NESTED_ENCRYPTED: &str =
+        "it is an encrypted 7z, inside another container: those are not decrypted";
+    let archive = match Archive::read(&mut Cursor::new(bytes), &Password::empty()) {
+        Ok(archive) => archive,
+        Err(Error::PasswordRequired) => bail!(NESTED_ENCRYPTED),
+        Err(e) => bail!(describe(&e)),
+    };
+    let data_encrypted = archive.blocks.iter().any(|block| {
+        block
+            .coders
+            .iter()
+            .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
+    });
+    if data_encrypted {
+        bail!(NESTED_ENCRYPTED);
+    }
+    let reader = ArchiveReader::from_archive(archive, Cursor::new(bytes), Password::empty());
+    decode_all(reader, Unlock::NotEncrypted, spool)
 }
 
 /// The archive's header, and whether reading it needed the password.
@@ -195,8 +226,8 @@ fn read_header(raw: &[u8], password: Option<&str>) -> Result<(Archive, bool)> {
 fn decode_all(
     mut reader: ArchiveReader<Cursor<&[u8]>>,
     unlock: Unlock,
+    mut spool: Spool,
 ) -> Result<(Content<'static>, Vec<Entry>)> {
-    let mut spool = Spool::new("the 7z archive");
     let mut entries = Vec::new();
     // A spool write that failed: the crate's callback cannot carry it, so it stops
     // the walk and is returned below.

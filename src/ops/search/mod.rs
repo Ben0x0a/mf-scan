@@ -198,6 +198,7 @@ pub fn search_source(
     let mut stats = ScanStats {
         total_entries: entries.len(),
         archive_bytes: source.byte_size(),
+        nested_gaps: source.nested_gaps().len(),
         ..ScanStats::default()
     };
     let not_path_globs = filter.not_path_globs();
@@ -235,6 +236,8 @@ pub fn search_source(
                 stats.bytes_total += bytes;
                 stats.add_unreadable(bytes);
             }
+            // Not in `bytes_total`: its members' bytes are counted there instead.
+            Class::Expanded { bytes } => stats.add_expanded(bytes),
             Class::DecryptFailed { bytes } => {
                 stats.bytes_total += bytes;
                 stats.add_decrypt_failed(bytes);

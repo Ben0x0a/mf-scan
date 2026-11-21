@@ -1,7 +1,9 @@
 //! The spool: where a container decoded before it can be read at random is kept.
 //!
-//! Defines: `Spool` (collect decoded bytes).
+//! Defines: `Spool` (collect decoded bytes, optionally up to a cap) and
+//! [`SpoolCapExceeded`] (the error when the cap is reached).
 //! Used by: `compressed` (a compressed stream), `sevenz` (a 7z's decoded blocks),
+//! `expand` (nested containers, under the run's `--nested-limit`),
 //! `platform::android::backup` (the decoded `.ab` payload).
 //! Uses: `tempfile` (the spill file), `memmap2`, `Content`.
 //!
@@ -15,6 +17,7 @@
 //! `TMPDIR` (`TMP` on Windows) chooses where. A stream larger than the free space
 //! there fails loudly when a write fails, it is never cut short silently.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Write;
 
@@ -31,6 +34,8 @@ pub(crate) struct Spool {
     file: Option<File>,
     /// Bytes written so far, in memory or in the file.
     len: u64,
+    /// The most bytes this spool may hold, if capped.
+    cap: Option<u64>,
     /// What is being decoded, for error messages ("the Android backup").
     what: &'static str,
 }
@@ -41,12 +46,27 @@ impl Spool {
             memory: Vec::new(),
             file: None,
             len: 0,
+            cap: None,
             what,
+        }
+    }
+
+    /// A spool that refuses to hold more than `cap` bytes: the write that would pass
+    /// it fails with [`SpoolCapExceeded`], before anything more is stored.
+    pub(crate) fn capped(what: &'static str, cap: u64) -> Self {
+        Self {
+            cap: Some(cap),
+            ..Self::new(what)
         }
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<()> {
         let what = self.what;
+        if let Some(cap) = self.cap
+            && self.len + bytes.len() as u64 > cap
+        {
+            return Err(anyhow::Error::new(SpoolCapExceeded { cap }));
+        }
         self.len += bytes.len() as u64;
         if self.file.is_none() && self.memory.len() + bytes.len() > SPOOL_LIMIT {
             let mut file = tempfile::tempfile()
@@ -65,6 +85,11 @@ impl Spool {
                 Ok(())
             }
         }
+    }
+
+    /// What is being decoded, as errors name it.
+    pub(crate) fn what(&self) -> &'static str {
+        self.what
     }
 
     /// How many bytes have been written so far: where the next write starts.
@@ -92,9 +117,39 @@ impl Spool {
     }
 }
 
+/// A capped spool's write would have passed its cap.
+///
+/// A marker, so the caller can tell a resource limit (to report and stop) from a
+/// damaged stream (to note and carry on), however deep in a decoder it happened.
+#[derive(Debug)]
+pub(crate) struct SpoolCapExceeded {
+    pub(crate) cap: u64,
+}
+
+impl fmt::Display for SpoolCapExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the decoded data would pass the {} bytes allowed",
+            self.cap
+        )
+    }
+}
+
+impl std::error::Error for SpoolCapExceeded {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_spool_refuses_the_write_past_its_cap() {
+        let mut spool = Spool::capped("test data", 10);
+        spool.write(&[1; 10]).unwrap();
+        let e = spool.write(&[1]).unwrap_err();
+        assert!(e.is::<SpoolCapExceeded>(), "{e}");
+        assert_eq!(spool.len(), 10);
+    }
 
     #[test]
     fn past_the_limit_it_spills_and_still_reads() {

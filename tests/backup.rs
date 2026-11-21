@@ -42,7 +42,7 @@ const NOTES_CONTENT: &[u8] = b"hello SECRET_TOKEN_42 world\n";
 #[test]
 fn unencrypted_backup_maps_logical_paths_and_skips_missing() {
     let path = fixture("unencrypted");
-    let folder = FolderSource::open(&path, 0).unwrap();
+    let folder = FolderSource::open(&path).unwrap();
 
     let p = profile::detect(&folder).expect("fixture is recognised as a backup");
     assert!(!p.encrypted);
@@ -79,7 +79,7 @@ fn unencrypted_backup_maps_logical_paths_and_skips_missing() {
 #[test]
 fn encrypted_backup_decrypts_with_password() {
     let path = fixture("encrypted");
-    let folder = FolderSource::open(&path, 0).unwrap();
+    let folder = FolderSource::open(&path).unwrap();
 
     let p = profile::detect(&folder).expect("fixture is recognised as a backup");
     assert!(p.encrypted);
@@ -93,6 +93,16 @@ fn encrypted_backup_decrypts_with_password() {
 
     // The blob decrypts to the original plaintext.
     assert_eq!(&*bs.content(entry(&bs, NOTES)).unwrap(), NOTES_CONTENT);
+    // Its start alone decrypts to the plaintext's start (what `expand` reads), and
+    // a head longer than the file is the whole file.
+    assert_eq!(
+        &*bs.content_head(entry(&bs, NOTES), 5).unwrap(),
+        &NOTES_CONTENT[..5]
+    );
+    assert_eq!(
+        &*bs.content_head(entry(&bs, NOTES), 4096).unwrap(),
+        NOTES_CONTENT
+    );
 
     // The stored ciphertext matches its Manifest.db SHA-1 Digest.
     assert!(matches!(
@@ -108,7 +118,7 @@ fn encrypted_backup_decrypts_with_password() {
 #[test]
 fn encrypted_backup_tries_the_defaults_before_a_supplied_password() {
     let path = fixture("encrypted");
-    let folder = FolderSource::open(&path, 0).unwrap();
+    let folder = FolderSource::open(&path).unwrap();
     let p = profile::detect(&folder).unwrap();
     let bs = BackupSource::build(&folder, &p, PasswordInput::Given("not-the-password")).unwrap();
     let rec = bs.record(&p);
@@ -123,7 +133,7 @@ fn encrypted_backup_tries_the_defaults_before_a_supplied_password() {
 /// backup contains, and `Source::content` must never be asked for a directory.
 #[test]
 fn directory_records_are_separate_from_entries() {
-    let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("fixture opens");
+    let folder = FolderSource::open(&fixture("unencrypted")).expect("fixture opens");
     let profile = profile::detect(&folder).expect("fixture is recognised as a backup");
     let source = BackupSource::build(&folder, &profile, PasswordInput::None).expect("builds");
 

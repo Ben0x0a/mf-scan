@@ -10,6 +10,7 @@
 //! content (bar a header for `--type`), and a `find` user expects only paths. An export
 //! still writes its own integrity report.
 
+use mf_scan::core::source::expand::Nesting;
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -140,6 +141,8 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
         not_path_globs: args.not_path.clone(),
         app: (!args.app.is_empty()).then(|| args.app.join(", ")),
         types: args.file_type.clone(),
+        archive_depth: args.archive_depth,
+        nested_limit: (args.archive_depth > 0).then_some(args.nested_limit),
         ..RunInfo::default()
     };
 
@@ -148,14 +151,23 @@ pub(crate) fn run_find(args: FindArgs) -> Result<ExitCode> {
     let mut query = base_query;
     for src in &sources {
         with_operand_source(
-            src.operand(args.archive_depth),
+            src.operand(),
             &backup_opts,
             args.io_mode.to_io_mode(),
+            Nesting {
+                depth: args.archive_depth,
+                limit: args.nested_limit,
+            },
             prov.sink(),
             |source, _raw| {
                 // `--app`: only the apps' containers, resolved from this source.
                 query.scope = app_scope(source, &args.app, &src.label, None);
                 let outcome = find(source, &query)?;
+                // A nested archive not opened (its `nested:` note says why) hides the
+                // names inside it: the listing is incomplete.
+                if !source.nested_gaps().is_empty() {
+                    incomplete = true;
+                }
 
                 if outcome.undated > 0 {
                     eprintln!(

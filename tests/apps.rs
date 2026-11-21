@@ -100,7 +100,7 @@ fn build_ffs(with_mcm_db: bool) -> TempDir {
 
 /// Group ids attributed to `id`, each with the tag recording how it was attributed.
 fn groups_for(tmp: &TempDir, id: &str) -> Vec<(String, &'static str)> {
-    let source = FolderSource::open(tmp.path(), 0).unwrap();
+    let source = FolderSource::open(tmp.path()).unwrap();
     let catalog = AppCatalog::build(&source);
     assert_eq!(
         catalog.platform,
@@ -162,7 +162,7 @@ fn recorded_absence_of_groups_is_authoritative() {
 #[test]
 fn extensions_follow_the_declared_parent_not_the_name_prefix() {
     let tmp = build_ffs(true);
-    let source = FolderSource::open(tmp.path(), 0).unwrap();
+    let source = FolderSource::open(tmp.path()).unwrap();
     let catalog = AppCatalog::build(&source);
 
     let extensions = |id: &str| -> Vec<String> {
@@ -186,7 +186,7 @@ fn extensions_follow_the_declared_parent_not_the_name_prefix() {
 fn wal_replay_is_reported_only_when_it_happens() {
     for with_db in [false, true] {
         let tmp = build_ffs(with_db);
-        let source = FolderSource::open(tmp.path(), 0).unwrap();
+        let source = FolderSource::open(tmp.path()).unwrap();
         assert!(!AppCatalog::build(&source).mcm_wal_replayed());
     }
 }
@@ -196,7 +196,7 @@ fn wal_replay_is_reported_only_when_it_happens() {
 #[test]
 fn app_scope_is_the_app_paths_footprint() {
     let tmp = build_ffs(true);
-    let source = FolderSource::open(tmp.path(), 0).unwrap();
+    let source = FolderSource::open(tmp.path()).unwrap();
     let catalog = AppCatalog::build(&source);
     let ids = [
         "com.example.full".to_string(),

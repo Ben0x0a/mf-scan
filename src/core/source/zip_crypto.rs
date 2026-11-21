@@ -48,7 +48,10 @@ const AES_ROUNDS: u32 = 1000;
 const BLOCK: usize = 16;
 
 /// What a ZIP reader knows of the password, for its error messages.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` is written by hand and never shows the password: a `{:?}` of a value
+/// holding one (a [`crate::core::source::zip::Coding`]) must not print it.
+#[derive(Clone, Copy)]
 pub(crate) enum ZipPassword<'a> {
     /// The password given (asked for with `--archive-password`, or
     /// `MFSCAN_ARCHIVE_PASSWORD`).
@@ -57,6 +60,16 @@ pub(crate) enum ZipPassword<'a> {
     Missing,
     /// A ZIP inside another container: those are not decrypted.
     Nested,
+}
+
+impl std::fmt::Debug for ZipPassword<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ZipPassword::Given(_) => "Given(<redacted>)",
+            ZipPassword::Missing => "Missing",
+            ZipPassword::Nested => "Nested",
+        })
+    }
 }
 
 /// The plain bytes of an entry's raw `data`, still compressed by its method.
@@ -234,6 +247,12 @@ mod tests {
         // CRC-32 of "123456789" is 0xCBF43926 (the check value of the standard).
         let crc = b"123456789".iter().fold(!0u32, |c, &b| crc_step(c, b));
         assert_eq!(!crc, 0xCBF4_3926);
+    }
+
+    #[test]
+    fn debug_never_shows_the_password() {
+        let shown = format!("{:?}", ZipPassword::Given("hunter2"));
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 
     #[test]

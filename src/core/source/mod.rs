@@ -29,8 +29,8 @@ use crate::core::models::Entry;
 
 pub mod bytes;
 pub(crate) mod compressed;
+pub mod expand;
 pub mod folder;
-mod nested;
 pub mod ranged;
 pub mod sevenz;
 pub(crate) mod spool;
@@ -97,6 +97,41 @@ pub fn is_seven_z_name(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("7z"))
 }
 
+/// Where the `ustar` magic sits in a tar header.
+pub(crate) const USTAR_OFFSET: usize = 257;
+
+/// What a file's first bytes say it is, as a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadKind {
+    AndroidBackup,
+    Zip,
+    SevenZ,
+    Tar,
+    /// A compressed stream: a tar, or a single file, as its decoded start says.
+    Compressed(compressed::Compression),
+}
+
+/// The container `head`, a file's first bytes (512 suffice), starts like. The one
+/// table of container signatures: [`sniff_container`] and `expand` both use it.
+pub(crate) fn head_kind(head: &[u8]) -> Option<HeadKind> {
+    if is_android_backup(head) {
+        Some(HeadKind::AndroidBackup)
+    } else if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        Some(HeadKind::Zip)
+    } else if sevenz::is_seven_z(head) {
+        Some(HeadKind::SevenZ)
+    } else if is_ustar(head) {
+        Some(HeadKind::Tar)
+    } else {
+        compressed::Compression::of(head).map(HeadKind::Compressed)
+    }
+}
+
+/// Whether `head` holds a tar header's `ustar` magic.
+pub(crate) fn is_ustar(head: &[u8]) -> bool {
+    head.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar")
+}
+
 /// Decide what kind of container the file at `path` is.
 ///
 /// HOW: from its content first (the `.ab` magic, a ZIP header or end-of-central-directory
@@ -105,8 +140,6 @@ pub fn is_seven_z_name(path: &Path) -> bool {
 /// damaged `.zip`, `.tar` or `.7z` must fail loudly as an archive rather than be quietly
 /// searched as one opaque file.
 pub fn sniff_container(path: &Path) -> Result<Container> {
-    /// Where the `ustar` magic sits in a tar header.
-    const USTAR_OFFSET: usize = 257;
     /// An end-of-central-directory record, plus the longest possible comment.
     const ZIP_TAIL: u64 = 22 + u16::MAX as u64;
 
@@ -117,27 +150,22 @@ pub fn sniff_container(path: &Path) -> Result<Container> {
         .read_to_end(&mut head)
         .with_context(|| format!("cannot read {}", path.display()))?;
 
-    if is_android_backup(&head) {
-        return Ok(Container::AndroidBackup);
-    }
-    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
-        return Ok(Container::Zip);
-    }
-    if sevenz::is_seven_z(&head) {
-        return Ok(Container::SevenZ);
-    }
-    if head.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
-        return Ok(Container::Tar);
-    }
-    // A compressed file is a tar when what it decodes to starts like one. A damaged
-    // stream decides nothing here: the name below still can.
-    if let Some(compression) = compressed::Compression::of(&head) {
-        file.seek(SeekFrom::Start(0))
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        let inner = compression.head(&mut file, 512).unwrap_or_default();
-        if inner.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
-            return Ok(Container::Tar);
+    match head_kind(&head) {
+        Some(HeadKind::AndroidBackup) => return Ok(Container::AndroidBackup),
+        Some(HeadKind::Zip) => return Ok(Container::Zip),
+        Some(HeadKind::SevenZ) => return Ok(Container::SevenZ),
+        Some(HeadKind::Tar) => return Ok(Container::Tar),
+        // A compressed file is a tar when what it decodes to starts like one. A
+        // damaged stream decides nothing here: the name below still can.
+        Some(HeadKind::Compressed(compression)) => {
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            let inner = compression.head(&mut file, 512).unwrap_or_default();
+            if is_ustar(&inner) {
+                return Ok(Container::Tar);
+            }
         }
+        None => {}
     }
     if is_tar_name(path) {
         return Ok(Container::Tar);
@@ -324,6 +352,40 @@ pub trait Source: Sync {
     /// returns, so the end of `entry` is worth reading before deciding to fetch the
     /// whole of it. `false` by default (the default suffix is the whole content).
     fn cheap_suffix(&self, _entry: &Entry) -> bool {
+        false
+    }
+
+    /// At least the first `max` bytes of `entry` (the caller keeps only those), read
+    /// as cheaply as the source can: what `expand` looks at to tell an archive.
+    ///
+    /// WHY not [`Source::content_prefix`]: the engine takes that as the whole file
+    /// from a source that does not prefer prefixes, so a short one there would change
+    /// type detection. The default is that prefix; a ZIP inflates only the start of a
+    /// DEFLATE entry, a folder reads only the start of a file.
+    fn content_head(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        self.content_prefix(entry, max)
+    }
+
+    /// Whether `entry` is an archive `expand` opened: it is listed, and its members
+    /// are searched in its place, so the engine counts it as expanded rather than
+    /// searching its bytes a second time. `false` for every source but the expanded
+    /// one.
+    fn is_expanded(&self, _entry: &Entry) -> bool {
+        false
+    }
+
+    /// The nested archives `expand` could not open, or read only in part (damaged,
+    /// or encrypted): a coverage gap the run's exit status reports. Empty for every
+    /// other source.
+    fn nested_gaps(&self) -> &[String] {
+        &[]
+    }
+
+    /// Whether [`Source::content`] serves `entry` without reading it into memory
+    /// (a slice of a mapped file or of a decoded stream, or a mapped loose file).
+    /// `false` by default: the safe answer, which makes `expand` check the entry's
+    /// size against `--nested-limit` before reading it.
+    fn reads_in_place(&self, _entry: &Entry) -> bool {
         false
     }
 }

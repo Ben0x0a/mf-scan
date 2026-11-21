@@ -11,6 +11,7 @@ use std::io::BufReader;
 use anyhow::{Context, Result};
 
 use mf_scan::core::source::Source;
+use mf_scan::core::source::expand::{DEFAULT_NESTED_LIMIT, Nesting};
 use mf_scan::report::export;
 
 use crate::cmd::cli::ExportArgs;
@@ -27,12 +28,30 @@ pub(crate) fn run_export(args: ExportArgs) -> Result<()> {
     let manifest = export::read_manifest(BufReader::new(manifest_file))?;
 
     let resolved = resolve_file(&args.archive)?;
-    let backup_opts = BackupOptions::resolve(false, false)?;
+    let backup_opts = BackupOptions::resolve(args.backup_password, args.archive_password)?;
     let prov = BackupProvenance::new();
+    // The source is reopened as the manifest's run opened it, so the paths it lists
+    // inside nested archives are found again.
+    let nesting = Nesting {
+        depth: args.archive_depth.unwrap_or(manifest.run.archive_depth),
+        limit: args
+            .nested_limit
+            .or(manifest.run.nested_limit)
+            .unwrap_or(DEFAULT_NESTED_LIMIT),
+    };
+    if args.archive_depth.is_none() && nesting.depth > 0 {
+        eprintln!(
+            "export: opening nested archives {} level(s) deep, as the manifest's run did",
+            nesting.depth
+        );
+    }
+    // No nested-gap failure here, unlike the other commands: export reads only the
+    // files the manifest names, and one it cannot find is reported as skipped.
     with_operand_source(
-        resolved.operand(0),
+        resolved.operand(),
         &backup_opts,
         IoMode::Auto,
+        nesting,
         prov.sink(),
         |source, raw| {
             let verify_before = args.verify.then(|| raw.map(sha256_hex)).flatten();

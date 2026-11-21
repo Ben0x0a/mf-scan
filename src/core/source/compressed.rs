@@ -82,7 +82,12 @@ impl Compression {
     /// The whole of `input` decoded, in the spool (memory, then a temporary file).
     /// `what` names it in errors ("the compressed tar").
     pub(crate) fn decode(self, input: &[u8], what: &'static str) -> Result<Content<'static>> {
-        let mut spool = Spool::new(what);
+        self.decode_into(input, Spool::new(what))
+    }
+
+    /// [`Compression::decode`] into a given spool (a capped one, for a nested file).
+    pub(crate) fn decode_into(self, input: &[u8], mut spool: Spool) -> Result<Content<'static>> {
+        let what = spool.what();
         let name = self.name();
         match self {
             Self::Gzip => drain(MultiGzDecoder::new(input), &mut spool),

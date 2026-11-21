@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 
 use mf_scan::core::source::bytes::BytesSource;
+use mf_scan::core::source::expand::{ExpandedSource, Nesting};
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::ranged::RangedZipSource;
 use mf_scan::core::source::sevenz::{SevenZSource, Unlock};
@@ -181,9 +182,8 @@ pub(crate) struct ResolvedSource {
 
 impl ResolvedSource {
     /// The [`Operand`] to hand to [`with_operand_source`], derived from the resolved
-    /// [`ResolvedKind`]. `archive_depth` is only consulted for a folder (nested
-    /// `.zip` expansion). Shared so `grep` and `app` map the kind identically.
-    pub(crate) fn operand(&self, archive_depth: u32) -> Operand<'_> {
+    /// [`ResolvedKind`]. Shared so every command maps the kind identically.
+    pub(crate) fn operand(&self) -> Operand<'_> {
         match self.kind {
             ResolvedKind::Archive => Operand::Archive(&self.path),
             ResolvedKind::Tar => Operand::Tar(&self.path),
@@ -191,10 +191,7 @@ impl ResolvedSource {
             ResolvedKind::AndroidBackup => Operand::AndroidBackup(&self.path),
             ResolvedKind::LooseFile => Operand::LooseFile(&self.path),
             ResolvedKind::Stdin => Operand::Stdin,
-            ResolvedKind::Folder => Operand::Folder {
-                path: &self.path,
-                archive_depth,
-            },
+            ResolvedKind::Folder => Operand::Folder(&self.path),
         }
     }
 }
@@ -382,9 +379,8 @@ pub(crate) enum Operand<'a> {
     LooseFile(&'a Path),
     /// Standard input, read into memory.
     Stdin,
-    /// A directory scanned as a folder of loose files, expanding nested `.zip`
-    /// files up to `archive_depth` levels.
-    Folder { path: &'a Path, archive_depth: u32 },
+    /// A directory scanned as a folder of loose files.
+    Folder(&'a Path),
 }
 
 /// Open `operand` as a live [`Source`] and run `f` with it, plus the raw archive
@@ -407,6 +403,7 @@ pub(crate) fn with_operand_source<R>(
     operand: Operand<'_>,
     backup: &BackupOptions,
     io_mode: IoMode,
+    nesting: Nesting,
     record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source, Option<&[u8]>) -> Result<R>,
 ) -> Result<R> {
@@ -420,7 +417,7 @@ pub(crate) fn with_operand_source<R>(
             let source = RangedZipSource::open_with_password(path, password)
                 .with_context(|| format!("cannot open {}", path.display()))?;
             print_zip_notes(path, source.entries(), password.is_some());
-            with_maybe_backup(&source, backup, record, |s| f(s, None))
+            with_maybe_backup(&source, backup, nesting, record, |s| f(s, None))
         }
         Operand::Archive(path) => {
             let mmap = open_archive(path)?;
@@ -428,7 +425,7 @@ pub(crate) fn with_operand_source<R>(
             let source = ZipSource::open_with_password(&mmap, password)
                 .with_context(|| format!("cannot open {}", path.display()))?;
             print_zip_notes(path, source.entries(), password.is_some());
-            with_maybe_backup(&source, backup, record, |s| f(s, Some(&mmap)))
+            with_maybe_backup(&source, backup, nesting, record, |s| f(s, Some(&mmap)))
         }
         // Tar keeps its on-disk mapping alive alongside any inflated stream, so
         // `--verify` attests the archive FILE — the `.tar.gz` as stored, not the
@@ -436,7 +433,9 @@ pub(crate) fn with_operand_source<R>(
         // a different level, and so a weaker attestation).
         Operand::Tar(path) => {
             let source = TarSource::open(path)?;
-            with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
+            with_maybe_backup(&source, backup, nesting, record, |s| {
+                f(s, Some(source.raw_bytes()))
+            })
         }
         // Like tar: `--verify` attests the `.7z` as stored. The decoded files may be an
         // iOS backup, which is then opened as one.
@@ -453,7 +452,9 @@ pub(crate) fn with_operand_source<R>(
                     path.display()
                 );
             }
-            with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
+            with_maybe_backup(&source, backup, nesting, record, |s| {
+                f(s, Some(source.raw_bytes()))
+            })
         }
         Operand::AndroidBackup(path) => {
             let source = backup.backup_password(|p| AndroidBackupSource::open(path, p))?;
@@ -472,11 +473,11 @@ pub(crate) fn with_operand_source<R>(
                 let files = source.entries().iter().filter(|e| !e.is_dir()).count();
                 sink.record = Some(BackupRecord::new_android(source.provenance(), files, facts));
             }
-            f(&source, Some(source.raw_bytes()))
+            with_nesting(&source, nesting, |s| f(s, Some(source.raw_bytes())))
         }
         Operand::LooseFile(path) => {
             let source = FolderSource::open_file(path)?;
-            f(&source, None)
+            with_nesting(&source, nesting, |s| f(s, None))
         }
         Operand::Stdin => {
             let mut data = Vec::new();
@@ -485,14 +486,11 @@ pub(crate) fn with_operand_source<R>(
                 .read_to_end(&mut data)
                 .context("cannot read standard input")?;
             let source = BytesSource::new(STDIN_LABEL, data);
-            f(&source, None)
+            with_nesting(&source, nesting, |s| f(s, None))
         }
-        Operand::Folder {
-            path,
-            archive_depth,
-        } => {
-            let source = FolderSource::open(path, archive_depth)?;
-            with_maybe_backup(&source, backup, record, |s| f(s, None))
+        Operand::Folder(path) => {
+            let source = FolderSource::open(path)?;
+            with_maybe_backup(&source, backup, nesting, record, |s| f(s, None))
         }
     }
 }
@@ -569,6 +567,7 @@ fn statfs(path: &Path) -> Option<libc::statfs> {
 fn with_maybe_backup<R>(
     inner: &dyn Source,
     backup: &BackupOptions,
+    nesting: Nesting,
     record: &RefCell<BackupFacts>,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
@@ -585,11 +584,43 @@ fn with_maybe_backup<R>(
                 facts.structure = Some(bs.structure().clone());
                 facts.kind = Some(BackupKind::Ios);
             }
-            f(&bs)
+            with_nesting(&bs, nesting, f)
         }
         // Not a backup at all: search the raw files unchanged.
-        None => f(inner),
+        None => with_nesting(inner, nesting, f),
     }
+}
+
+/// Fail (exit 2) when `gaps` nested archives were not fully read: called by the
+/// commands with no exit status of their own (`app`, `backup`, `diff`)
+/// once their work and output are done, so the gap is never silent.
+///
+/// WHY after the work: the files that were read are still listed, exported or
+/// compared; the error only says the result is incomplete, as `grep`'s exit 2 does.
+pub(crate) fn fail_on_nested_gaps(gaps: usize) -> Result<()> {
+    anyhow::ensure!(
+        gaps == 0,
+        "{gaps} nested archive(s) were not fully read (not opened, or damaged: see the \
+         nested: lines above); what they hold is missing from this result"
+    );
+    Ok(())
+}
+
+/// Run `f` with `source`, its nested archives opened when `nesting.depth` is 1 or
+/// more (see `ExpandedSource`), what could not be opened said on stderr.
+fn with_nesting<R>(
+    source: &dyn Source,
+    nesting: Nesting,
+    f: impl FnOnce(&dyn Source) -> Result<R>,
+) -> Result<R> {
+    if nesting.depth == 0 {
+        return f(source);
+    }
+    let expanded = ExpandedSource::open(source, nesting)?;
+    for note in expanded.notes() {
+        eprintln!("nested: {note}");
+    }
+    f(&expanded)
 }
 
 /// Extensions `-r` harvests as archives, besides tars. A Cellebrite `.ufdr` report is

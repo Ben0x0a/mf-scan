@@ -68,7 +68,7 @@ pub(crate) struct DiffArgs {
     #[arg(long = "dir-mode")]
     pub(crate) dir_mode: bool,
 
-    /// With --dir-mode, open nested .zip files this many levels deep.
+    /// Open archives and compressed files found inside, this many levels deep.
     #[arg(
         long = "archive-depth",
         value_name = "N",
@@ -76,4 +76,14 @@ pub(crate) struct DiffArgs {
         hide_default_value = true
     )]
     pub(crate) archive_depth: u32,
+
+    /// With --archive-depth: the most opening them may add to memory or disk.
+    #[arg(
+        long = "nested-limit",
+        value_name = "SIZE",
+        value_parser = crate::cmd::cli::common::parse_size,
+        default_value = "16G",
+        hide_default_value = true
+    )]
+    pub(crate) nested_limit: u64,
 }

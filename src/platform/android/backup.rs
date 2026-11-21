@@ -591,6 +591,10 @@ impl Source for AndroidBackupSource {
         self.tar.content(entry)
     }
 
+    fn reads_in_place(&self, _entry: &Entry) -> bool {
+        true
+    }
+
     fn byte_size(&self) -> u64 {
         self.raw_bytes().len() as u64
     }

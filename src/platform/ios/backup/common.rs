@@ -112,6 +112,24 @@ impl BlobStore {
             .with_context(|| format!("blob for {file_id} not found in the backup"))
     }
 
+    /// At least the first `max` bytes of `file_id`'s blob (fewer when it is
+    /// shorter), read through the inner source's [`Source::content_head`].
+    pub(crate) fn read_head(
+        &self,
+        inner: &dyn Source,
+        file_id: &str,
+        max: usize,
+    ) -> Result<Vec<u8>> {
+        let (sharded, flat) = blob_names(&self.root_prefix, file_id);
+        let head = |name: &str| {
+            let entry = inner.entries().get(*self.index.get(name)?)?;
+            inner.content_head(entry, max).ok().map(|c| c.into_owned())
+        };
+        head(&sharded)
+            .or_else(|| head(&flat))
+            .with_context(|| format!("blob for {file_id} not found in the backup"))
+    }
+
     /// Read an inner entry's bytes by exact name, or `None` if it is absent.
     pub(crate) fn read_named(&self, inner: &dyn Source, name: &str) -> Option<Vec<u8>> {
         let entry = inner.entries().get(*self.index.get(name)?)?;

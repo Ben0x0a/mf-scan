@@ -100,10 +100,23 @@ pub struct RunInfo {
     /// from JSON when zero, so a run with no such scope loss is unchanged.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub loose_files_skipped: usize,
+    /// `--archive-depth`: how many levels of nested archives the run opened. `export`
+    /// reopens the source the same way, so a manifest's nested paths are found
+    /// again. Omitted when 0 (and absent from manifests written before it existed).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub archive_depth: u32,
+    /// `--nested-limit`, for a run that opened nested archives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_limit: Option<u64>,
 }
 
 /// `skip_serializing_if` predicate: omit a zero count from JSON output.
 fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// `skip_serializing_if` predicate: omit a zero depth from JSON output.
+fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
@@ -133,6 +146,8 @@ impl Default for RunInfo {
             app_containers: Vec::new(),
             app_group_links: Vec::new(),
             loose_files_skipped: 0,
+            archive_depth: 0,
+            nested_limit: None,
         }
     }
 }
@@ -188,7 +203,7 @@ impl Encoding {
 /// Stored and Deflate are the two methods mobile-forensic archives use, and the two
 /// read. Any other is kept as [`Method::Other`], so the entry is listed and reported
 /// as not searched rather than left out of the archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Method {
     Stored,
     Deflate,
@@ -197,7 +212,7 @@ pub enum Method {
 }
 
 /// How a ZIP entry's data is encrypted (APPNOTE 6.1, and WinZip's AE-1/AE-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encryption {
     None,
     /// Traditional PKWARE encryption. `check` is the byte the 12-byte encryption
@@ -225,7 +240,7 @@ pub enum Encryption {
 /// compression method); a loose file is addressed by its path on disk. The search
 /// engine reads bytes through a [`crate::core::source::Source`], so it never matches on
 /// this directly — but the offset model (`MatchRecord`) and the export step do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     /// Inside a ZIP archive. `data_offset`/`data_len` describe the entry's bytes as
     /// they sit in the archive (the literal content for STORED, the compressed
@@ -286,7 +301,7 @@ pub enum Location {
 /// (Unix epoch seconds, best-effort) used by `diff`'s metadata comparison: from the
 /// ZIP central-directory DOS timestamp, or the filesystem for a loose file; `None`
 /// when the source does not record one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry {
     pub name: String,
     pub uncompressed_size: u64,

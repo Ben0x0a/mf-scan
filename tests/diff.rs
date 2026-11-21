@@ -85,7 +85,7 @@ fn size_only_ignores_mismatched_clock_mtimes() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("x.bin"), b"AAAA").unwrap();
     fs::write(dir.path().join("bigger.bin"), b"BBBBBBBB").unwrap();
-    let sb = FolderSource::open(dir.path(), 0).unwrap();
+    let sb = FolderSource::open(dir.path()).unwrap();
 
     let meta = diff_sources(&sa, &sb, CompareMode::Meta, &EntryFilter::all(), false).unwrap();
     assert_eq!(change_of(&meta, "x.bin"), Change::Modified); // mtime clocks differ

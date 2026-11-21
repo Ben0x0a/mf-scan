@@ -13,6 +13,7 @@
 //! decryption (`--keyfile`), and nested-archive expansion (`--archive-depth`) are
 //! rejected for now rather than silently ignored — they arrive in later milestones.
 
+use mf_scan::core::source::expand::Nesting;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,7 +32,8 @@ use crate::cmd::support::exporting::run_export_sink;
 use crate::cmd::support::reporting::emit;
 use crate::cmd::support::scoping::{app_scope, scoped_run};
 use crate::cmd::support::sources::{
-    BackupFacts, BackupOptions, IoMode, Operand, resolve_file, with_operand_source,
+    BackupFacts, BackupOptions, IoMode, Operand, fail_on_nested_gaps, resolve_file,
+    with_operand_source,
 };
 use crate::cmd::support::{Caveat, caveat};
 
@@ -70,13 +72,19 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
     with_diff_side(
         &args.a,
         args.dir_mode,
-        args.archive_depth,
+        Nesting {
+            depth: args.archive_depth,
+            limit: args.nested_limit,
+        },
         &backup_opts,
         |a_src| {
             with_diff_side(
                 &args.b,
                 args.dir_mode,
-                args.archive_depth,
+                Nesting {
+                    depth: args.archive_depth,
+                    limit: args.nested_limit,
+                },
                 &backup_opts,
                 |b_src| {
                     // `--app`: the apps' containers on either side (a reinstall moves
@@ -114,7 +122,8 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
                     if want_export {
                         export_changes(&args, &report, b_src, prefixes.as_deref())?;
                     }
-                    Ok(())
+                    // Changes inside an archive not fully read are missing.
+                    fail_on_nested_gaps(a_src.nested_gaps().len() + b_src.nested_gaps().len())
                 },
             )
         },
@@ -153,19 +162,16 @@ fn decryption_requested(args: &DiffArgs) -> bool {
 fn with_diff_side<R>(
     path: &Path,
     dir_mode: bool,
-    archive_depth: u32,
+    nesting: Nesting,
     backup_opts: &BackupOptions,
     f: impl FnOnce(&dyn Source) -> Result<R>,
 ) -> Result<R> {
     let resolved;
     let operand = if !path.is_dir() {
         resolved = resolve_file(path)?;
-        resolved.operand(archive_depth)
+        resolved.operand()
     } else if dir_mode {
-        Operand::Folder {
-            path,
-            archive_depth,
-        }
+        Operand::Folder(path)
     } else {
         bail!(
             "{} is a directory; pass --dir-mode to diff it as a folder",
@@ -180,6 +186,7 @@ fn with_diff_side<R>(
         operand,
         backup_opts,
         IoMode::Auto,
+        nesting,
         &record,
         |source, _raw| f(source),
     )
@@ -231,6 +238,8 @@ fn diff_run_info(args: &DiffArgs) -> RunInfo {
         path_globs: args.filter.path.clone(),
         not_path_globs: args.filter.not_path.clone(),
         app: (!args.filter.app.is_empty()).then(|| args.filter.app.join(", ")),
+        archive_depth: args.archive_depth,
+        nested_limit: (args.archive_depth > 0).then_some(args.nested_limit),
         ..RunInfo::default()
     }
 }

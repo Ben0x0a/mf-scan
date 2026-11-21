@@ -48,6 +48,9 @@ pub(super) enum Class {
     /// its ciphertext was **not** searched, so it must not count as scanned or
     /// the coverage figures would overstate what was actually looked at.
     DecryptFailed { bytes: u64 },
+    /// An archive `--archive-depth` opened: listed, its members searched in its
+    /// place, so its own bytes are not searched a second time.
+    Expanded { bytes: u64 },
     /// The file was searched.
     Scanned {
         bytes: u64,
@@ -181,6 +184,15 @@ fn classify_content(
     progress: &dyn Progress,
     bytes: u64,
 ) -> Result<EntryResult> {
+    if source.is_expanded(entry) {
+        progress.inc();
+        return Ok(EntryResult {
+            records: Vec::new(),
+            file: None,
+            class: Class::Expanded { bytes },
+            decryption: None,
+        });
+    }
     // Header-first classification: for a source where fetching a whole file just
     // to skip it is expensive (a positioned-read remote archive), classify from a
     // cheap header read and skip media/`--type`-excluded files WITHOUT the full

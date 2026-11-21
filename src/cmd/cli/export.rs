@@ -34,4 +34,20 @@ pub(crate) struct ExportArgs {
     /// Hash the archive before and after, to attest it did not change.
     #[arg(long = "verify")]
     pub(crate) verify: bool,
+
+    /// Open nested archives this deep (default: as the manifest's run).
+    #[arg(long = "archive-depth", value_name = "N")]
+    pub(crate) archive_depth: Option<u32>,
+
+    /// Most nested archives may decode to (default: as the run, or 16G).
+    #[arg(long = "nested-limit", value_name = "SIZE", value_parser = parse_size)]
+    pub(crate) nested_limit: Option<u64>,
+
+    /// Ask for the backup's password (or set MFSCAN_BACKUP_PASSWORD).
+    #[arg(long = "backup-password")]
+    pub(crate) backup_password: bool,
+
+    /// Ask for a 7z/zip's password (or set MFSCAN_ARCHIVE_PASSWORD).
+    #[arg(long = "archive-password")]
+    pub(crate) archive_password: bool,
 }

@@ -53,10 +53,11 @@ src/
       sevenz.rs     SevenZSource: a 7z (sevenz-rust2), plain or AES, every block decoded
                     once into the spool; each member a range of that stream
       spool.rs      decoded streams: in memory up to 64 MiB, then an unnamed temp file
-      folder.rs     FolderSource: a directory of loose files (+ nested-archive arena), or
+      folder.rs     FolderSource: a directory of loose files, or
                     one loose file
       bytes.rs      BytesSource: one file held in memory (standard input)
-      nested.rs     --archive-depth expansion of nested .zip files into the arena
+      expand.rs     ExpandedSource: --archive-depth over any source; ZIP, tar, 7z and
+                    compressed files opened by content into the spool, capped
   formats/      file-CONTENT understanding (what is in this file?)
     inspect/      "what does this match mean" inspectors + file-type detection + diff
       mod.rs        Inspector trait (detect/inspect/diff) + registry + detect_type
@@ -242,9 +243,11 @@ over two sources, pairing entries by path (see [diff.md](diff.md)).
 
 ## Key types (`core/models.rs`)
 
-- `Method` — `Stored` or `Deflate`.
+- `Method` — `Stored`, `Deflate`, or `Other(n)` (listed, not read); `Encryption` — none,
+  ZipCrypto, WinZip AES, or one not read.
 - `Location` — where a file's bytes live: `Zip { … }` (mmap offsets), `Loose { path }`
-  (disk), or `Nested { archive, … }` (offsets into a folder source's in-memory arena).
+  (disk), `Tar`/`SevenZ { … }` (ranges of a decoded stream), or `Nested { archive, … }`
+  (ranges of an archive `ExpandedSource` opened).
 - `Entry` — a located file: `name`, `uncompressed_size`, `mtime` (for diff), `location`.
 - `SearchHit` — one match within an entry: `offset`, line-preview bytes, match range.
 - `MatchRecord` — an archive-level match. `archive_offset` is `Option<u64>` — `None` for a

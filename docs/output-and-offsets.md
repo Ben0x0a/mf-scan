@@ -26,8 +26,8 @@ archive byte for the match:
   **compressed** (`~` prefix in txt, `compressed: true` in json/csv);
 - **loose files** in a `--dir-mode` folder source — there is no enclosing archive
   (`file_start` is `0`);
-- files inside an **opened nested archive** (`--archive-depth`) — the bytes live in an
-  in-memory blob, not the archive on disk;
+- files inside an **opened nested archive** (`--archive-depth`) — the bytes live in the
+  decoded copy of that archive, not the archive on disk;
 - **decrypted** content — the offsets are within the plaintext, not the archive.
 
 `file_offset` (the in-file position) is always meaningful and is what txt shows.
@@ -293,6 +293,9 @@ The `stats` object:
 - `offsets` are the `file_offset`s of every match in that file.
 - `export --from-manifest` reuses `output_path` and locates each file by
   `internal_path`; missing entries are reported as skipped.
+- `run.archive_depth` and `run.nested_limit` (present only when the run opened nested
+  archives) are how `export` reopens the source, so an `internal_path` inside a nested
+  archive (`case.zip`'s `chats/backup.zip/msgstore.db`) is found again.
 
 ## iOS app bundle-ID annotation
 

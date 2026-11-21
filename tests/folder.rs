@@ -1,9 +1,9 @@
 //! Integration tests for folder scanning and nested-archive expansion.
 //!
-//! Defines: `--archive-depth` behaviour — a nested `.zip` is opaque at depth 0,
-//! opened one level at depth 1, and a zip-in-zip is opened at depth 2 — plus that a
-//! nested entry's content reads back the inner file's bytes.
-//! Uses: `common` (fixture builder) and `mf_scan::core::source::{folder, Source}`.
+//! Defines: folder scanning, and `--archive-depth` over a folder — a nested `.zip` is
+//! one file at depth 0, opened (and still listed) at depth 1, and a zip-in-zip is
+//! opened at depth 2 — plus that a nested entry reads back the inner file's bytes.
+//! Uses: `common` (fixture builder) and `mf_scan::core::source::{folder, expand}`.
 
 mod common;
 
@@ -12,6 +12,7 @@ use std::fs;
 use common::{FileSpec, build_zip};
 use mf_scan::core::filter::EntryFilter;
 use mf_scan::core::source::Source;
+use mf_scan::core::source::expand::{ExpandedSource, Nesting};
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::engine::NoProgress;
 use mf_scan::ops::search::{MatchOn, Query, search_source};
@@ -19,9 +20,16 @@ use mf_scan::report::export::{self, ExportOutcome};
 use regex::bytes::Regex;
 use tempfile::tempdir;
 
-/// Entry names of a folder source, in their (sorted) order.
-fn names(src: &FolderSource) -> Vec<String> {
+/// Entry names of a source, in its order.
+fn names(src: &dyn Source) -> Vec<String> {
     src.entries().iter().map(|e| e.name.clone()).collect()
+}
+
+fn depth(depth: u32) -> Nesting {
+    Nesting {
+        depth,
+        ..Nesting::default()
+    }
 }
 
 #[test]
@@ -38,19 +46,24 @@ fn archive_depth_controls_nested_expansion() {
     fs::write(dir.path().join("loose.txt"), b"loose").unwrap();
 
     // depth 0: the nested zip is a single opaque file.
-    let d0 = FolderSource::open(dir.path(), 0).unwrap();
+    let folder = FolderSource::open(dir.path()).unwrap();
+    let d0 = ExpandedSource::open(&folder, depth(0)).unwrap();
     assert_eq!(names(&d0), ["backup.zip", "loose.txt"]);
 
-    // depth 1: the zip is opened; its files appear under its path.
-    let d1 = FolderSource::open(dir.path(), 1).unwrap();
+    // depth 1: the zip is opened; it stays listed, its files follow it under its
+    // path, and it is marked expanded (its members are searched in its place).
+    let d1 = ExpandedSource::open(&folder, depth(1)).unwrap();
     assert_eq!(
         names(&d1),
         [
+            "backup.zip",
             "backup.zip/inner1.txt",
             "backup.zip/sub/inner2.txt",
             "loose.txt"
         ]
     );
+    assert!(d1.is_expanded(&d1.entries()[0]));
+    assert!(!d1.is_expanded(&d1.entries()[1]));
 
     // A nested entry reads back the inner file's bytes.
     let e = d1
@@ -76,14 +89,23 @@ fn depth_two_opens_a_zip_inside_a_zip() {
     fs::write(dir.path().join("outer.zip"), &outer).unwrap();
 
     // depth 1: outer is opened but deep.zip inside it stays opaque.
-    let d1 = FolderSource::open(dir.path(), 1).unwrap();
-    assert_eq!(names(&d1), ["outer.zip/deep.zip", "outer.zip/top.txt"]);
+    let folder = FolderSource::open(dir.path()).unwrap();
+    let d1 = ExpandedSource::open(&folder, depth(1)).unwrap();
+    assert_eq!(
+        names(&d1),
+        ["outer.zip", "outer.zip/deep.zip", "outer.zip/top.txt"]
+    );
 
     // depth 2: deep.zip is opened too, so its file surfaces.
-    let d2 = FolderSource::open(dir.path(), 2).unwrap();
+    let d2 = ExpandedSource::open(&folder, depth(2)).unwrap();
     assert_eq!(
         names(&d2),
-        ["outer.zip/deep.zip/deep.txt", "outer.zip/top.txt"]
+        [
+            "outer.zip",
+            "outer.zip/deep.zip",
+            "outer.zip/deep.zip/deep.txt",
+            "outer.zip/top.txt"
+        ]
     );
     let e = d2
         .entries()
@@ -100,7 +122,7 @@ fn search_and_export_run_over_a_folder_source() {
     fs::write(dir.path().join("miss.txt"), b"nothing").unwrap();
 
     // Search the folder through the same engine entry point grep uses.
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let re = Regex::new("SECRET").unwrap();
     let findings = search_source(
         &src,
@@ -145,7 +167,7 @@ fn unreadable_file_is_counted_and_does_not_abort_the_scan() {
     fs::write(&blocked, b"SECRET but unreadable").unwrap();
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let re = Regex::new("SECRET").unwrap();
     let findings = search_source(
         &src,
@@ -167,28 +189,45 @@ fn unreadable_file_is_counted_and_does_not_abort_the_scan() {
     assert_eq!(findings.stats.files_scanned, 1);
 }
 
-/// Resource-exhaustion guard (review finding S4): nested-archive expansion has
-/// a cumulative arena budget. Exhausting it must fail loudly — not degrade
-/// silently (coverage cut short) and not OOM (crafted archive-of-archives).
+/// Resource-exhaustion guard (review finding S4): what opening nested containers
+/// adds (decoded data, or containers read into memory) has a cap for the whole
+/// source. Reaching it must fail loudly — not degrade silently (coverage cut short)
+/// and not fill the memory or the disk (a crafted bomb). Containers read in place (a
+/// folder's own files) cost nothing against it.
 #[test]
-fn nested_arena_budget_exhaustion_fails_loudly() {
+fn nested_limit_exhaustion_fails_loudly() {
+    use std::io::Write;
     let dir = tempdir().unwrap();
-    let inner = build_zip(&[FileSpec::stored("inner.txt", b"hello nested")], false);
-    fs::write(dir.path().join("a.zip"), &inner).unwrap();
-    fs::write(dir.path().join("b.zip"), &inner).unwrap();
+    let decoded = vec![b'x'; 1000];
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&decoded).unwrap();
+    let gz = gz.finish().unwrap();
+    fs::write(dir.path().join("a.log.gz"), &gz).unwrap();
+    fs::write(dir.path().join("b.log.gz"), &gz).unwrap();
+    let folder = FolderSource::open(dir.path()).unwrap();
 
-    // Room for one archive but not both.
-    let small = inner.len() as u64 + 1;
-    let err = match FolderSource::open_with_arena_budget(dir.path(), 1, small) {
-        Ok(_) => panic!("expected the arena budget to be exceeded"),
+    // Room to decode one file but not both.
+    let small = Nesting {
+        depth: 1,
+        limit: 1500,
+    };
+    let err = match ExpandedSource::open(&folder, small) {
+        Ok(_) => panic!("expected the nested limit to be reached"),
         Err(e) => e,
     };
     assert!(
-        format!("{err:#}").contains("nested archives exceed"),
+        format!("{err:#}").contains("--nested-limit"),
         "unexpected error: {err:#}"
     );
 
-    // A sufficient budget expands both.
-    let src = FolderSource::open_with_arena_budget(dir.path(), 1, 10 * inner.len() as u64).unwrap();
-    assert_eq!(names(&src), ["a.zip/inner.txt", "b.zip/inner.txt"]);
+    // A sufficient limit decodes both.
+    let enough = Nesting {
+        depth: 1,
+        limit: 2000,
+    };
+    let src = ExpandedSource::open(&folder, enough).unwrap();
+    assert_eq!(
+        names(&src),
+        ["a.log.gz", "a.log.gz/a.log", "b.log.gz", "b.log.gz/b.log"]
+    );
 }

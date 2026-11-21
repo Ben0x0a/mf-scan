@@ -219,6 +219,35 @@ impl<'a> EncryptedBackupSource<'a> {
         Ok(plain)
     }
 
+    /// The first `max` bytes of a backed-up file (fewer when it is shorter): only
+    /// the blocks that hold them are read and decrypted.
+    ///
+    /// HOW: AES-CBC block `i` decrypts from ciphertext blocks `i - 1` and `i` alone
+    /// (the IV is zero), so the first `n` blocks of the blob give the first `n`
+    /// blocks of the file. WHY: `expand` looks at the start of every file to tell
+    /// an archive; decrypting each whole file for that would double the work.
+    fn decrypt_head(&self, meta: &BackupEntry, max: usize) -> Result<Vec<u8>> {
+        const BLOCK: usize = 16;
+        let class_key = self
+            .class_keys
+            .get(&meta.protection_class)
+            .with_context(|| {
+                format!(
+                    "no class key for protection class {} (file {})",
+                    meta.protection_class, meta.file_id
+                )
+            })?;
+        let file_key = unwrap_key(class_key, &meta.wrapped_key)
+            .with_context(|| format!("cannot unwrap per-file key for {}", meta.file_id))?;
+        let want = max.div_ceil(BLOCK) * BLOCK;
+        let mut blob = self.blobs.read_head(self.inner, &meta.file_id, want)?;
+        blob.truncate(want.min(blob.len() / BLOCK * BLOCK));
+        let mut plain = aes_cbc_decrypt(&file_key, &ZERO_IV, &blob)
+            .with_context(|| format!("cannot decrypt {}", meta.file_id))?;
+        plain.truncate(max.min(meta.size as usize));
+        Ok(plain)
+    }
+
     /// The directory and symlink rows `Manifest.db` records.
     ///
     /// Deliberately NOT part of `entries()`: see [`BackupStructure`] for the three
@@ -246,6 +275,11 @@ impl Source for EncryptedBackupSource<'_> {
         let idx = meta_index(&self.index, &entry.name)?;
         let plain = self.decrypt_file(&self.meta[idx])?;
         Ok(Content::Owned(plain))
+    }
+
+    fn content_head(&self, entry: &Entry, max: usize) -> Result<Content<'_>> {
+        let idx = meta_index(&self.index, &entry.name)?;
+        Ok(Content::Owned(self.decrypt_head(&self.meta[idx], max)?))
     }
 
     /// Sum of the logical (real) file sizes, for the coverage report.

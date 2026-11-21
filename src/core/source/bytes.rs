@@ -43,6 +43,10 @@ impl Source for BytesSource {
         Ok(Content::Borrowed(&self.data))
     }
 
+    fn reads_in_place(&self, _entry: &Entry) -> bool {
+        true
+    }
+
     fn byte_size(&self) -> u64 {
         self.data.len() as u64
     }

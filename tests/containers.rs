@@ -75,7 +75,7 @@ fn container_hit_gets_bundle_id_outside_does_not() {
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("other.txt"), b"NEEDLE outside container").unwrap();
 
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let re = Regex::new("NEEDLE").unwrap();
     let findings = search_source(
         &src,
@@ -149,7 +149,7 @@ fn longest_prefix_wins_for_nested_containers() {
     // Target file inside the inner container.
     fs::write(inner.join("data.txt"), b"NEEDLE").unwrap();
 
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let map = AppContainerMap::build(&src);
 
     // Identify the path as the source sees it.
@@ -195,7 +195,7 @@ fn invalid_metadata_plist_degrades_without_error() {
     fs::write(bad.join("file.txt"), b"NEEDLE bad").unwrap();
 
     // Build must not panic; the bad container is simply absent from the map.
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let map = AppContainerMap::build(&src);
 
     // The good container still resolves.
@@ -243,7 +243,7 @@ fn segment_boundary_prevents_false_prefix_match() {
     fs::create_dir_all(&applex).unwrap();
     fs::write(applex.join("data.txt"), b"unrelated").unwrap();
 
-    let src = FolderSource::open(dir.path(), 0).unwrap();
+    let src = FolderSource::open(dir.path()).unwrap();
     let map = AppContainerMap::build(&src);
 
     // The file under AppleX/ must NOT resolve to com.example.apple.
