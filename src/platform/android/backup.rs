@@ -5,7 +5,7 @@
 //! Used by: the binary's `support::sources`; through the `Source` trait, every
 //! operation (`grep`, `find`, `diff`, `export`, `app`, `backup`).
 //! Uses: `core::source::tar` (the payload is a tar), `aes`/`cbc`/`pbkdf2`/`sha1`
-//! (encryption), `flate2` (compression), `tempfile` (the spill file), and the
+//! (encryption), `flate2` (compression), `core::source::spool` (the decoded payload), and the
 //! acquisition-default password list in `platform::ios::backup::password`.
 //!
 //! ── The format, as written by AOSP ─────────────────────────────────────────────
@@ -42,13 +42,13 @@
 //!
 //! ── Memory ─────────────────────────────────────────────────────────────────────
 //! A compressed or encrypted payload must be decoded before it can be read at random.
-//! Up to `SPOOL_LIMIT` it stays in memory; beyond that it spills to an unnamed
-//! temporary file, which the operating system deletes when the process ends, because
-//! a backup can run to many gigabytes. That file holds decrypted evidence while the
-//! tool runs. Point `TMPDIR` (`TMP` on Windows) at an approved location if that matters.
+//! It is spooled (`core::source::spool`): up to 64 MiB in memory, beyond that in an
+//! unnamed temporary file, which the operating system deletes when the process ends,
+//! because a backup can run to many gigabytes. That file holds decrypted evidence while
+//! the tool runs. Point `TMPDIR` (`TMP` on Windows) at an approved location if that
+//! matters.
 
 use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 
 use aes::Aes256;
@@ -63,6 +63,7 @@ use serde::Serialize;
 use sha1::Sha1;
 
 use crate::core::models::Entry;
+use crate::core::source::spool::Spool;
 use crate::core::source::tar::TarSource;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{BackupStructure, DirectoryRecord};
@@ -81,8 +82,6 @@ const MAX_HEADER_LINE: usize = 4096;
 const KEY_BYTES: usize = 32;
 const AES_BLOCK: usize = 16;
 
-/// Decoded payload above this spills from memory to a temporary file.
-const SPOOL_LIMIT: usize = 64 * 1024 * 1024;
 /// How much of the payload is decoded at a time. A multiple of the AES block size,
 /// so only the very last chunk can be a partial block.
 const DECODE_CHUNK: usize = 1024 * 1024;
@@ -276,54 +275,6 @@ fn try_password(header: &Header, password: &str) -> Option<(Vec<u8>, Vec<u8>, Ke
     None
 }
 
-/// Collects decoded bytes, in memory up to [`SPOOL_LIMIT`], then in a temporary file.
-struct Spool {
-    memory: Vec<u8>,
-    file: Option<File>,
-}
-
-impl Spool {
-    fn new() -> Self {
-        Self {
-            memory: Vec::new(),
-            file: None,
-        }
-    }
-
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.file.is_none() && self.memory.len() + bytes.len() > SPOOL_LIMIT {
-            let mut file = tempfile::tempfile()
-                .context("cannot create a temporary file to decode the Android backup")?;
-            file.write_all(&self.memory)
-                .context("cannot write the decoded Android backup to a temporary file")?;
-            self.memory = Vec::new();
-            self.file = Some(file);
-        }
-        match &mut self.file {
-            Some(file) => file
-                .write_all(bytes)
-                .context("cannot write the decoded Android backup to a temporary file"),
-            None => {
-                self.memory.extend_from_slice(bytes);
-                Ok(())
-            }
-        }
-    }
-
-    fn finish(self) -> Result<Content<'static>> {
-        match self.file {
-            None => Ok(Content::Owned(self.memory)),
-            Some(file) => {
-                // SAFETY: an unnamed temporary file this process alone holds, mapped
-                // read-only once it is complete.
-                let map = unsafe { memmap2::Mmap::map(&file) }
-                    .context("cannot map the decoded Android backup")?;
-                Ok(Content::Mapped(map))
-            }
-        }
-    }
-}
-
 /// Inflates a zlib stream chunk by chunk.
 ///
 /// WHY `Decompress` directly rather than the `flate2` reader: the reader reports a
@@ -402,7 +353,7 @@ fn decode_payload(
     keys: Option<(&[u8], &[u8])>,
     compressed: bool,
 ) -> Result<(Content<'static>, Option<String>)> {
-    let mut out = Spool::new();
+    let mut out = Spool::new("the Android backup");
     let stop = run_decode(payload, keys, compressed, &mut out);
     let damage = match stop {
         Ok(()) => None,
@@ -665,6 +616,8 @@ impl Source for AndroidBackupSource {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use cbc::Encryptor;
     use cbc::cipher::BlockEncryptMut;
@@ -844,19 +797,6 @@ mod tests {
             assert_eq!(first.name, "apps/com.x/f/first");
             assert_eq!(&*source.content(first).unwrap(), b"needle");
         }
-    }
-
-    #[test]
-    fn a_payload_past_the_spool_limit_spills_and_still_reads() {
-        let mut spool = Spool::new();
-        let chunk = vec![0xABu8; SPOOL_LIMIT / 2 + 1];
-        spool.write(&chunk).unwrap();
-        assert!(spool.file.is_none());
-        spool.write(&chunk).unwrap();
-        assert!(spool.file.is_some());
-        let content = spool.finish().unwrap();
-        assert_eq!(content.len(), chunk.len() * 2);
-        assert!(content.iter().all(|&b| b == 0xAB));
     }
 
     #[test]

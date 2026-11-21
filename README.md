@@ -27,7 +27,9 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 - **Archives *and* folders** — point at a `.zip`, a `.tar`/`.tar.gz`/`.tgz`, or a
   directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
   folder and searches the files within them. (A plain `.tar` is memory-mapped and
-  reports true archive offsets; a `.tar.gz` is decompressed in memory.)
+  reports true archive offsets; a `.tar.gz` is decompressed once, in memory up to
+  64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
+  evidence while the tool runs.)
 - **Tells you *where*, always** — every match reports the file path plus byte
   offsets (see [Offsets](#offsets)).
 - **STORED + DEFLATE**: uncompressed entries are searched in place; DEFLATE

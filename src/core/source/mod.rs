@@ -31,6 +31,7 @@ pub mod bytes;
 pub mod folder;
 mod nested;
 pub mod ranged;
+pub(crate) mod spool;
 pub mod tar;
 pub mod zip;
 

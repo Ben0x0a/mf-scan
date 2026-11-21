@@ -7,7 +7,8 @@
 //! extension), so a gzipped tar with any name is handled.
 //! Used by: the binary's `support::sources` (opens a `.tar`/`.tar.gz` operand) and,
 //! through the [`Source`] trait, the search/diff/export engines.
-//! Uses: `crate::core::models::{Entry, Location}`, `flate2` (gunzip), `memmap2`, `anyhow`.
+//! Uses: `crate::core::models::{Entry, Location}`, `flate2` (gunzip), `spool` (the
+//! decoded stream), `memmap2`, `anyhow`.
 //!
 //! Why hand-rolled (not the `tar` crate): the codebase parses its containers by hand
 //! (see `zip`) for full bounds-checking control and the forensic "degrade, don't die"
@@ -17,14 +18,14 @@
 //! overrides are handled — enough for real iOS/Android extractions with long paths.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 
 use crate::core::models::{Entry, Location};
-use crate::core::source::{Content, Source, nested};
+use crate::core::source::spool::spool_reader;
+use crate::core::source::{Content, Source};
 
 /// A tar block: header and data are both padded to this size.
 const BLOCK: usize = 512;
@@ -58,8 +59,8 @@ impl TarSource {
     ///
     /// Detection is by content (the gzip magic `1f 8b`), not extension, so a
     /// gzipped tar with any name is handled. A plain `.tar` is memory-mapped
-    /// (zero-copy, physical offsets); a `.tar.gz` is decompressed into memory,
-    /// bounded by the shared arena budget so a crafted gzip cannot exhaust RAM.
+    /// (zero-copy, physical offsets); a `.tar.gz` is decompressed once into the
+    /// spool (memory, then a temporary file), so its size is not bounded by RAM.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         // SAFETY: read-only map of evidence opened read-only — the same discipline
@@ -67,9 +68,11 @@ impl TarSource {
         let map = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("cannot map {}", path.display()))?;
         let inflated = if map.starts_with(&[0x1f, 0x8b]) {
-            Some(Content::Owned(gunzip(&map).with_context(|| {
-                format!("cannot decompress {}", path.display())
-            })?))
+            // `MultiGzDecoder` handles a gzip of several concatenated members (what
+            // `gzip a b > out.gz` or some tar tools produce).
+            let stream = spool_reader(MultiGzDecoder::new(&map[..]), "the compressed tar")
+                .with_context(|| format!("cannot decompress {}", path.display()))?;
+            Some(stream)
         } else {
             None
         };
@@ -166,27 +169,6 @@ impl Source for TarSource {
             _ => None,
         }
     }
-}
-
-/// Decompress a gzip stream, bounded by the nested-archive arena budget so a
-/// crafted `.tar.gz` cannot exhaust memory (a top-level tar.gz must be inflated
-/// whole to random-access it, unlike a zip's per-entry inflate).
-fn gunzip(compressed: &[u8]) -> Result<Vec<u8>> {
-    let budget = nested::NESTED_ARENA_BUDGET;
-    let mut out = Vec::new();
-    // `MultiGzDecoder` handles a gzip made of several concatenated members (what
-    // `gzip a b > out.gz` or some tar tools produce). `take(budget + 1)` lets us
-    // detect an overrun: reading budget+1 bytes means it exceeds the cap.
-    MultiGzDecoder::new(compressed)
-        .take(budget + 1)
-        .read_to_end(&mut out)?;
-    if out.len() as u64 > budget {
-        bail!(
-            "decompressed tar exceeds the {} MiB budget",
-            budget / (1024 * 1024)
-        );
-    }
-    Ok(out)
 }
 
 /// What a walk of the block sequence found.
