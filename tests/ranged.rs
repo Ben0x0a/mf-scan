@@ -192,3 +192,40 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     e.write_all(data).unwrap();
     e.finish().unwrap()
 }
+
+/// Many threads reading one ranged source at once must each get their own entry's
+/// bytes. A positioned read that seeks a handle sharing its position with the
+/// others (the old fallback, on Windows) reads at another thread's offset.
+#[test]
+fn parallel_reads_each_get_their_own_bytes() {
+    let contents: Vec<Vec<u8>> = (0..64u32)
+        .map(|i| format!("file {i}: ").repeat(500 + i as usize).into_bytes())
+        .collect();
+    let names: Vec<String> = (0..contents.len()).map(|i| format!("f{i}.txt")).collect();
+    let specs: Vec<FileSpec> = names
+        .iter()
+        .zip(&contents)
+        .map(|(n, c)| FileSpec::stored(n, c))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.zip");
+    std::fs::write(&path, build_zip(&specs, false)).unwrap();
+    let source = RangedZipSource::open(&path).unwrap();
+
+    std::thread::scope(|scope| {
+        for thread in 0..8 {
+            let (source, contents) = (&source, &contents);
+            scope.spawn(move || {
+                for round in 0..20 {
+                    for (i, entry) in source.entries().iter().enumerate() {
+                        if (i + thread + round) % 3 != 0 {
+                            continue;
+                        }
+                        let got = source.content(entry).unwrap();
+                        assert_eq!(&*got, &contents[i][..], "{} (thread {thread})", entry.name);
+                    }
+                }
+            });
+        }
+    });
+}

@@ -353,17 +353,53 @@ fn read_range_chunked(file: &File, start: u64, total: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Positioned `read_exact` at an absolute offset. Unix uses `pread`; the fallback
-/// (other platforms) seeks a cloned handle so the shared `File` is left alone.
+/// Positioned `read_exact` at an absolute offset, safe to call from several threads
+/// at once on the one `File` (the engine reads entries in parallel).
+///
+/// Unix uses `pread`, which takes the offset with each call. Windows uses
+/// `seek_read`, which does too (ReadFile with an explicit offset).
+///
+/// WHY not seek-then-read on a cloned handle, as before: a cloned `File` shares
+/// its position with the original (Rust's `try_clone` documentation), so two
+/// threads seeking and reading at once read at each other's offsets — wrong bytes,
+/// found only when a check happened to cover them (a ZipCrypto CRC, on Windows CI).
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     file.read_exact_at(buf, offset)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the file ends before the range read",
+                ));
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Any other platform: seek then read, one thread at a time (the position is
+/// shared, see above), so a read is never interleaved with another.
+#[cfg(not(any(unix, windows)))]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut handle = file.try_clone()?;
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut handle = file;
     handle.seek(SeekFrom::Start(offset))?;
     handle.read_exact(buf)
 }
