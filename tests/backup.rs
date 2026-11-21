@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use mf_scan::core::models::Entry;
 use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::{IntegrityCheck, Source};
+use mf_scan::platform::ios::backup::password::{PasswordInput, PasswordSource};
 use mf_scan::platform::ios::backup::profile;
 use mf_scan::platform::ios::backup::source::BackupSource;
 
@@ -46,7 +47,7 @@ fn unencrypted_backup_maps_logical_paths_and_skips_missing() {
     let p = profile::detect(&folder).expect("fixture is recognised as a backup");
     assert!(!p.encrypted);
 
-    let bs = BackupSource::build(&folder, &p, None).unwrap();
+    let bs = BackupSource::build(&folder, &p, PasswordInput::None).unwrap();
 
     // Provenance: 3 files mapped, the 1 manifest-only file counted as missing.
     let rec = bs.record(&p);
@@ -83,7 +84,7 @@ fn encrypted_backup_decrypts_with_password() {
     let p = profile::detect(&folder).expect("fixture is recognised as a backup");
     assert!(p.encrypted);
 
-    let bs = BackupSource::build(&folder, &p, Some("1234")).unwrap();
+    let bs = BackupSource::build(&folder, &p, PasswordInput::Given("1234")).unwrap();
 
     let rec = bs.record(&p);
     assert!(rec.encrypted);
@@ -100,12 +101,19 @@ fn encrypted_backup_decrypts_with_password() {
     ));
 }
 
+/// The acquisition defaults come first: the fixture's password, `1234`, is one, so
+/// a wrong supplied password is never reached, and the record says a default
+/// unlocked it. (A password no default matches is refused: see the Android backup
+/// and `password` tests, which share this order.)
 #[test]
-fn encrypted_backup_wrong_password_errors() {
+fn encrypted_backup_tries_the_defaults_before_a_supplied_password() {
     let path = fixture("encrypted");
     let folder = FolderSource::open(&path, 0).unwrap();
     let p = profile::detect(&folder).unwrap();
-    assert!(BackupSource::build(&folder, &p, Some("not-the-password")).is_err());
+    let bs = BackupSource::build(&folder, &p, PasswordInput::Given("not-the-password")).unwrap();
+    let rec = bs.record(&p);
+    assert_eq!(rec.password_source, Some(PasswordSource::Default));
+    assert_eq!(rec.default_password_used.as_deref(), Some("1234"));
 }
 
 /// Directory and symlink rows are exposed SEPARATELY from `entries()`.
@@ -117,7 +125,7 @@ fn encrypted_backup_wrong_password_errors() {
 fn directory_records_are_separate_from_entries() {
     let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("fixture opens");
     let profile = profile::detect(&folder).expect("fixture is recognised as a backup");
-    let source = BackupSource::build(&folder, &profile, None).expect("builds");
+    let source = BackupSource::build(&folder, &profile, PasswordInput::None).expect("builds");
 
     // The fixture carries one directory row (flags == 2).
     let structure = source.structure();

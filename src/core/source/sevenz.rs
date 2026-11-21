@@ -104,8 +104,8 @@ impl SevenZSource {
             (Unlock::NotEncrypted, _) => Password::empty(),
             (_, Some(p)) => Password::from(p),
             (_, None) => bail!(
-                "{} is an encrypted 7z: pass its password with --archive-password (or \
-                 MFSCAN_ARCHIVE_PASSWORD)",
+                "{} is an encrypted 7z: pass --archive-password to be asked for its \
+                 password (or set MFSCAN_ARCHIVE_PASSWORD)",
                 path.display()
             ),
         };
@@ -173,8 +173,8 @@ fn read_header(raw: &[u8], password: Option<&str>) -> Result<(Archive, bool)> {
         Err(Error::PasswordRequired) => {
             let Some(password) = password else {
                 bail!(
-                    "its list of files is encrypted: pass its password with \
-                     --archive-password (or MFSCAN_ARCHIVE_PASSWORD)"
+                    "its list of files is encrypted: pass --archive-password to be asked \
+                     for its password (or set MFSCAN_ARCHIVE_PASSWORD)"
                 );
             };
             let archive =

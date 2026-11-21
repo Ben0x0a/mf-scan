@@ -66,7 +66,9 @@ use crate::core::source::spool::Spool;
 use crate::core::source::tar::TarSource;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::{BackupStructure, DirectoryRecord};
-use crate::platform::ios::backup::password::{UnlockProvenance, candidates};
+use crate::platform::ios::backup::password::{
+    PasswordInput, UnlockProvenance, no_unlock_error, unlock_with,
+};
 
 const MAGIC: &[u8] = crate::core::source::ANDROID_BACKUP_MAGIC;
 /// The highest archive version AOSP writes (`BACKUP_FILE_VERSION`). A newer one is
@@ -470,9 +472,9 @@ pub struct AndroidBackupSource {
 impl AndroidBackupSource {
     /// Open and decode the `.ab` at `path`.
     ///
-    /// A supplied password is the only one tried. With none, the acquisition defaults
-    /// are tried and the one that worked is recorded, as for an iOS backup.
-    pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
+    /// The acquisition defaults are tried first, then `password`, and the one that
+    /// worked is recorded, as for an iOS backup.
+    pub fn open(path: &Path, password: PasswordInput) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         // SAFETY: read-only map of evidence opened read-only, as for every archive.
         let raw = unsafe { memmap2::Mmap::map(&file) }
@@ -483,25 +485,16 @@ impl AndroidBackupSource {
         let mut key_derivation = None;
         let mut provenance = None;
         if header.encrypted() {
-            let unlocked = candidates(password).into_iter().find_map(|candidate| {
-                try_password(&header, &candidate).map(|found| (candidate, found))
-            });
-            let Some((candidate, (key, iv, regime))) = unlocked else {
-                if password.is_some() {
-                    bail!("the supplied --backup-password did not unlock this Android backup");
-                }
-                bail!(
-                    "this Android backup is encrypted and no default password unlocked it — pass \
-                     the password with --backup-password (or MFSCAN_BACKUP_PASSWORD)"
-                );
+            let unlocked = unlock_with(password, |candidate| try_password(&header, candidate))?;
+            let Some(((key, iv, regime), found)) = unlocked else {
+                return Err(no_unlock_error(
+                    "this Android backup is encrypted",
+                    password.supplies(),
+                ));
             };
             keys = Some((key, iv));
             key_derivation = Some(regime.as_str());
-            provenance = Some(if password.is_some() {
-                UnlockProvenance::Supplied
-            } else {
-                UnlockProvenance::Default(candidate)
-            });
+            provenance = Some(found);
         }
 
         let (stream, mut stream_error) = decode_payload(
@@ -714,7 +707,8 @@ mod tests {
         // Named without `.ab`: detection is by content.
         let path = dir.path().join("backup.bin");
         std::fs::write(&path, bytes).unwrap();
-        AndroidBackupSource::open(&path, password)
+        let source = password.map_or(PasswordInput::None, PasswordInput::Given);
+        AndroidBackupSource::open(&path, source)
     }
 
     fn assert_sample(source: &AndroidBackupSource) {
@@ -760,11 +754,32 @@ mod tests {
         );
     }
 
+    /// The defaults come first even when a password is supplied, and the one that
+    /// worked is recorded as such.
+    #[test]
+    fn a_default_is_tried_before_the_supplied_password() {
+        let ab = build_ab(&sample_tar(), true, Some("Password"));
+        let source = open(&ab, Some("not it")).unwrap();
+        assert_eq!(
+            source.provenance(),
+            Some(&UnlockProvenance::Default("Password".to_string()))
+        );
+        let source = open(
+            &build_ab(&sample_tar(), true, Some("s3cret")),
+            Some("s3cret"),
+        )
+        .unwrap();
+        assert_eq!(source.provenance(), Some(&UnlockProvenance::Supplied));
+    }
+
     #[test]
     fn a_wrong_password_is_refused() {
         let ab = build_ab(&sample_tar(), true, Some("s3cret"));
         let err = open(&ab, Some("wrong")).err().expect("must be refused");
-        assert!(err.to_string().contains("did not unlock"), "{err}");
+        assert!(
+            err.to_string().contains("nor the password supplied"),
+            "{err}"
+        );
         let err = open(&ab, None).err().expect("must be refused");
         assert!(err.to_string().contains("--backup-password"), "{err}");
     }

@@ -8,7 +8,7 @@ reads both as a logical view for `grep`, `find`, `diff` and `app`; the `backup` 
 report on one and turn it back into the device's tree.
 
 ```text
-mf-scan backup info    SOURCE [--backup-password PW]
+mf-scan backup info    SOURCE [--backup-password]
 mf-scan backup rebuild SOURCE --to FILE.zip [options]
 ```
 
@@ -56,8 +56,8 @@ apps/com.app/db/data.db        ->  data/data/com.app/databases/data.db
 | `--force` | off | Replace the archive if it already exists |
 | `--dry-run` | off | Report the plan and write nothing |
 | `--continue-on-error` | off | Keep what can be read of a damaged backup, recording the rest |
-| `--backup-password PW` | — | Else `MFSCAN_BACKUP_PASSWORD`, else the acquisition defaults |
-| `--archive-password PASS` | — | An encrypted 7z or ZIP holding the backup; else `MFSCAN_ARCHIVE_PASSWORD` |
+| `--backup-password` | — | Ask for the password (no echo) if no acquisition default opens the backup; else `MFSCAN_BACKUP_PASSWORD` |
+| `--archive-password` | — | Ask for the password of an encrypted 7z or ZIP holding the backup; else `MFSCAN_ARCHIVE_PASSWORD` |
 | `--max-size SIZE` | no cap | Refuse the rebuild if the files would exceed this |
 | `--verify` | off | SHA-256 the source file before and after reading |
 
@@ -204,8 +204,10 @@ not a rebuild failure.
 
 **Encryption.** The password unlocks an AES-256 key held in the header, verified by a
 checksum before anything is decoded, so a wrong password fails immediately. As for an iOS
-backup, a supplied password is the only one tried; with none, the acquisition defaults are
-tried, and which one worked is reported loudly and recorded.
+backup, the acquisition defaults (`1234`, `12345`, `123456`, `password`, `Password`) are
+tried first, then the password supplied (`MFSCAN_BACKUP_PASSWORD`) or asked for
+(`--backup-password`, asked only when no default worked); which one worked is reported
+loudly and recorded. A supplied password equal to a default is recorded as supplied.
 
 **Memory.** A compressed or encrypted payload has to be decoded before it can be read at
 random. Up to 64 MiB stays in memory. Beyond that it spills to an unnamed temporary file,

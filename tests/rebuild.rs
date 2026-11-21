@@ -11,6 +11,7 @@ use mf_scan::core::source::folder::FolderSource;
 use mf_scan::core::source::zip::ZipSource;
 use mf_scan::ops::rebuild;
 use mf_scan::ops::search::MatchedFile;
+use mf_scan::platform::ios::backup::password::PasswordInput;
 use mf_scan::platform::ios::backup::profile;
 use mf_scan::platform::ios::backup::source::BackupSource;
 use mf_scan::report::export::{self, ExportOutcome};
@@ -29,7 +30,12 @@ fn rebuild_fixture(
 ) -> (rebuild::Rebuild, Vec<String>) {
     let folder = FolderSource::open(&fixture(name), 0).expect("fixture opens");
     let profile = profile::detect(&folder).expect("fixture is a backup");
-    let source = BackupSource::build(&folder, &profile, password).expect("builds");
+    let source = BackupSource::build(
+        &folder,
+        &profile,
+        password.map_or(PasswordInput::None, PasswordInput::Given),
+    )
+    .expect("builds");
 
     let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);
     let files: Vec<MatchedFile> = rebuild::files_to_rebuild(&source)
@@ -135,7 +141,7 @@ fn encrypted_and_unencrypted_rebuilds_are_identical() {
 fn every_entry_is_attributable_to_a_root() {
     let folder = FolderSource::open(&fixture("unencrypted"), 0).expect("opens");
     let profile = profile::detect(&folder).expect("is a backup");
-    let source = BackupSource::build(&folder, &profile, None).expect("builds");
+    let source = BackupSource::build(&folder, &profile, PasswordInput::None).expect("builds");
     let plan = rebuild::plan(&source, source.structure(), rebuild::BackupKind::Ios);
 
     for entry in source.entries() {

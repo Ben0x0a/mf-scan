@@ -158,6 +158,28 @@ mod tests {
         assert!(args.output.is_none());
     }
 
+    /// The password flags take no value (the password is asked for, so it never
+    /// lands in shell history): `--archive-password needle a.zip` must read `needle`
+    /// as the pattern, never as a password.
+    #[test]
+    fn password_flags_take_no_value() {
+        let cli = Cli::try_parse_from([
+            "mf-scan",
+            "grep",
+            "--archive-password",
+            "--backup-password",
+            "needle",
+            "a.zip",
+        ])
+        .unwrap();
+        let crate::cmd::cli::Command::Grep(args) = cli.command else {
+            panic!("expected grep");
+        };
+        assert!(args.decrypt.archive_password && args.decrypt.backup_password);
+        assert_eq!(args.pattern.as_deref(), Some("needle"));
+        assert_eq!(args.archives, [std::path::PathBuf::from("a.zip")]);
+    }
+
     /// `--count` forces `deep = false`, so `--inspect` would be silently ignored —
     /// reject the combination up front rather than accepting a flag that does nothing.
     #[test]

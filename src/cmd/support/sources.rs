@@ -28,7 +28,7 @@ use mf_scan::core::source::{Container, Source, is_tar_name, sniff_container};
 use mf_scan::ops::rebuild::BackupKind;
 use mf_scan::platform::android::backup::AndroidBackupSource;
 use mf_scan::platform::ios::backup::common::BackupStructure;
-use mf_scan::platform::ios::backup::password::BackupRecord;
+use mf_scan::platform::ios::backup::password::{BackupRecord, PasswordInput};
 use mf_scan::platform::ios::backup::profile;
 use mf_scan::platform::ios::backup::source::BackupSource;
 
@@ -56,33 +56,80 @@ impl IoMode {
     }
 }
 
-/// The passwords resolved from the CLI flags or their environment variables,
-/// threaded through the open path: the backup's (`MFSCAN_BACKUP_PASSWORD`; `None` ⇒
-/// try the acquisition defaults) and an encrypted 7z's (`MFSCAN_ARCHIVE_PASSWORD`).
+/// The passwords for the run: the backup's (`None` ⇒ try the acquisition defaults)
+/// and an encrypted 7z's or ZIP's, threaded through the open path.
 ///
-/// WHY two: a 7z can hold an encrypted iOS backup, and the two passwords are set by
-/// different people (the examiner packing the case, the phone's owner).
+/// WHY two: an archive can hold an encrypted iOS backup, and the two passwords are
+/// set by different people (the examiner packing the case, the phone's owner).
 #[derive(Clone, Default)]
 pub(crate) struct BackupOptions {
+    /// The backup password from its environment variable.
     pub(crate) password: Option<String>,
+    /// Ask for the backup password, once no default unlocks a backup.
+    ask_password: bool,
+    /// The answer, kept so a run with two backups (`diff`, `-r`) asks once.
+    asked: std::sync::OnceLock<String>,
     pub(crate) archive_password: Option<String>,
 }
 
+/// The backup password's environment variable.
+const BACKUP_PASSWORD_VAR: &str = "MFSCAN_BACKUP_PASSWORD";
+/// The archive password's environment variable.
+const ARCHIVE_PASSWORD_VAR: &str = "MFSCAN_ARCHIVE_PASSWORD";
+
 impl BackupOptions {
-    /// Resolve the option from the flag value, falling back to the env var when
-    /// the flag is absent. WHY env fallback: keeping the password out of the
-    /// shell command line avoids it landing in shell history or `ps` output —
-    /// forensic hygiene.
-    pub(crate) fn resolve(flag: Option<&str>, archive_flag: Option<&str>) -> Self {
-        let from = |flag: Option<&str>, var: &str| {
-            flag.map(str::to_string)
-                .or_else(|| std::env::var(var).ok().filter(|s| !s.is_empty()))
+    /// Resolve each password: asked for on the terminal when its flag is given
+    /// (`--backup-password`, `--archive-password`), else read from its environment
+    /// variable, else none. The archive password is asked for now; the backup's only
+    /// when a backup's defaults all fail (see [`BackupOptions::backup_password`]).
+    ///
+    /// WHY the flags take no value: a password on the command line is kept in the
+    /// shell's history and shown by `ps` to every user of the machine. The prompt
+    /// reads from the terminal itself, not standard input, and does not echo; the
+    /// variable is for scripts. The flag wins over the variable: it is the
+    /// examiner's explicit choice for this run.
+    pub(crate) fn resolve(ask_backup: bool, ask_archive: bool) -> Result<Self> {
+        let get = |ask: bool, what: &str, var: &str| -> Result<Option<String>> {
+            if ask {
+                return prompt(what, var).map(Some);
+            }
+            Ok(std::env::var(var).ok().filter(|s| !s.is_empty()))
         };
-        Self {
-            password: from(flag, "MFSCAN_BACKUP_PASSWORD"),
-            archive_password: from(archive_flag, "MFSCAN_ARCHIVE_PASSWORD"),
-        }
+        Ok(Self {
+            password: get(false, "backup", BACKUP_PASSWORD_VAR)?,
+            ask_password: ask_backup,
+            asked: std::sync::OnceLock::new(),
+            archive_password: get(ask_archive, "archive", ARCHIVE_PASSWORD_VAR)?,
+        })
     }
+
+    /// Run `f` with where the backup password comes from beyond the defaults: the
+    /// prompt (asked at most once per run), the environment variable, or nothing.
+    pub(crate) fn backup_password<R>(&self, f: impl FnOnce(PasswordInput) -> R) -> R {
+        let ask = || -> Result<String> {
+            if let Some(answer) = self.asked.get() {
+                return Ok(answer.clone());
+            }
+            let answer = prompt("backup", BACKUP_PASSWORD_VAR)?;
+            Ok(self.asked.get_or_init(|| answer).clone())
+        };
+        let source = match (&self.password, self.ask_password) {
+            (_, true) => PasswordInput::Ask(&ask),
+            (Some(password), false) => PasswordInput::Given(password),
+            (None, false) => PasswordInput::None,
+        };
+        f(source)
+    }
+}
+
+/// Ask for the `what` password on the terminal, without echo.
+fn prompt(what: &str, var: &str) -> Result<String> {
+    let password =
+        rpassword::prompt_password(format!("mf-scan: {what} password: ")).with_context(|| {
+            format!("cannot ask for the {what} password: no terminal to ask on (set {var} instead)")
+        })?;
+    anyhow::ensure!(!password.is_empty(), "no {what} password entered");
+    Ok(password)
 }
 
 /// The operand naming standard input, as in `grep`.
@@ -409,7 +456,7 @@ pub(crate) fn with_operand_source<R>(
             with_maybe_backup(&source, backup, record, |s| f(s, Some(source.raw_bytes())))
         }
         Operand::AndroidBackup(path) => {
-            let source = AndroidBackupSource::open(path, backup.password.as_deref())?;
+            let source = backup.backup_password(|p| AndroidBackupSource::open(path, p))?;
             let facts = source.facts().clone();
             if let Some(reason) = &facts.stream_error {
                 eprintln!(
@@ -531,7 +578,7 @@ fn with_maybe_backup<R>(
             // profile; both present files by logical domain/relativePath, so
             // output and export use the real names and each file is attested
             // against its Manifest.db digest.
-            let bs = BackupSource::build(inner, &p, backup.password.as_deref())?;
+            let bs = backup.backup_password(|password| BackupSource::build(inner, &p, password))?;
             {
                 let mut facts = record.borrow_mut();
                 facts.record = Some(bs.record(&p));

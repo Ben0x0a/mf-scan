@@ -40,13 +40,13 @@ pub(crate) struct BackupSourceArgs {
     #[arg(value_name = "SOURCE")]
     pub(crate) source: PathBuf,
 
-    /// Password if encrypted (or set MFSCAN_BACKUP_PASSWORD).
-    #[arg(long = "backup-password", value_name = "PASSWORD")]
-    pub(crate) backup_password: Option<String>,
+    /// Ask for the backup's password, unechoed (or set MFSCAN_BACKUP_PASSWORD).
+    #[arg(long = "backup-password")]
+    pub(crate) backup_password: bool,
 
-    /// Password of an encrypted 7z or zip (or MFSCAN_ARCHIVE_PASSWORD).
-    #[arg(long = "archive-password", value_name = "PASS")]
-    pub(crate) archive_password: Option<String>,
+    /// Ask for an encrypted 7z/zip's password (or set MFSCAN_ARCHIVE_PASSWORD).
+    #[arg(long = "archive-password")]
+    pub(crate) archive_password: bool,
 
     /// With a folder, open nested .zip files this many levels deep.
     #[arg(

@@ -72,7 +72,7 @@ pub(crate) const BACKUP: &str = "\
 Examples:
   mf-scan backup info ./iphone-backup                   # what is it? writes nothing
   mf-scan backup rebuild ./iphone-backup --to device.zip
-  mf-scan backup rebuild phone.ab --to device.zip --backup-password 'secret'
+  mf-scan backup rebuild phone.ab --to device.zip --backup-password   # asks for it
 
 Output is always one .zip, so long device paths work on Windows too. It keeps the
 device's timestamps and holds its own report; a .sha256 file is written beside it.";

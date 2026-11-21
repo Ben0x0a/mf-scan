@@ -73,6 +73,20 @@ fn mf_scan(cwd: &Path, args: &[&str]) -> Output {
         .expect("run mf-scan")
 }
 
+/// [`mf_scan`] with the backup password in its environment variable, as a script
+/// passes it (`--backup-password` asks on the terminal, which a test has not).
+fn mf_scan_with_password(cwd: &Path, args: &[&str], password: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mf-scan"));
+    command
+        .current_dir(cwd)
+        .args(args)
+        .env_remove("MFSCAN_BACKUP_PASSWORD");
+    if let Some(password) = password {
+        command.env("MFSCAN_BACKUP_PASSWORD", password);
+    }
+    command.output().expect("run mf-scan")
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -159,17 +173,14 @@ fn an_ios_backup_rebuilds_to_a_zip_and_keeps_its_folder_input_simple() {
     for (name, password) in [("unencrypted", None), ("encrypted", Some("1234"))] {
         let dir = tempfile::tempdir().unwrap();
         let backup = fixture(name);
-        let mut args = vec![
+        let args = vec![
             "backup",
             "rebuild",
             backup.to_str().unwrap(),
             "--to",
             "d.zip",
         ];
-        if let Some(password) = password {
-            args.extend(["--backup-password", password]);
-        }
-        let output = mf_scan(dir.path(), &args);
+        let output = mf_scan_with_password(dir.path(), &args, password);
         assert!(output.status.success(), "{name}: {}", stderr(&output));
         with_archive(&dir.path().join("d.zip"), |source, entries| {
             let sms = entry(entries, "private/var/mobile/Library/SMS/sms.db");
@@ -211,17 +222,14 @@ fn an_ios_archive_holds_the_plaintext_manifest_and_its_zip_paths() {
     for (name, password) in [("unencrypted", None), ("encrypted", Some("1234"))] {
         let dir = tempfile::tempdir().unwrap();
         let backup = fixture(name);
-        let mut args = vec![
+        let args = vec![
             "backup",
             "rebuild",
             backup.to_str().unwrap(),
             "--to",
             "d.zip",
         ];
-        if let Some(password) = password {
-            args.extend(["--backup-password", password]);
-        }
-        let output = mf_scan(dir.path(), &args);
+        let output = mf_scan_with_password(dir.path(), &args, password);
         assert!(output.status.success(), "{name}: {}", stderr(&output));
         assert!(
             stderr(&output).contains("Manifest.mf-scan.zip-paths.csv"),

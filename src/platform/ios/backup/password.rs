@@ -1,35 +1,105 @@
 //! Backup password candidates and unlock provenance.
 //!
-//! Defines: `candidates` (the ordered passwords to try, from a supplied value
-//! or the acquisition defaults), [`UnlockProvenance`] (how the backup was
-//! unlocked — supplied vs which default — for the audit record), and
-//! `try_unlock`, which finds the first candidate that recovers the class keys.
-//! Used by: `ios::backup::source` (build a `BackupSource`) and `support::sources`
-//! (emit the stderr provenance line and the scan-report record).
+//! Defines: [`PasswordInput`] (where a password comes from beyond the defaults),
+//! `unlock_with` (try the defaults, then that password, with any unlock test),
+//! [`UnlockProvenance`] (how the backup was unlocked — supplied vs which default —
+//! for the audit record), and `try_unlock`, which finds the password that recovers
+//! an iOS keybag's class keys.
+//! Used by: `ios::backup::source` (build a `BackupSource`), `android::backup` (the
+//! same order for an `.ab`) and `support::sources` (the prompt, the stderr
+//! provenance line and the scan-report record).
 //! Uses: `ios::backup::{keybag, keys}` (the 4a crypto layer).
 //!
 //! ── Candidate order (forensic defaults) ─────────────────────────────────────
-//! If a password is supplied (the `--backup-password` flag or the
-//! `MFSCAN_BACKUP_PASSWORD` env var), ONLY that one is tried — an examiner who
-//! names a password means it. If none is supplied, the common acquisition
-//! defaults are tried in order: `"1234"`, `"12345"`, `"123456"`, `"password"`. These are
-//! the passcodes acquisition tooling (e.g. `idevicebackup2`) commonly sets when
-//! it enables backup encryption to obtain a fuller backup; trying them lets a
-//! routine search "just work" on such acquisitions. WHICH default unlocked the
-//! backup is recorded loudly so an examiner is never misled into thinking the
-//! owner chose it.
+//! The common acquisition defaults are always tried first, in order: `"1234"`,
+//! `"12345"`, `"123456"`, `"password"`, `"Password"`. These are the passwords
+//! acquisition tools commonly set when they turn backup encryption on to obtain a
+//! fuller backup; trying them lets a routine search "just work". Then the password
+//! supplied (`MFSCAN_BACKUP_PASSWORD`), or the one asked for on the terminal
+//! (`--backup-password`), asked only when no default worked, so an examiner is not
+//! asked for what a default opens. WHICH default unlocked the backup is recorded
+//! loudly so an examiner is never misled into thinking the owner chose it; a
+//! supplied password equal to a default is recorded as supplied.
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::platform::ios::backup::keybag::Keybag;
 use crate::platform::ios::backup::keys::unwrap_class_keys;
 
-/// The acquisition-default passwords, in the order they are tried when none is
-/// supplied. Documented as the single source of truth for the default list.
-pub(crate) const DEFAULT_PASSWORDS: &[&str] = &["1234", "12345", "123456", "password"];
+/// The acquisition-default passwords, in the order they are tried, before any
+/// supplied one. Documented as the single source of truth for the default list.
+pub(crate) const DEFAULT_PASSWORDS: &[&str] = &["1234", "12345", "123456", "password", "Password"];
+
+/// Where a backup's password comes from, beyond the defaults (always tried first).
+#[derive(Clone, Copy)]
+pub enum PasswordInput<'a> {
+    /// None: the defaults only.
+    None,
+    /// Supplied up front (the environment variable).
+    Given(&'a str),
+    /// Asked for (on the terminal), only once the defaults have failed.
+    Ask(&'a dyn Fn() -> Result<String>),
+}
+
+impl PasswordInput<'_> {
+    /// Whether a password beyond the defaults will be tried.
+    pub fn supplies(&self) -> bool {
+        !matches!(self, PasswordInput::None)
+    }
+}
+
+/// The first password `try_one` accepts, the defaults first, then the supplied or
+/// asked-for one, with its provenance; `None` when none is accepted.
+///
+/// `try_one` returns what the password unlocked (keys), or `None` for a wrong one.
+/// A supplied password equal to a default is skipped among the defaults and tried
+/// as supplied, so its provenance says supplied.
+pub(crate) fn unlock_with<T>(
+    source: PasswordInput,
+    mut try_one: impl FnMut(&str) -> Option<T>,
+) -> Result<Option<(T, UnlockProvenance)>> {
+    let given = match source {
+        PasswordInput::Given(password) => Some(password),
+        _ => None,
+    };
+    for default in DEFAULT_PASSWORDS {
+        if given == Some(*default) {
+            continue;
+        }
+        if let Some(found) = try_one(default) {
+            return Ok(Some((
+                found,
+                UnlockProvenance::Default(default.to_string()),
+            )));
+        }
+    }
+    let supplied = match source {
+        PasswordInput::None => return Ok(None),
+        PasswordInput::Given(password) => password.to_string(),
+        PasswordInput::Ask(ask) => ask()?,
+    };
+    Ok(try_one(&supplied).map(|found| (found, UnlockProvenance::Supplied)))
+}
+
+/// The error when no password unlocked a backup, for both backup kinds: whether a
+/// password beyond the defaults was tried decides what it suggests.
+pub(crate) fn no_unlock_error(what: &str, supplied: bool) -> anyhow::Error {
+    if supplied {
+        anyhow::anyhow!(
+            "{what}: neither the default passwords ({}) nor the password supplied unlocked it",
+            DEFAULT_PASSWORDS.join(", ")
+        )
+    } else {
+        anyhow::anyhow!(
+            "{what}: none of the default passwords ({}) unlocked it — pass --backup-password \
+             to be asked for the right one (or set MFSCAN_BACKUP_PASSWORD)",
+            DEFAULT_PASSWORDS.join(", ")
+        )
+    }
+}
 
 /// How the backup was unlocked — carried into stderr and the scan report so the
 /// use of a default password is unmistakable.
@@ -193,67 +263,71 @@ impl BackupRecord {
     }
 }
 
-/// The ordered password candidates to try.
-///
-/// A supplied password (already resolved from the flag-or-env by the caller)
-/// yields a single-element list; absence yields the defaults. Returned as owned
-/// strings so the caller need not juggle the flag/env/default lifetimes.
-pub(crate) fn candidates(supplied: Option<&str>) -> Vec<String> {
-    match supplied {
-        Some(pw) => vec![pw.to_string()],
-        None => DEFAULT_PASSWORDS.iter().map(|s| s.to_string()).collect(),
-    }
-}
-
-/// Try each candidate against the keybag; return the unwrapped class keys and the
-/// provenance of the password that worked.
-///
-/// `supplied` is the resolved flag-or-env password, or `None` to try the
-/// defaults. Errors (with a message naming `--backup-password`) when no candidate
-/// recovers any class key — the single clear failure an examiner sees.
+/// Try the defaults, then `source`, against the keybag; return the unwrapped class
+/// keys and the provenance of the password that worked. Errors, naming what was
+/// tried, when none recovers any class key — the single clear failure an examiner
+/// sees.
 pub(crate) fn try_unlock(
     keybag: &Keybag,
-    supplied: Option<&str>,
+    source: PasswordInput,
 ) -> Result<(BTreeMap<u32, [u8; 32]>, UnlockProvenance)> {
-    let supplied_given = supplied.is_some();
-    for candidate in candidates(supplied) {
-        // unwrap_class_keys errors when the password is wrong; try the next one.
-        if let Ok(keys) = unwrap_class_keys(candidate.as_bytes(), keybag)
-            && !keys.is_empty()
-        {
-            let provenance = if supplied_given {
-                UnlockProvenance::Supplied
-            } else {
-                UnlockProvenance::Default(candidate)
-            };
-            return Ok((keys, provenance));
-        }
+    // unwrap_class_keys errors when the password is wrong: the next one is tried.
+    let unlocked = unlock_with(source, |candidate| {
+        unwrap_class_keys(candidate.as_bytes(), keybag)
+            .ok()
+            .filter(|keys| !keys.is_empty())
+    })?;
+    match unlocked {
+        Some(found) => Ok(found),
+        None => Err(no_unlock_error("encrypted backup", source.supplies())),
     }
-
-    if supplied_given {
-        bail!("the supplied --backup-password did not unlock the encrypted backup");
-    }
-    bail!(
-        "encrypted backup: none of the default passwords ({}) unlocked it — pass the correct \
-         one with --backup-password (or the MFSCAN_BACKUP_PASSWORD environment variable)",
-        DEFAULT_PASSWORDS.join(", ")
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn supplied_password_yields_single_candidate() {
-        assert_eq!(candidates(Some("hunter2")), vec!["hunter2".to_string()]);
+    /// Every password `unlock_with` tries, in order, when none unlocks.
+    fn tried(source: PasswordInput) -> Vec<String> {
+        let mut tried = Vec::new();
+        let found = unlock_with(source, |p| {
+            tried.push(p.to_string());
+            None::<()>
+        })
+        .unwrap();
+        assert!(found.is_none());
+        tried
     }
 
     #[test]
-    fn no_password_yields_defaults_in_order() {
+    fn the_defaults_come_first_then_the_supplied_password() {
+        let defaults = ["1234", "12345", "123456", "password", "Password"];
+        assert_eq!(tried(PasswordInput::None), defaults);
+        let mut with = defaults.to_vec();
+        with.push("hunter2");
+        assert_eq!(tried(PasswordInput::Given("hunter2")), with);
+        // A supplied default is tried once, as supplied.
         assert_eq!(
-            candidates(None),
-            vec!["1234", "12345", "123456", "password"]
+            tried(PasswordInput::Given("123456")),
+            ["1234", "12345", "password", "Password", "123456"]
         );
+    }
+
+    #[test]
+    fn the_prompt_is_reached_only_when_no_default_unlocks() {
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            Ok("hunter2".to_string())
+        };
+        // "12345" unlocks: never asked, and recorded as that default.
+        let found = unlock_with(PasswordInput::Ask(&ask), |p| (p == "12345").then_some(()));
+        let (_, provenance) = found.unwrap().unwrap();
+        assert_eq!(provenance, UnlockProvenance::Default("12345".into()));
+        assert_eq!(asked.get(), 0);
+        // Only the asked one unlocks: asked once, recorded as supplied.
+        let found = unlock_with(PasswordInput::Ask(&ask), |p| (p == "hunter2").then_some(()));
+        assert_eq!(found.unwrap().unwrap().1, UnlockProvenance::Supplied);
+        assert_eq!(asked.get(), 1);
     }
 }

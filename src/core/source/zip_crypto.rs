@@ -50,7 +50,8 @@ const BLOCK: usize = 16;
 /// What a ZIP reader knows of the password, for its error messages.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ZipPassword<'a> {
-    /// The password given (`--archive-password` or `MFSCAN_ARCHIVE_PASSWORD`).
+    /// The password given (asked for with `--archive-password`, or
+    /// `MFSCAN_ARCHIVE_PASSWORD`).
     Given(&'a str),
     /// No password was given.
     Missing,
@@ -76,8 +77,8 @@ pub(crate) fn decrypt(
         ),
         (_, ZipPassword::Given(password)) => password.as_bytes(),
         (_, ZipPassword::Missing) => bail!(
-            "it is encrypted: pass the archive's password with --archive-password (or \
-             MFSCAN_ARCHIVE_PASSWORD)"
+            "it is encrypted: pass --archive-password to be asked for the archive's \
+             password (or set MFSCAN_ARCHIVE_PASSWORD)"
         ),
         (_, ZipPassword::Nested) => {
             bail!("it is encrypted, inside a nested archive: those are not decrypted")

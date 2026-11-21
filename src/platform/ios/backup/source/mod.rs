@@ -25,7 +25,7 @@ use anyhow::Result;
 use crate::core::models::Entry;
 use crate::core::source::{Content, IntegrityCheck, Source};
 use crate::platform::ios::backup::common::BackupStructure;
-use crate::platform::ios::backup::password::BackupRecord;
+use crate::platform::ios::backup::password::{BackupRecord, PasswordInput};
 use crate::platform::ios::backup::profile::BackupProfile;
 
 /// An iOS backup presented as a [`Source`] of logically-named files — either an
@@ -42,14 +42,14 @@ pub enum BackupSource<'a> {
 
 impl<'a> BackupSource<'a> {
     /// Build the right backup source for the recognised `profile`: an
-    /// [`EncryptedBackupSource`] when the payload is encrypted (using
-    /// `password`, or the acquisition defaults when `None`), else a
+    /// [`EncryptedBackupSource`] when the payload is encrypted (the acquisition
+    /// defaults first, then `password`), else a
     /// [`PlainBackupSource`]. Errors when the manifest is unreadable or — for an
     /// encrypted backup — no password candidate unlocks the keybag.
     pub fn build(
         inner: &'a dyn Source,
         profile: &BackupProfile,
-        password: Option<&str>,
+        password: PasswordInput,
     ) -> Result<Self> {
         if profile.encrypted {
             Ok(Self::Encrypted(EncryptedBackupSource::build(

@@ -47,7 +47,7 @@ use crate::platform::ios::backup::common::{
 };
 use crate::platform::ios::backup::keybag;
 use crate::platform::ios::backup::keys::{aes_cbc_decrypt, aes_unwrap};
-use crate::platform::ios::backup::password::{UnlockProvenance, try_unlock};
+use crate::platform::ios::backup::password::{PasswordInput, UnlockProvenance, try_unlock};
 use crate::platform::ios::backup::profile::BackupProfile;
 
 /// AES-256 class/file key size, in bytes.
@@ -106,13 +106,13 @@ pub struct EncryptedBackupSource<'a> {
 impl<'a> EncryptedBackupSource<'a> {
     /// Build a decrypted view over `inner` for the backup at `profile`.
     ///
-    /// `supplied_password` is the resolved `--backup-password`/env value, or
-    /// `None` to try the acquisition defaults. Errors when the manifest is
-    /// unreadable or no password candidate unlocks the keybag.
+    /// `password` is where a password comes from beyond the acquisition defaults,
+    /// which are tried first. Errors when the manifest is unreadable or no password
+    /// unlocks the keybag.
     pub fn build(
         inner: &'a dyn Source,
         profile: &BackupProfile,
-        supplied_password: Option<&str>,
+        password: PasswordInput,
     ) -> Result<Self> {
         let root_prefix = profile.root_prefix.clone();
 
@@ -136,7 +136,7 @@ impl<'a> EncryptedBackupSource<'a> {
 
         // ── Unwrap class keys with a password candidate ─────────────────────
         let keybag = keybag::parse(keybag_blob).context("cannot parse BackupKeyBag")?;
-        let (class_keys, provenance) = try_unlock(&keybag, supplied_password)?;
+        let (class_keys, provenance) = try_unlock(&keybag, password)?;
 
         // ── Decrypt Manifest.db ─────────────────────────────────────────────
         // ManifestKey is a 4-byte LE class number followed by the wrapped DB key.

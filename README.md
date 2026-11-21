@@ -195,7 +195,8 @@ file named `.zip`, `.tar` or `.7z` fails rather than being searched as an opaque
 
 A **7z** is decoded whole on open (LZMA, LZMA2, PPMd, BZip2, the BCJ filters), every
 member's CRC-32 verified. An encrypted one (AES-256, its list of files encrypted or
-not) needs `--archive-password` or `MFSCAN_ARCHIVE_PASSWORD`; it is used only if the
+not) needs `--archive-password` (asked for on the terminal) or `MFSCAN_ARCHIVE_PASSWORD`;
+it is used only if the
 archive is encrypted, and stderr says when it was. A missing or wrong password, a
 failed check, or a method this build does not decode (Deflate, Deflate64, and the
 zstd/brotli/lz4 methods of some 7-Zip forks) is an error, never a smaller archive.
@@ -203,8 +204,8 @@ A 7z holding an iOS backup is opened as that backup. Its offsets are within each
 only: no byte of the `.7z` holds them.
 
 A **ZIP** lists every file its central directory names. Encrypted files (WinZip AES
-128/192/256, or ZipCrypto) are decrypted with `--archive-password` or
-`MFSCAN_ARCHIVE_PASSWORD`; the password is checked on open, on the smallest encrypted
+128/192/256, or ZipCrypto) are decrypted with the password `--archive-password` asks
+for, or `MFSCAN_ARCHIVE_PASSWORD`; the password is checked on open, on the smallest encrypted
 file decoded whole, and a wrong one stops the run. Each encrypted file is then
 verified as it is read (the AES authentication code, or the CRC-32 for ZipCrypto,
 whose one check byte lets a wrong password through 1 time in 256). A match in an
@@ -279,8 +280,13 @@ With more than one source, each result is tagged with its origin (see
 | `--keyfile FILE` | Decrypt profile-matched databases using keys from this keychain/keystore dump (repeatable). See [Decryption](#decryption). |
 | `--platform ios\|android` | Limit decryption profiles to one platform. |
 | `--no-decrypt` | Disable decryption entirely (on by default when a keyfile dump is found beside the source). |
-| `--backup-password PASSWORD` | Password to unlock an **encrypted iOS or Android backup** (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
-| `--archive-password PASS` | Password of an **encrypted 7z or ZIP** (or set `MFSCAN_ARCHIVE_PASSWORD`), separate from the backup's: an archive can hold an encrypted backup. |
+| `--backup-password` | Ask on the terminal (no echo) for the password of an **encrypted iOS or Android backup**, only if none of the acquisition defaults opens it (or set `MFSCAN_BACKUP_PASSWORD`). See [iOS backups](#ios-backups). |
+| `--archive-password` | Ask on the terminal (no echo) for the password of an **encrypted 7z or ZIP** (or set `MFSCAN_ARCHIVE_PASSWORD`), separate from the backup's: an archive can hold an encrypted backup. |
+
+The password flags take no value: a password on the command line stays in the shell's
+history and is shown by `ps`. They read from the terminal itself, so they work with
+standard input as an operand; with no terminal (a pipe, a CI job) they fail, naming the
+variable to set instead.
 
 **Encoded matches.** Each match is one byte span in one encoding, so searching
 several encodings never duplicates a match: a match that is not plain UTF-8 is
@@ -583,11 +589,18 @@ unencrypted backups are both handled.
 # Unencrypted backup — nothing extra needed
 mf-scan grep "icloud" /path/to/00008120-… --dir-mode
 
-# Encrypted backup — supply the password (or set MFSCAN_BACKUP_PASSWORD)
-mf-scan grep "token" /path/to/00008030-… --dir-mode --backup-password 'hunter2'
-export MFSCAN_BACKUP_PASSWORD='hunter2'   # keeps it out of shell history / ps
+# Encrypted backup — the defaults are tried, then you are asked for the password
+mf-scan grep "token" /path/to/00008030-… --dir-mode --backup-password
+
+# In a script: read it once, unechoed, into the variable (never typed on a command line)
+read -rs MFSCAN_BACKUP_PASSWORD && export MFSCAN_BACKUP_PASSWORD
 mf-scan grep "token" backup.zip
 ```
+
+The passwords acquisition tools set (`1234`, `12345`, `123456`, `password`, `Password`)
+are always tried first, then the one supplied or asked for. Which one opened the backup
+is printed on stderr and recorded in the scan report, so a default is never mistaken
+for the owner's choice.
 
 Work is **lazy**: only files that survive the `--path`/`--type`/media filters are ever
 read (and, for an encrypted backup, decrypted), so a targeted search over a backup

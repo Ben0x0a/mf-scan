@@ -796,8 +796,8 @@ pub fn not_searched_notes(entries: &[Entry], password_given: bool) -> Vec<String
             )
         } else {
             format!(
-                "⚠ {total} encrypted file(s) ({}) NOT searched: pass the password with \
-                 --archive-password (or MFSCAN_ARCHIVE_PASSWORD)",
+                "⚠ {total} encrypted file(s) ({}) NOT searched: pass --archive-password to \
+                 be asked for the password (or set MFSCAN_ARCHIVE_PASSWORD)",
                 schemes.join(", ")
             )
         });

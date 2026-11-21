@@ -57,10 +57,7 @@ pub(crate) fn run_decrypt(args: DecryptCmdArgs) -> Result<ExitCode> {
         ..RunInfo::default()
     };
 
-    let backup_opts = BackupOptions::resolve(
-        args.backup_password.as_deref(),
-        args.archive_password.as_deref(),
-    );
+    let backup_opts = BackupOptions::resolve(args.backup_password, args.archive_password)?;
     let prov = BackupProvenance::new();
     let failed = with_operand_source(
         resolved.operand(0),
