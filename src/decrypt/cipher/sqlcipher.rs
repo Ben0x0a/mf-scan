@@ -41,8 +41,8 @@
 use aes::Aes256;
 use anyhow::{Result, bail, ensure};
 use cbc::Decryptor;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
-use hmac::{Hmac, Mac};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 
@@ -312,7 +312,7 @@ fn aes_cbc_decrypt(key: &[u8; KEY_SZ], iv: &[u8], buf: &mut [u8]) -> Result<()> 
     let decryptor = Decryptor::<Aes256>::new_from_slices(key, iv)
         .map_err(|_| anyhow::anyhow!("invalid AES key/IV length"))?;
     decryptor
-        .decrypt_padded_mut::<NoPadding>(buf)
+        .decrypt_padded::<NoPadding>(buf)
         .map_err(|_| anyhow::anyhow!("AES-CBC decryption failed"))?;
     Ok(())
 }
@@ -334,12 +334,12 @@ fn aes_cbc_decrypt(key: &[u8; KEY_SZ], iv: &[u8], buf: &mut [u8]) -> Result<()> 
 #[cfg(test)]
 fn aes_cbc_encrypt(key: &[u8; KEY_SZ], iv: &[u8; IV_SZ], data: &[u8]) -> Vec<u8> {
     use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
+    use cbc::cipher::BlockModeEncrypt;
     let mut buf = data.to_vec();
     let len = buf.len();
     Encryptor::<Aes256>::new_from_slices(key, iv)
         .unwrap()
-        .encrypt_padded_mut::<NoPadding>(&mut buf, len)
+        .encrypt_padded::<NoPadding>(&mut buf, len)
         .unwrap()
         .to_vec()
 }

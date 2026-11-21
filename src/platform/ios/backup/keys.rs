@@ -17,11 +17,10 @@
 use std::collections::BTreeMap;
 
 use aes::Aes256;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use anyhow::{Result, ensure};
 use cbc::Decryptor;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use sha1::Sha1;
 use sha2::Sha256;
 
@@ -68,7 +67,7 @@ pub fn aes_unwrap(kek: &[u8; KEY_SZ], wrapped: &[u8]) -> Result<Vec<u8>> {
     );
     let n = n - 1;
 
-    let cipher = Aes256::new(GenericArray::from_slice(kek));
+    let cipher = Aes256::new(kek.into());
 
     // A = first semi-block; R[1..=n] = the rest, kept as a flat Vec (R[i] lives
     // at r[(i-1)*8 .. i*8]).
@@ -90,7 +89,7 @@ pub fn aes_unwrap(kek: &[u8; KEY_SZ], wrapped: &[u8]) -> Result<Vec<u8>> {
             let ri = &r[(i - 1) * HALF_SZ..i * HALF_SZ];
             block[HALF_SZ..].copy_from_slice(ri);
 
-            cipher.decrypt_block(GenericArray::from_mut_slice(&mut block));
+            cipher.decrypt_block((&mut block).into());
 
             // A = B[0..8]; R[i] = B[8..16].
             a.copy_from_slice(&block[..HALF_SZ]);
@@ -195,7 +194,7 @@ pub fn aes_cbc_decrypt(key: &[u8; KEY_SZ], iv: &[u8; BLOCK_SZ], data: &[u8]) -> 
     let decryptor = Decryptor::<Aes256>::new_from_slices(key, iv)
         .map_err(|_| anyhow::anyhow!("invalid AES key/IV length"))?;
     decryptor
-        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .decrypt_padded::<NoPadding>(&mut buf)
         .map_err(|_| anyhow::anyhow!("AES-CBC decryption failed"))?;
     Ok(buf)
 }
@@ -205,8 +204,8 @@ mod tests {
     use super::*;
     use crate::platform::ios::backup::keybag::ClassEntry;
     // `encrypt_block` (used only by the test-only RFC 3394 wrapper) lives on the
-    // `BlockEncrypt` trait, which production code does not need.
-    use aes::cipher::BlockEncrypt;
+    // `BlockCipherEncrypt` trait, which production code does not need.
+    use aes::cipher::BlockCipherEncrypt;
 
     /// Decode a hex string into bytes (test helper).
     fn hex(s: &str) -> Vec<u8> {
@@ -358,7 +357,7 @@ mod tests {
     #[test]
     fn aes_cbc_decrypt_round_trips() {
         use cbc::Encryptor;
-        use cbc::cipher::BlockEncryptMut;
+        use cbc::cipher::BlockModeEncrypt;
         let key = [0x42u8; KEY_SZ];
         let iv = [0u8; BLOCK_SZ];
         let plain = b"sixteen byte msg"; // exactly one block
@@ -366,7 +365,7 @@ mod tests {
         let len = buf.len();
         let ct = Encryptor::<Aes256>::new_from_slices(&key, &iv)
             .unwrap()
-            .encrypt_padded_mut::<NoPadding>(&mut buf, len)
+            .encrypt_padded::<NoPadding>(&mut buf, len)
             .unwrap()
             .to_vec();
         let got = aes_cbc_decrypt(&key, &iv, &ct).unwrap();
@@ -386,7 +385,7 @@ mod tests {
     fn aes_wrap_for_test(kek: &[u8; KEY_SZ], key_data: &[u8]) -> Vec<u8> {
         assert!(key_data.len().is_multiple_of(HALF_SZ));
         let n = key_data.len() / HALF_SZ;
-        let cipher = Aes256::new(GenericArray::from_slice(kek));
+        let cipher = Aes256::new(kek.into());
         let mut a = KW_DEFAULT_IV;
         let mut r = key_data.to_vec();
         let n_u64 = n as u64;
@@ -395,7 +394,7 @@ mod tests {
                 let mut block = [0u8; BLOCK_SZ];
                 block[..HALF_SZ].copy_from_slice(&a);
                 block[HALF_SZ..].copy_from_slice(&r[(i - 1) * HALF_SZ..i * HALF_SZ]);
-                cipher.encrypt_block(GenericArray::from_mut_slice(&mut block));
+                cipher.encrypt_block((&mut block).into());
                 let t = n_u64 * j + (i as u64);
                 let t_be = t.to_be_bytes();
                 a.copy_from_slice(&block[..HALF_SZ]);

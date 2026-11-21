@@ -55,8 +55,7 @@ use aes::Aes256;
 use anyhow::{Context, Result, bail};
 use cbc::Decryptor;
 use cbc::cipher::block_padding::Pkcs7;
-use cbc::cipher::generic_array::GenericArray;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use flate2::{Decompress, FlushDecompress, Status};
 use pbkdf2::pbkdf2_hmac;
 use serde::Serialize;
@@ -257,7 +256,7 @@ fn try_password(header: &Header, password: &str) -> Option<(Vec<u8>, Vec<u8>, Ke
             continue;
         };
         let mut buffer = header.key_blob.clone();
-        let Ok(blob) = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buffer) else {
+        let Ok(blob) = decryptor.decrypt_padded::<Pkcs7>(&mut buffer) else {
             continue;
         };
         let Some((iv, key, checksum)) = split_key_blob(blob) else {
@@ -392,7 +391,7 @@ fn run_decode(
             }
             buffer.truncate(whole);
             for block in buffer.as_chunks_mut::<AES_BLOCK>().0 {
-                decryptor.decrypt_block_mut(GenericArray::from_mut_slice(block));
+                decryptor.decrypt_block(block.into());
             }
             if is_last && damage.is_none() {
                 match pkcs7_plain_len(&buffer) {
@@ -620,7 +619,7 @@ mod tests {
 
     use super::*;
     use cbc::Encryptor;
-    use cbc::cipher::BlockEncryptMut;
+    use cbc::cipher::BlockModeEncrypt;
 
     const ROUNDS: u32 = 1000;
 
@@ -662,7 +661,7 @@ mod tests {
         buffer.resize(data.len() + AES_BLOCK, 0);
         let written = Encryptor::<Aes256>::new_from_slices(key, iv)
             .unwrap()
-            .encrypt_padded_mut::<Pkcs7>(&mut buffer, data.len())
+            .encrypt_padded::<Pkcs7>(&mut buffer, data.len())
             .unwrap()
             .len();
         buffer.truncate(written);

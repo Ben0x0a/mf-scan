@@ -22,8 +22,7 @@
 //! elsewhere would still decrypt to wrong bytes without an error.
 
 use aes::Aes256;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use anyhow::{Result, bail};
 
 use crate::decrypt::cipher::{DbDecryptor, DecryptedDb};
@@ -86,7 +85,8 @@ fn decrypt_db(db: &[u8], key: &KeyMaterial) -> Result<DecryptedDb> {
         );
     }
 
-    let cipher = Aes256::new(GenericArray::from_slice(key));
+    let cipher = Aes256::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("page-aes-ofb needs a 32-byte key"))?;
     let mut plaintext = Vec::with_capacity(db.len());
     for (index, page) in db.chunks_exact(page_size).enumerate() {
         let page_no = u32::try_from(index + 1)?;
@@ -129,7 +129,7 @@ fn page_size(db: &[u8]) -> Result<usize> {
 /// HOW: OFB encrypts the IV, then encrypts each output again; the outputs are the
 /// keystream. Encryption and decryption are the same operation.
 fn apply_ofb(cipher: &Aes256, page_no: u32, nonce: &[u8], data: &mut [u8]) {
-    let mut block = GenericArray::from([0u8; BLOCK]);
+    let mut block = Array::from([0u8; BLOCK]);
     block[..4].copy_from_slice(&page_no.to_le_bytes());
     block[4..].copy_from_slice(nonce);
     for chunk in data.chunks_mut(BLOCK) {
@@ -143,7 +143,7 @@ fn apply_ofb(cipher: &Aes256, page_no: u32, nonce: &[u8], data: &mut [u8]) {
 /// Encrypt a plaintext SQLite image the way the Find My daemons do (test helper).
 #[cfg(test)]
 pub(crate) fn encrypt_db(plain: &[u8], key: &[u8], page_size: usize) -> Vec<u8> {
-    let cipher = Aes256::new(GenericArray::from_slice(key));
+    let cipher = Aes256::new_from_slice(key).unwrap();
     let mut out = Vec::with_capacity(plain.len());
     for (index, page) in plain.chunks_exact(page_size).enumerate() {
         let page_no = u32::try_from(index + 1).unwrap();

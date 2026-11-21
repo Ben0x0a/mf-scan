@@ -29,8 +29,8 @@
 use std::io::Read;
 
 use aes_gcm::AesGcm;
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::generic_array::typenum::U16;
+use aes_gcm::aead::array::Array;
+use aes_gcm::aead::consts::U16;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::aes::Aes256;
 use anyhow::{Result, bail, ensure};
@@ -153,7 +153,8 @@ fn decrypt_crypt14(file: &[u8], key: &KeyMaterial, p: &WhatsappCryptParams) -> R
     let aes_key = cipher_key_from_key_file(key_bytes)?;
     let (iv, body) = parse_header(file)?;
     let cipher = Aes256Gcm16::new_from_slice(&aes_key).expect("a 32-byte AES-256 key");
-    let nonce = GenericArray::<u8, U16>::from_slice(iv);
+    let nonce = <&Array<u8, U16>>::try_from(iv)
+        .map_err(|_| anyhow::anyhow!("the backup header holds a {}-byte IV, not 16", iv.len()))?;
 
     // Single-file backup (tag then MD5) first, then multi-file (tag last).
     let layouts = [body.len().checked_sub(MD5_LEN), Some(body.len())];
@@ -361,7 +362,7 @@ mod tests {
         let cipher = Aes256Gcm16::new_from_slice(&AES_KEY).unwrap();
         let sealed = cipher
             .encrypt(
-                GenericArray::<u8, U16>::from_slice(&IV),
+                <&Array<u8, U16>>::try_from(&IV[..]).unwrap(),
                 compressed.as_slice(),
             )
             .unwrap();
