@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use crate::core::models::Entry;
 
 pub mod bytes;
+pub(crate) mod compressed;
 pub mod folder;
 mod nested;
 pub mod ranged;
@@ -56,14 +57,30 @@ pub fn is_android_backup(head: &[u8]) -> bool {
     head.starts_with(ANDROID_BACKUP_MAGIC)
 }
 
-/// Whether `path` is named like a tar archive, plain or gzip-compressed.
+/// The names of a tar archive, plain or compressed (gzip, bzip2, xz, zstd).
+const TAR_SUFFIXES: [&str; 12] = [
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tar.zst",
+    ".tar.zstd",
+    ".tzst",
+    ".tar.md5",
+];
+
+/// Whether `path` is named like a tar archive, plain or compressed.
 pub fn is_tar_name(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    name.ends_with(".tar") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+    TAR_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 fn is_zip_name(path: &Path) -> bool {
@@ -99,6 +116,16 @@ pub fn sniff_container(path: &Path) -> Result<Container> {
     }
     if head.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
         return Ok(Container::Tar);
+    }
+    // A compressed file is a tar when what it decodes to starts like one. A damaged
+    // stream decides nothing here: the name below still can.
+    if let Some(compression) = compressed::Compression::of(&head) {
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let inner = compression.head(&mut file, 512).unwrap_or_default();
+        if inner.get(USTAR_OFFSET..USTAR_OFFSET + 5) == Some(b"ustar") {
+            return Ok(Container::Tar);
+        }
     }
     if is_tar_name(path) {
         return Ok(Container::Tar);

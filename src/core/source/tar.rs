@@ -1,14 +1,16 @@
-//! Tar source: read a `.tar` (or gzip-compressed `.tar.gz`/`.tgz`) as located files.
+//! Tar source: read a `.tar`, plain or compressed (gzip, bzip2, xz, zstd), as located
+//! files.
 //!
 //! Defines: [`TarSource`], a [`Source`] over a POSIX/USTAR tar archive. Each regular
 //! file (and directory placeholder) becomes an [`Entry`] whose bytes are a contiguous
 //! range in the backing buffer — the memory-mapped `.tar` (zero-copy) or the
-//! decompressed stream of a `.tar.gz`. Gzip is detected by content magic (not
-//! extension), so a gzipped tar with any name is handled.
+//! decompressed stream of a compressed tar. The compression is recognised by its
+//! magic (`compressed`), not the extension, so a compressed tar with any name is
+//! handled.
 //! Used by: the binary's `support::sources` (opens a `.tar`/`.tar.gz` operand) and,
 //! through the [`Source`] trait, the search/diff/export engines.
-//! Uses: `crate::core::models::{Entry, Location}`, `flate2` (gunzip), `spool` (the
-//! decoded stream), `memmap2`, `anyhow`.
+//! Uses: `crate::core::models::{Entry, Location}`, `compressed` (the decoders, into
+//! the spool), `memmap2`, `anyhow`.
 //!
 //! Why hand-rolled (not the `tar` crate): the codebase parses its containers by hand
 //! (see `zip`) for full bounds-checking control and the forensic "degrade, don't die"
@@ -21,16 +23,15 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use flate2::read::MultiGzDecoder;
 
 use crate::core::models::{Entry, Location};
-use crate::core::source::spool::spool_reader;
+use crate::core::source::compressed::Compression;
 use crate::core::source::{Content, Source};
 
 /// A tar block: header and data are both padded to this size.
 const BLOCK: usize = 512;
 
-/// A [`Source`] backed by a tar archive (plain or gzip-compressed).
+/// A [`Source`] backed by a tar archive (plain or compressed).
 ///
 /// Parses the whole block sequence once on [`TarSource::open`], then serves each
 /// entry's bytes straight from the backing buffer (always zero-copy — tar stores
@@ -55,11 +56,11 @@ pub struct TarSource {
 }
 
 impl TarSource {
-    /// Open `path` as a tar source, transparently decompressing a gzip stream.
+    /// Open `path` as a tar source, transparently decompressing a compressed stream.
     ///
-    /// Detection is by content (the gzip magic `1f 8b`), not extension, so a
-    /// gzipped tar with any name is handled. A plain `.tar` is memory-mapped
-    /// (zero-copy, physical offsets); a `.tar.gz` is decompressed once into the
+    /// Detection is by content (the compression's magic), not extension, so a
+    /// compressed tar with any name is handled. A plain `.tar` is memory-mapped
+    /// (zero-copy, physical offsets); a compressed tar is decompressed once into the
     /// spool (memory, then a temporary file), so its size is not bounded by RAM.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
@@ -67,14 +68,13 @@ impl TarSource {
         // as the ZIP and large-loose-file mmap paths.
         let map = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("cannot map {}", path.display()))?;
-        let inflated = if map.starts_with(&[0x1f, 0x8b]) {
-            // `MultiGzDecoder` handles a gzip of several concatenated members (what
-            // `gzip a b > out.gz` or some tar tools produce).
-            let stream = spool_reader(MultiGzDecoder::new(&map[..]), "the compressed tar")
-                .with_context(|| format!("cannot decompress {}", path.display()))?;
-            Some(stream)
-        } else {
-            None
+        let inflated = match Compression::of(&map) {
+            Some(compression) => Some(
+                compression
+                    .decode(&map, "the compressed tar")
+                    .with_context(|| format!("cannot decompress {}", path.display()))?,
+            ),
+            None => None,
         };
         let parsed = parse(inflated.as_deref().unwrap_or(&map));
         Ok(Self {

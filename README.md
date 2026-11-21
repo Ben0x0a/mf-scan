@@ -24,10 +24,11 @@ private/var/.../CellularUsage.db:0x1f4a:...IMSI 208...
 
 - **~40–100× faster than `zipgrep`** on STORED archives (memory-mapped, no
   per-file process spawn, SIMD search).
-- **Archives *and* folders** — point at a `.zip`, a `.tar`/`.tar.gz`/`.tgz`, or a
+- **Archives *and* folders** — point at a `.zip`, a `.tar` (plain, or compressed
+  with gzip, bzip2, xz or zstd), or a
   directory; with `--archive-depth` mf-scan opens nested `.zip` files found inside a
   folder and searches the files within them. (A plain `.tar` is memory-mapped and
-  reports true archive offsets; a `.tar.gz` is decompressed once, in memory up to
+  reports true archive offsets; a compressed tar is decompressed once, in memory up to
   64 MiB and beyond that in a temporary file in `TMPDIR`, which holds decoded
   evidence while the tool runs.)
 - **Tells you *where*, always** — every match reports the file path plus byte
@@ -185,8 +186,11 @@ on success. All exit `2` on error.
 
 ### Sources, `--dir-mode`, and `-r`
 
-A **file** operand is identified by its content, then its name: a ZIP, a tar, or an
-Android backup is opened as one, and anything else is searched as one file. A damaged
+A **file** operand is identified by its content, then its name: a ZIP, a tar (plain, or
+gzip, bzip2, xz or zstd compressed: a compressed file is a tar when what it decodes to
+starts like one), or an Android backup is opened as one, and anything else is searched
+as one file. Every member or frame of a compressed stream is read and its checks
+verified; a damaged stream is an error, never a shorter archive. A damaged
 file named `.zip` or `.tar` fails rather than being searched as an opaque blob.
 
 A **directory** operand needs one of these two flags to say how to read it (there is no
@@ -197,7 +201,8 @@ silent default — a directory with neither is rejected; the two are mutually ex
   raise the depth to open nested archives and list the files within them (`1` = one
   level, `N` = `N` levels of nesting).
 - `-r`, `--recursive` — walk the directory tree and treat **every archive** found
-  (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.ab`) as its own source, tagged by its path. Loose
+  (`.zip`, `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`,
+  `.tar.zst`/`.tzst`, `.tar.md5`, `.ab`) as its own source, tagged by its path. Loose
   files are not searched; how many were skipped is reported on stderr and in the scan
   report.
 
@@ -225,7 +230,7 @@ With more than one source, each result is tagged with its origin (see
 | `-E`, `--extended-regexp` | Accepted for grep muscle memory; no-op (the engine is already ERE-like). |
 | `--dir-mode` | Treat a directory operand as a folder of interest: scan its files. Mutually exclusive with `-r`. |
 | `--archive-depth N` | Open nested `.zip` files (found while scanning a `--dir-mode` folder) up to `N` levels deep. Default `0` (nested zips are opaque). |
-| `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.ab`), each its own source. Skipped loose files are counted and reported. |
+| `-r`, `--recursive` | Walk a directory operand for archives (`.zip`, `.ufdr`, tars plain or compressed, `.ab`), each its own source. Skipped loose files are counted and reported. |
 | `--path GLOB` | Only handle files whose whole internal path matches the wildcard: `*` any run of characters, `/` included; `?` one byte; case-sensitive. Repeatable. |
 | `--app ID` | Only this app's data: its data container, extensions and widgets, bundle and App Groups (as `app paths` lists them), on an iOS file system, an iOS backup or Android. App Groups come from the entitlements of the app and its extensions where the iOS file system records them, else by name (a guess, named in the output). On Android: every user (`/data/user/<n>`) and every mount alias a capture holds (`/data_mirror`, `/mnt/…`), also below an extraction folder (`Dump/`). What each id resolved to is printed; an id with no data is reported and adds nothing. Apple apps also keep data outside their containers (Messages in `Library/SMS`): use `--path` for it. Repeatable; combines with `--path`. |
 | `--not-path GLOB` | Skip files matching the wildcard (takes precedence over `--path`). Repeatable. |

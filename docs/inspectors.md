@@ -59,7 +59,7 @@ log whose first record does not fit in the first 4 KiB is not named.
 | `sqlite-journal` | `D9 D5 05 F9 20 A1 63 D7` |
 | `binarycookies` | `cook`, page count, page sizes, first page `00 00 01 00` |
 | `bom` | `BOMStore` |
-| `zip` / `gzip` / `bzip2` / `xz` / `zstd` / `7z` / `tar` / `lz4` / `lzfse` / `aea` | `PK\3\4` (or empty `PK\5\6`) / `1F 8B 08` / `BZh`+digit+block magic / `FD 37 7A 58 5A 00` / `28 B5 2F FD` / `37 7A BC AF 27 1C` / `ustar` at 257 / `04 22 4D 18` / `bvx1`,`bvx2`,`bvxn`,`bvx-` / `AEA1` |
+| `zip` / `gzip` / `bzip2` / `xz` / `zstd` / `7z` / `tar` / `lz4` / `lzfse` / `aea` | `PK\3\4` (or empty `PK\5\6`) / `1F 8B 08` / `BZh`+digit+block magic / `FD 37 7A 58 5A 00` / `28 B5 2F FD` (or a skippable frame first, as `pzstd` writes) / `37 7A BC AF 27 1C` / `ustar` at 257 / `04 22 4D 18` / `bvx1`,`bvx2`,`bvxn`,`bvx-` / `AEA1` |
 | `elf` / `macho` / `dex` / `hermes` | `7F ELF`+class / `FEEDFACE`, `FEEDFACF` either order (not fat `CAFEBABE`, shared with Java) / `dex\n`+3 digits+NUL / `C6 1F BC 03 C1 03 19 1F` |
 | `pdf` / `ole` / `vcard` / `icalendar` / `pem` | `%PDF-` / `D0 CF 11 E0 A1 B1 1A E1` / `BEGIN:VCARD` / `BEGIN:VCALENDAR` (any case, optional BOM) / `-----BEGIN ` but not `-----BEGIN PGP ` |
 | `chromium-cache` | `30 5C 72 A7 1B 6D FB FC` |

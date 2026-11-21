@@ -45,7 +45,10 @@ src/
       ranged.rs     RangedZipSource: positioned-read ZIP for remote SMB/NFS sources
                     (no whole-file mmap; lazy data-offset resolution; header-first
                     prefix reads). Reuses zip.rs's central-directory decoders.
-      tar.rs        TarSource: plain or gzipped tar; also the payload of an Android backup
+      tar.rs        TarSource: plain or compressed tar; also the payload of an Android backup
+      compressed.rs the one table of compression magics (gzip, bzip2, xz, zstd) and
+                    their decoders, every member and check read
+      spool.rs      decoded streams: in memory up to 64 MiB, then an unnamed temp file
       folder.rs     FolderSource: a directory of loose files (+ nested-archive arena), or
                     one loose file
       bytes.rs      BytesSource: one file held in memory (standard input)

@@ -61,3 +61,24 @@ form, including archived arrays, wrapped values and dictionary keys.
 
 A minimal iTunes/Finder backup layout (`Manifest.db` plus hashed blob files) for
 the backup source reader.
+
+## `compressed/`
+
+`note.tar`, a ustar archive holding `evidence/note.txt` ("needle in a compressed tar"),
+written by Python's `tarfile` (`USTAR_FORMAT`, mtime 1700000000, uid/gid 0, `root`),
+and the same tar compressed by the reference tools, for `core::source::compressed`
+and `tests/compressed_tar.rs`. The tar is cut in two at half its length and each half
+compressed on its own, then the two concatenated, so each fixture holds two gzip or
+bzip2 members, two xz streams or two zstd frames: a reader that stops after the first
+decodes half a tar. The zstd file also starts with a skippable frame (magic
+`0x184D2A50`, length 4, `skip`).
+
+| file | command per half |
+|---|---|
+| `note.tar.gz` | `gzip -n -9 -c` |
+| `note.tar.bz2` | `bzip2 -9 -c` |
+| `note.tar.xz` | `xz -6 -c --check=crc64` |
+| `note.tar.zst` | `zstd -19 -q -c --check` |
+
+Each was checked to decode back to `note.tar` with the same tool (`gzip -dc`,
+`bzip2 -dc`, `xz -dc`, `zstd -dcq`).

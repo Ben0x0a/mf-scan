@@ -21,6 +21,7 @@ aes = "0.9.4"
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 anyhow = "1.0.102"
 base64 = "0.22"
+bzip2 = "0.6.1"
 cbc = { version = "0.2.1", features = ["block-padding"] }
 clap = { version = "4.6.1", features = ["derive"] }
 # CRC-32 (ISO-HDLC) for ZIP entry integrity attestation on export. Already in the
@@ -32,6 +33,7 @@ hmac = "0.13.0"
 # statfs-based detection of remote (SMB/NFS) sources for --io-mode auto. Already
 # in the build as a transitive dependency; declaring it direct adds no compile.
 libc = "0.2"
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
 memmap2 = "0.9.10"
 pbkdf2 = "0.13.0"
 plist = "1.9.0"
@@ -42,6 +44,7 @@ regex = "1.12.3"
 # the same folding `regex` applies to the plain pattern. Already in the build as a
 # dependency of `regex`.
 regex-syntax = "0.8"
+ruzstd = "0.9.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9"
